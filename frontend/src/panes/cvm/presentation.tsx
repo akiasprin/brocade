@@ -65,7 +65,7 @@ export function Section({
   icon?: IconName;
   step?: number;
   className?: string;
-  /** 内容自带卡片（如多张网卡卡片）时不再套一层。 */
+  /** 内容自带卡片（如多项出站方式）时不再套一层。 */
   bare?: boolean;
 }) {
   return (

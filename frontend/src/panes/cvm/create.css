@@ -339,7 +339,7 @@
   font: 11px var(--mono);
 }
 
-/* 网络：主网卡一行，入口与业务网卡沿用创建网络选项。 */
+/* 网络：默认网络一行，入站与出站方式沿用创建网络选项。 */
 .cvm-new-net {
   display: flex;
   flex-direction: column;

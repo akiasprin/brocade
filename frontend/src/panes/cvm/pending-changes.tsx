@@ -151,22 +151,22 @@ export function CvmPendingChanges({
             </li>
           ))}
           {changes?.entry_additions?.map((entry, index) => (
-            <li key={`add-entry-${index}`}>添加入口 · {stagedEntryLabel(entry)}</li>
+            <li key={`add-entry-${index}`}>添加入站方式 · {stagedEntryLabel(entry)}</li>
           ))}
           {changes?.entry_releases?.map(entry => (
             <li key={entry.id}>
-              撤销入口 · <code>{entry.id}</code>
+              撤销入站方式 · <code>{entry.id}</code>
             </li>
           ))}
           {changes?.mounts?.map(nic => (
             <li key={nic.draft_id}>
-              挂载网卡 · <code>{nic.publication_id}</code> · {nic.transport}
+              添加出站方式 · <code>{nic.publication_id}</code> · {nic.transport}
               {nic.use_dns_suggestions ? ' · 使用网络提供的 DNS' : ''}
             </li>
           ))}
           {changes?.detach_interface_ids?.map(id => (
             <li key={id}>
-              卸载网卡 · <code>{id}</code>
+              移除出站方式 · <code>{id}</code>
             </li>
           ))}
           {changes?.routes && network.draft && (
@@ -291,7 +291,7 @@ const fieldNames: Record<string, string> = {
   image: '系统镜像',
   name: '名称',
   resources: '资源规格',
-  interfaces: '网卡',
+  interfaces: '出站方式',
   routes: '路由与优先级',
   dns: 'DNS',
   login: '登录凭证',
@@ -321,10 +321,10 @@ function PendingReview({ instance }: { instance: CvmInstance }) {
             {new Date(data.saved_at).toLocaleString('zh-CN')} · R{data.revision}
           </p>
           {!!data.fields.length && <p>{data.fields.map(field => fieldNames[field] ?? field).join('、')}</p>}
-          {!!data.entries_added && <p>新增 {data.entries_added} 个入口</p>}
-          {!!data.entries_removed && <p>撤销 {data.entries_removed} 个入口</p>}
-          {!!data.nics_added && <p>挂载 {data.nics_added} 张业务网卡</p>}
-          {!!data.nics_removed && <p>卸载 {data.nics_removed} 张业务网卡</p>}
+          {!!data.entries_added && <p>新增 {data.entries_added} 个入站方式</p>}
+          {!!data.entries_removed && <p>撤销 {data.entries_removed} 个入站方式</p>}
+          {!!data.nics_added && <p>添加 {data.nics_added} 个出站方式</p>}
+          {!!data.nics_removed && <p>移除 {data.nics_removed} 个出站方式</p>}
         </div>
       )}
     </details>

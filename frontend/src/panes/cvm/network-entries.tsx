@@ -79,7 +79,7 @@ export function NetworkEntries({
   });
   const uncertain = uncertainCvmResult(move.error);
   const retry = uncertain && move.variables?.entryId === moving?.entry.id ? move.variables : undefined;
-  useUnsavedChanges(!!moving?.target || move.isPending || !!retry, '改派访问入口');
+  useUnsavedChanges(!!moving?.target || move.isPending || !!retry, '改派入站方式');
   const targets = !instance.user_id
     ? []
     : workspace.instances.filter(
@@ -131,7 +131,7 @@ export function NetworkEntries({
             entryModesOverlap(entry.mode, mode, offer),
         )
       )
-        throw new Error('与草稿中已添加的入口冲突。');
+        throw new Error('与草稿中已添加的入站方式冲突。');
       addition = { publication_id: row.publication.id, address: offer.address, mode };
     } catch (error) {
       validation = error instanceof Error ? error.message : String(error);
@@ -146,10 +146,10 @@ export function NetworkEntries({
   };
   const count = (entries.data?.length ?? 0) + additions.length;
   return (
-    <section className="panel titled cvm-net-panel" aria-label="访问入口">
+    <section className="panel titled cvm-net-panel" aria-label="入站方式">
       <header>
-        <PanelTitle of="ingress">访问入口</PanelTitle>
-        <span className="hint">{workspace.redacted ? '投递到主网卡' : `${count} 个 · 投递到主网卡`}</span>
+        <PanelTitle of="ingress">入站方式</PanelTitle>
+        <span className="hint">{workspace.redacted ? '投递到容器' : `${count} 个 · 投递到容器`}</span>
         {writable && (
           <span className="cvm-panel-tools">
             <button
@@ -160,7 +160,7 @@ export function NetworkEntries({
               aria-expanded={adding}
             >
               <Icon of="plus" size={13} />
-              添加入口
+              添加入站方式
             </button>
           </span>
         )}
@@ -171,7 +171,7 @@ export function NetworkEntries({
         <>
           {entries.isPending && <Loading />}
           {entries.error && <ErrorBox error={entries.error} />}
-          <ul className="cvm-nrows" aria-label="访问入口列表">
+          <ul className="cvm-nrows" aria-label="入站方式列表">
             {entries.data?.map(entry => {
               const removing = releases.some(change => change.id === entry.id);
               const provider = providerName(entry.provider_node);
@@ -198,10 +198,10 @@ export function NetworkEntries({
                   <span className="cvm-nrow-acts">
                     <NetworkLogsButton
                       iconOnly
-                      title="入口网络日志"
+                      title="入站网络日志"
                       allowed={entry.can_read_logs ?? workspace.can_manage_network}
                       machines={[
-                        { node_id: entry.provider_node, name: provider, role: '入口' },
+                        { node_id: entry.provider_node, name: provider, role: '入站' },
                         {
                           node_id: instance.node_id,
                           name: workspace.hosts.find(host => host.node_id === instance.node_id)?.name,
@@ -251,7 +251,7 @@ export function NetworkEntries({
                 <span className={`cvm-nrow-lead${entry.mode.kind === 'l3' ? ' l3' : ''}`}>{entryLead(entry.mode)}</span>
                 <div className="cvm-nrow-main">
                   <span className="cvm-nrow-title mono">{stagedEntryLabel(entry)}</span>
-                  <small>{publicationName(entry.publication_id) ?? '新访问入口'}</small>
+                  <small>{publicationName(entry.publication_id) ?? '新入站方式'}</small>
                 </div>
                 <span className="st st-gold">未保存</span>
                 {writable && (
@@ -274,14 +274,14 @@ export function NetworkEntries({
             ))}
             {entries.data?.length === 0 && !additions.length && !adding && (
               <li className="cvm-nrow cvm-nrow-empty">
-                暂无访问入口{writable ? '。添加后可从外部经入口地址访问容器，SSH 入口会自动换算端口。' : ''}
+                暂无入站方式{writable ? '。添加后可从外部地址访问容器，SSH 入站会自动换算端口。' : ''}
               </li>
             )}
           </ul>
           {moving && (
             <form
               className="cvm-composer"
-              aria-label="改派访问入口"
+              aria-label="改派入站方式"
               onSubmit={event => {
                 event.preventDefault();
                 if (move.isPending || !writable) return;
@@ -300,7 +300,7 @@ export function NetworkEntries({
               }}
             >
               <div className="cvm-composer-head">
-                <b>改派访问入口</b>
+                <b>改派入站方式</b>
                 <span className="mono">{entryText(moving.entry).text}</span>
               </div>
               <p className="note">只更改投递目标，地址与端口保持不变。改派单独保存，保存后进入顶部待发布列表。</p>
@@ -333,7 +333,7 @@ export function NetworkEntries({
               )}
               {!retry && stale && (
                 <p className="cvm-notice" role="status">
-                  入口已变化，请取消后重新选择。
+                  入站方式已变化，请取消后重新选择。
                 </p>
               )}
               {!retry && hasEdits && <p className="cvm-notice">请先保存或丢弃当前网络草稿。</p>}
@@ -362,7 +362,7 @@ export function NetworkEntries({
           {adding && editingEntries && !moving && (
             <form
               className="cvm-composer"
-              aria-label="添加访问入口"
+              aria-label="添加入站方式"
               onSubmit={event => {
                 event.preventDefault();
                 if (!addition) return;
@@ -371,12 +371,12 @@ export function NetworkEntries({
               }}
             >
               <div className="cvm-composer-head">
-                <b>新访问入口</b>
-                <span className="note">→ {instance.desired.spec.name} 主网卡</span>
+                <b>新入站方式</b>
+                <span className="note">→ {instance.desired.spec.name}</span>
                 <button
                   className="btn icon cvm-row-btn"
                   type="button"
-                  aria-label="收起添加入口"
+                  aria-label="收起添加入站方式"
                   title="收起"
                   onClick={closeAdding}
                 >
@@ -385,7 +385,7 @@ export function NetworkEntries({
               </div>
               {board.isPending && <Loading />}
               {board.error && <ErrorBox error={board.error} />}
-              {board.data && !rows.length && <p className="note">当前使用者没有获授权且开放的入口地址。</p>}
+              {board.data && !rows.length && <p className="note">当前使用者没有获授权且开放的入站方式。</p>}
               {!!rows.length && (
                 <div className="cvm-picks" role="radiogroup" aria-label="入口地址">
                   {rows.map(row => {

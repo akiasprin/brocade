@@ -213,8 +213,8 @@ function HostDetails({
   const provider = catalog.data?.providers.find(item => item.node_id === host.node_id);
   const network = provider?.fresh && !provider.capabilities.error && !catalog.isError ? provider.capabilities : null;
   const capabilities: [string, boolean | undefined][] = [
-    ['访问入口', network?.entries],
-    ['主网卡投递', caps.primary_ip_delivery],
+    ['入站方式', network?.entries],
+    ['默认网络投递', caps.primary_ip_delivery],
     ['L4 路由', caps.route_services === false ? false : network?.route_service],
     ['线路出口', caps.chain_egress],
     ['持久终端', supportsGuestTerminal(caps)],
@@ -272,7 +272,7 @@ function HostDetails({
             );
           })}
         </ul>
-        {host.fresh && <p className="note">Cube 网卡上限 {caps.max_interfaces}</p>}
+        {host.fresh && <p className="note">出站方式上限 {caps.max_interfaces}</p>}
         {caps.host_system && (
           <p className="note">
             {caps.host_system.os} · 管理网卡 {caps.host_system.primary_device}{' '}

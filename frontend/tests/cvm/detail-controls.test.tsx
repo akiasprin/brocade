@@ -116,7 +116,7 @@ it('requires the exact displayed name and describes the destructive consequences
   const dialog = await screen.findByRole('dialog', { name: '删除容器？' });
   const confirm = within(dialog).getByRole('button', { name: '保存删除变更' });
   expect(within(dialog).getByRole('list').textContent).toContain('永久销毁系统盘');
-  expect(within(dialog).getByRole('list').textContent).toContain('撤销访问入口，卸载网卡');
+  expect(within(dialog).getByRole('list').textContent).toContain('撤销入站方式，移除出站方式');
   expect(within(dialog).getByRole('list').textContent).toContain('释放该容器在宿主上的资源分配');
   expect(confirm.hasAttribute('disabled')).toBe(true);
   const name = within(dialog).getByRole('textbox', { name: '输入完整容器名称以确认删除' });
@@ -223,7 +223,7 @@ it.each([true, false])('gates a completed withdrawal on outstanding NIC bindings
   const dialog = await screen.findByRole('dialog', { name: '容器使用授权' });
   const choice = within(dialog).getByRole('combobox', { name: '使用用户' });
   if (withdrawing) {
-    expect(await within(dialog).findByText('正在等待访问入口和业务网卡清理；确认完成后才能授权。')).toBeTruthy();
+    expect(await within(dialog).findByText('正在等待入站方式和出站方式清理；确认完成后才能授权。')).toBeTruthy();
     expect(choice.hasAttribute('disabled')).toBe(true);
     expect(writes).toHaveLength(0);
   } else {

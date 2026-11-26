@@ -168,7 +168,7 @@ export function CvmOverview({
                 <Icon of="access" size={13} className="chart-title-icon" />
                 接入与凭证
               </b>
-              <span>{native ? '终端与网络作用于宿主' : '优先使用已生效入口'}</span>
+              <span>{native ? '终端与网络作用于宿主' : '优先使用已生效入站方式'}</span>
             </div>
             <div className="cvm-card-body">
               {canConnect ? (
@@ -207,7 +207,8 @@ export function CvmOverview({
               </b>
               {!redacted && (
                 <span>
-                  入口 {entries.data?.length ?? '—'} · 网卡 {spec.interfaces.length} · 路由 {spec.routing.routes.length}
+                  入站方式 {entries.data?.length ?? '—'} · 出站方式 {spec.interfaces.length} · 路由{' '}
+                  {spec.routing.routes.length}
                 </span>
               )}
               <button className="cvm-cap-link" type="button" onClick={onNetwork}>
@@ -221,10 +222,10 @@ export function CvmOverview({
               ) : (
                 <dl className="cvm-net-summary">
                   <div>
-                    <dt>入口</dt>
+                    <dt>入站方式</dt>
                     <dd>
                       {entries.isPending ? (
-                        <PanelLoading label="读取访问入口" />
+                        <PanelLoading label="读取入站方式" />
                       ) : entries.error ? (
                         dim('读取失败')
                       ) : entries.data?.length ? (
@@ -244,7 +245,7 @@ export function CvmOverview({
                     </dd>
                   </div>
                   <div>
-                    <dt>网卡</dt>
+                    <dt>出站方式</dt>
                     <dd>
                       {spec.interfaces.map(nic => (
                         <NetChipView
@@ -253,10 +254,10 @@ export function CvmOverview({
                           chip={{
                             key: nic.id,
                             text: nic.allocated
-                              ? (publicationName(nic.allocated.publication_id) ?? '业务网卡')
+                              ? (publicationName(nic.allocated.publication_id) ?? '出站方式')
                               : native
                                 ? '宿主网络'
-                                : '管理主网卡',
+                                : '默认出站',
                             tail: report?.interfaces.find(item => item.id === nic.id)?.device,
                             kind: 'via',
                           }}
@@ -265,7 +266,7 @@ export function CvmOverview({
                     </dd>
                   </div>
                   <div>
-                    <dt>出口</dt>
+                    <dt>路由出口</dt>
                     <dd>
                       {exitChips(instance, publicationName, chainName).map(chip => (
                         <NetChipView key={chip.key} chip={chip} onClick={onNetwork} />
@@ -377,7 +378,7 @@ export function CvmOverview({
                 'w2',
               ],
               [
-                '主网卡',
+                '默认网络',
                 redacted ? (
                   dim('已脱敏')
                 ) : (

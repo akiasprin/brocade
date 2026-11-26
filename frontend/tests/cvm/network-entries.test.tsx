@@ -67,7 +67,7 @@ function setup(status: 409 | 503, edits: NetworkEdits = {}) {
 
 async function selectTarget() {
   fireEvent.click(await screen.findByRole('button', { name: '改派' }));
-  const form = screen.getByRole('form', { name: '改派访问入口' });
+  const form = screen.getByRole('form', { name: '改派入站方式' });
   const select = within(form).getByRole('combobox', { name: '目标容器' }) as HTMLSelectElement;
   expect(Array.from(select.options, option => option.value)).toEqual(['', 'eligible', 'stopped']);
   expect(within(form).getByText('same-owner · 香港宿主')).toBeTruthy();
@@ -80,7 +80,7 @@ it('moves only the existing claim and retries the original revision and request 
   const { entry, requests, onChange } = setup(503);
   const { form, select } = await selectTarget();
   await within(form).findByText('保存响应丢失');
-  await screen.findByText(/暂无访问入口/);
+  await screen.findByText(/暂无入站方式/);
   expect(select.disabled).toBe(true);
   expect(requests[0]).toEqual({
     url: `/cvm/entries/${entry.id}/target`,
@@ -88,7 +88,7 @@ it('moves only the existing claim and retries the original revision and request 
     body: { instance_id: 'eligible', expected_revision: entry.revision, request_id: expect.any(String) },
   });
   fireEvent.click(within(form).getByRole('button', { name: '重试原改派' }));
-  await waitFor(() => expect(screen.queryByRole('form', { name: '改派访问入口' })).toBeNull());
+  await waitFor(() => expect(screen.queryByRole('form', { name: '改派入站方式' })).toBeNull());
   expect(requests).toEqual([requests[0], requests[0]]);
   expect(onChange).not.toHaveBeenCalled();
 });
@@ -96,7 +96,7 @@ it('moves only the existing claim and retries the original revision and request 
 it('does not silently rebase after a definite revision conflict', async () => {
   const { requests } = setup(409);
   const { form } = await selectTarget();
-  await within(form).findByText('入口已变化，请取消后重新选择。');
+  await within(form).findByText('入站方式已变化，请取消后重新选择。');
   expect((within(form).getByRole('button', { name: '保存改派' }) as HTMLButtonElement).disabled).toBe(true);
   expect(within(form).queryByRole('button', { name: '重试原改派' })).toBeNull();
   expect(requests).toHaveLength(1);

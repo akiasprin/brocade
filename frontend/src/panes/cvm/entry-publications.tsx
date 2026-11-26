@@ -1,5 +1,5 @@
 import { parsePortRanges, rangesText, reservedPortsText } from './entry-policy';
-// 访问入口地址：管理员发布可投递到容器主网卡的地址，并维护协议端口的保留策略，
+// 入站方式：管理员发布可投递到容器默认网络的地址，并维护协议端口的保留策略，
 // IP 保留在入口机器上；跨宿主的入口经受管 IP 机器对通道送到容器所在宿主。
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
@@ -57,14 +57,14 @@ export function EntryPublications({ workspace }: { workspace: CvmWorkspace }) {
   const data = board.data;
   const addresses = data.publications.reduce((sum, p) => sum + p.spec.addresses.length, 0);
   return (
-    <section className="panel titled cvm-net-panel cvm-resource-panel cvm-entry-publications" aria-label="访问入口地址">
+    <section className="panel titled cvm-net-panel cvm-resource-panel cvm-entry-publications" aria-label="入站方式">
       <header>
-        <PanelTitle of="ingress">访问入口地址</PanelTitle>
-        <span className="hint" title="按整 IP 或 TCP／UDP 单端口、连续端口段投递到主网卡，不占网卡槽位。">
+        <PanelTitle of="ingress">入站方式</PanelTitle>
+        <span className="hint" title="按整 IP 或 TCP／UDP 单端口、连续端口段投递到容器，不占出站方式数量。">
           <span className="header-stat">
             {data.publications.length} 组入口 · {addresses} 个地址 ·{' '}
           </span>
-          按整 IP 或单端口／连续端口段投递到主网卡，不占网卡槽位
+          按整 IP 或单端口／连续端口段投递到容器，不占出站方式数量
         </span>
         {data.can_manage && (
           <span className="cvm-panel-tools">
@@ -84,8 +84,8 @@ export function EntryPublications({ workspace }: { workspace: CvmWorkspace }) {
             : '管理员添加入口地址并授权后，就可以为容器接入。'}
         </EmptyState>
       ) : (
-        <div className="cvm-resource-scroll" role="region" aria-label="访问入口地址列表" tabIndex={0}>
-          <table className="tbl cvm-resource-table" aria-label="访问入口地址">
+        <div className="cvm-resource-scroll" role="region" aria-label="入站方式列表" tabIndex={0}>
+          <table className="tbl cvm-resource-table" aria-label="入站方式">
             <thead>
               <tr>
                 <th scope="col">发布</th>

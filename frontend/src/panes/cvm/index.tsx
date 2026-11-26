@@ -51,7 +51,7 @@ export function CvmPane({ win }: { win: Win; bare?: boolean }) {
   const manager = !!data?.can_write && !data.redacted;
   const networkManager = !!data?.can_manage_network && !data.redacted;
   const network = useNetworkDraft(item, manager);
-  // 页签计数：网络页签取入口地址与出口网络两份目录（清单与网络页也读这两份，命中同一缓存）。
+  // 页签计数：网络页签取入站与出站两份目录（清单与网络页也读这两份，命中同一缓存）。
   const entryBoard = useQuery({
     queryKey: ENTRY_BOARD,
     queryFn: fetchCvmEntries,
@@ -73,7 +73,7 @@ export function CvmPane({ win }: { win: Win; bare?: boolean }) {
     page === 'instance'
       ? [{ label: item?.desired.spec.name ?? '实例详情' }]
       : publication
-        ? [{ label: page === 'network-new' ? '创建出口网络' : '编辑出口网络' }]
+        ? [{ label: page === 'network-new' ? '创建出站方式' : '编辑出站方式' }]
         : root
           ? []
           : [{ label: title }],

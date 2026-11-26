@@ -1,6 +1,5 @@
 import { api } from './client';
 import type { CvmInstance } from './cvm';
-import type { CvmNetworkEditRequest } from './cvm-network-edit';
 
 export type CvmNicTransport = 'xray' | 'wireguard';
 export type CvmNicAddressMode = 'shared_nat' | 'dedicated_routed' | 'dedicated_nat';
@@ -29,7 +28,7 @@ export interface CvmNicPublicationSpec {
   shared_ipv4: string | null;
   shared_ipv6: string | null;
   address_mode: CvmNicAddressMode;
-  /** 出口网卡可达的目标网段；入站由访问入口承担。 */
+  /** 出站方式可达的目标网段；入站由入站方式承担。 */
   destinations: string[];
   route_presets: string[];
   dns_suggestions: string[];
@@ -82,23 +81,6 @@ export interface CvmContainerRoutes {
   routes: CvmContainerRoute[];
   dns: string[];
 }
-export interface CvmRouteMatchRequest {
-  destination: string;
-  protocol: 'tcp' | 'udp' | 'other';
-  port?: number | null;
-  routes?: CvmContainerRoutes | null;
-  /** Pass the complete draft instead of routes when mounts or other edits affect the final table. */
-  network_edit?: CvmNetworkEditRequest | null;
-}
-export type CvmRouteMatchResult =
-  | { kind: 'default' }
-  | {
-      kind: 'route';
-      route_index: number;
-      route: CvmContainerRoute;
-      priority: number;
-      blocked?: 'chain_requires_tcp_udp';
-    };
 export interface CvmNicNodeCapabilities {
   entry_protocol_rules?: boolean;
   ssh_ports?: number[];
@@ -110,7 +92,7 @@ export interface CvmNicNodeCapabilities {
   addresses: string[];
   host_ports: { protocol: 'tcp' | 'udp'; port: number }[];
   error: string | null;
-  /** Agent 能执行访问入口（规则、宿主投递、机器对通道）。 */
+  /** Agent 能执行入站方式（规则、宿主投递、机器对通道）。 */
   entries?: boolean;
   /** Agent 能在宿主侧执行按协议端口选择的出口。 */
   route_service?: boolean;
@@ -215,12 +197,6 @@ export const mountCvmNic = (
     method: 'POST',
     body: JSON.stringify(body),
     ...(inputSha256 ? { headers: { 'x-brocade-cvm-input-sha256': inputSha256 } } : {}),
-  });
-export const matchCvmRoute = (id: string, body: CvmRouteMatchRequest, signal?: AbortSignal) =>
-  api<CvmRouteMatchResult>(`/cvm/${encodeURIComponent(id)}/routes/match`, '', {
-    method: 'POST',
-    body: JSON.stringify(body),
-    signal,
   });
 export const setCvmRoutes = (
   id: string,

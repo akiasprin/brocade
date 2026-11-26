@@ -1,4 +1,4 @@
-/* 容器网络页签：访问入口、网卡两张框架卡并排，路由整宽在下。卡片沿用 .panel.titled
+/* 容器网络页签：入站方式、出站方式两张框架卡并排，路由整宽在下。卡片沿用 .panel.titled
    （与机器配置页同一种带标题条的卡），这里只补行列表、就地编辑区与行内操作。 */
 .cvm-network-edit {
   display: flex;
@@ -215,7 +215,7 @@
   max-width: 420px;
 }
 
-/* 单选卡列表：入口地址与出口网络。 */
+/* 单选卡列表：入站地址与出站方式。 */
 .cvm-picks {
   display: flex;
   flex-direction: column;

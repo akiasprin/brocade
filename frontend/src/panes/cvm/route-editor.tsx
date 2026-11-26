@@ -1,16 +1,13 @@
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { useId, useState, type FormEvent, type ReactNode } from 'react';
 import {
   fetchCvmChainCatalog,
-  matchCvmRoute,
   type CvmContainerRoute,
   type CvmContainerRoutes,
   type CvmInstance,
   type CvmNicCatalog,
-  type CvmRouteMatchRequest,
   type CvmRouteService,
 } from '../../api';
-import type { CvmNetworkEditRequest } from '../../api/cvm-network-edit';
 import { ErrorBox } from '../../ui/bits';
 import { Icon, PanelTitle } from '../../ui/icons';
 import { networkLines } from './network-common';
@@ -35,7 +32,7 @@ const isChain = (key: string) => key.startsWith('chain:');
 function targetName(key: string, options: readonly RouteEditorTarget[]) {
   if (!key) return '未选择出口';
   const name = options.find(option => option.key === key)?.name ?? '出口详情不可用';
-  return `${isChain(key) ? '线路' : '网卡'} · ${name}`;
+  return `${isChain(key) ? '线路' : '出站方式'} · ${name}`;
 }
 
 function withPriority(routing: CvmContainerRoutes, option: RouteEditorTarget): CvmContainerRoutes {
@@ -75,21 +72,6 @@ function validDestination(text: string) {
   const v6 = /^([0-9a-f:.]+)(?:\/(\d{1,3}))?$/i.exec(value);
   return !!v6 && v6[1].includes(':') && (v6[2] === undefined || Number(v6[2]) <= 128);
 }
-
-/** 命中测试的一行输入：`203.0.113.9`、`203.0.113.9 udp/53`、`2001:db8::1 other`。未写协议按 TCP 443。 */
-function parseProbe(
-  text: string,
-): { destination: string; protocol: CvmRouteMatchRequest['protocol']; port?: number } | null {
-  const match = /^\s*(\S+)(?:\s+(tcp|udp|other)(?:\/(\d{1,5}))?)?\s*$/i.exec(text);
-  if (!match || !validDestination(match[1]) || match[1].includes('/')) return null;
-  const protocol = (match[2]?.toLowerCase() ?? 'tcp') as CvmRouteMatchRequest['protocol'];
-  if (protocol === 'other') return match[3] ? null : { destination: match[1], protocol };
-  const port = Number(match[3] ?? 443);
-  return port >= 1 && port <= 65535 ? { destination: match[1], protocol, port } : null;
-}
-
-const probeLabel = (probe: NonNullable<ReturnType<typeof parseProbe>>) =>
-  probe.protocol === 'other' ? '其他协议' : `${probe.protocol.toUpperCase()} ${probe.port}`;
 
 /* ── 一行路由的编辑格：新增行与就地编辑共用。 ── */
 function RouteForm({
@@ -169,7 +151,7 @@ function RouteForm({
           {[false, true].map(chain => {
             const group = options.filter(item => isChain(item.key) === chain);
             return group.length ? (
-              <optgroup key={String(chain)} label={chain ? '线路' : '网卡'}>
+              <optgroup key={String(chain)} label={chain ? '线路' : '出站方式'}>
                 {group.map(item => (
                   <option key={item.key} value={item.key} disabled={!canSelect(item)}>
                     {item.name}
@@ -349,7 +331,7 @@ function PriorityStrip({
                 onClick={() => setOpen(open === row.key ? null : row.key)}
               >
                 <b>{index + 1}</b>
-                <span className="cvm-route-priority-name">{name.replace(/^网卡 · /, '')}</span>
+                <span className="cvm-route-priority-name">{name.replace(/^出站方式 · /, '')}</span>
                 <span className="cvm-route-priority-values">
                   v4 {value('ipv4')} · v6 {value('ipv6')}
                 </span>
@@ -458,8 +440,6 @@ export function RouteEditor({
   writable,
   extraTargets = [],
   redacted = false,
-  canTest = writable,
-  networkEdit,
 }: {
   instance: CvmInstance;
   catalog?: CvmNicCatalog;
@@ -468,14 +448,12 @@ export function RouteEditor({
   writable: boolean;
   extraTargets?: readonly RouteEditorTarget[];
   redacted?: boolean;
-  canTest?: boolean;
-  networkEdit?: CvmNetworkEditRequest;
 }) {
   const id = useId();
   const { desired } = instance;
   const canEdit = writable && !redacted;
   const baremetal = desired.spec.execution.kind === 'baremetal';
-  const fallback = baremetal ? '本机 · 宿主路由' : '主网卡 · 宿主 NAT';
+  const fallback = baremetal ? '本机 · 宿主路由' : '默认出站 · 宿主 NAT';
   const [editing, setEditing] = useState<number | null>(null);
   const chains = useQuery({
     enabled: !redacted,
@@ -491,7 +469,7 @@ export function RouteEditor({
       return [
         {
           key: nic.id,
-          name: name ?? `业务网卡 ${allocation.slot}`,
+          name: name ?? `出站方式 ${allocation.slot}`,
           ipv4: !!allocation.ipv4,
           ipv6: !!allocation.ipv6,
           available: true,
@@ -520,39 +498,7 @@ export function RouteEditor({
     (routing.priorities.length < maxRoutes || routing.priorities.some(priority => targetKey(priority) === option.key));
   const selectable = options.some(canSelect);
 
-  const [probeText, setProbeText] = useState('');
-  const probe = parseProbe(probeText);
   const references = [...routing.priorities, ...routing.routes];
-  const temporaryReferenced =
-    !networkEdit && extraTargets.some(target => references.some(reference => targetKey(reference) === target.key));
-  const matchBlocked = temporaryReferenced
-    ? '当前草稿引用了尚未分配地址、且没有挂载草稿的网卡。请检查挂载草稿，再进行服务端命中测试。'
-    : null;
-  const body: CvmRouteMatchRequest | null = probe && {
-    destination: probe.destination,
-    protocol: probe.protocol,
-    ...(probe.protocol === 'other' ? {} : { port: probe.port }),
-    ...(networkEdit ? { network_edit: networkEdit } : { routes: routing }),
-  };
-  const scope = JSON.stringify([desired.id, desired.generation, body]);
-  const match = useMutation({
-    mutationFn: ({ instanceId, request }: { instanceId: string; request: CvmRouteMatchRequest; scope: string }) =>
-      matchCvmRoute(instanceId, request, AbortSignal.timeout(10_000)),
-  });
-  const active = canTest && !redacted && !matchBlocked && !!body && scope === match.variables?.scope;
-  const result = active ? match.data : undefined;
-  // A mount can contribute implicit routes not present in the editor. In that case the index refers to the preview table.
-  const hit =
-    result?.kind === 'route'
-      ? !networkEdit || networkEdit.routes
-        ? result.route_index
-        : routing.routes.findIndex(
-            route =>
-              route.destination === result.route.destination &&
-              targetKey(route) === targetKey(result.route) &&
-              serviceText(route) === serviceText(result.route),
-          )
-      : undefined;
   const hasChains = !!chains.data?.chains.length || references.some(reference => reference.chain_id);
   const replace = (index: number, route: CvmContainerRoute, option: RouteEditorTarget) => {
     const routes = routing.routes.map((old, i) => (i === index ? route : old));
@@ -565,14 +511,14 @@ export function RouteEditor({
     notes.push(
       `线路使用${chains.data?.owner?.name ? ` ${chains.data.owner.name} ` : '容器使用者'}的授权、额度与限速，仅支持 TCP／UDP。`,
     );
-  if (canEdit && !selectable) notes.push('没有可选的出口：请先挂载业务网卡，或检查线路授权与出口优先级。');
+  if (canEdit && !selectable) notes.push('没有可选的出口：请先添加出站方式，或检查线路授权与出口优先级。');
   if (canEdit && routing.routes.length >= maxRoutes) notes.push('已达到 256 条路由上限。');
 
   return (
     <section className="panel titled cvm-net-panel cvm-route-panel" aria-labelledby={`${id}-title`}>
       <header>
         <span id={`${id}-title`}>
-          <PanelTitle of="forwarding">路由与命中测试</PanelTitle>
+          <PanelTitle of="forwarding">路由</PanelTitle>
         </span>
         {!redacted && <span className="hint">最长前缀 → 同前缀端口规则 → 出口优先级</span>}
       </header>
@@ -604,16 +550,15 @@ export function RouteEditor({
                     onCancel={() => setEditing(null)}
                   />
                 ) : (
-                  <tr key={index} data-hit={hit === index || undefined}>
+                  <tr key={index}>
                     <td className="mono">{route.destination || <span className="cvm-faint">未填写</span>}</td>
                     <td className={`mono${route.service ? '' : ' cvm-faint'}`}>{serviceText(route)}</td>
                     <td>
                       <span className="cvm-route-via">
                         <Icon of={route.chain_id ? 'chains' : 'client'} size={13} />
                         <span title={targetName(targetKey(route), options)}>
-                          {targetName(targetKey(route), options).replace(/^(网卡|线路) · /, '')}
+                          {targetName(targetKey(route), options).replace(/^(出站方式|线路) · /, '')}
                         </span>
-                        {hit === index && <span className="st cvm-route-hit">命中</span>}
                       </span>
                     </td>
                     <td className="cvm-route-acts">
@@ -657,13 +602,12 @@ export function RouteEditor({
                   }
                 />
               )}
-              <tr className="cvm-route-rest" data-hit={result?.kind === 'default' || undefined}>
+              <tr className="cvm-route-rest">
                 <td colSpan={2}>其余流量</td>
                 <td>
                   <span className="cvm-route-via">
                     <Icon of="client" size={13} />
                     <span>{fallback}</span>
-                    {result?.kind === 'default' && <span className="st cvm-route-hit">默认出口</span>}
                   </span>
                 </td>
                 <td />
@@ -682,60 +626,6 @@ export function RouteEditor({
           ))}
           {!baremetal && (
             <RouteDns dns={routing.dns} writable={canEdit} onChange={dns => onChange({ ...routing, dns })} />
-          )}
-          {canTest ? (
-            <form
-              className="cvm-route-line cvm-route-probe"
-              aria-label="路由命中测试"
-              onSubmit={event => {
-                event.preventDefault();
-                if (body && !matchBlocked && !(active && match.isPending))
-                  match.mutate({ instanceId: desired.id, request: body, scope });
-              }}
-            >
-              <Icon of="search" size={13} />
-              <input
-                className="f mono"
-                aria-label="测试目标"
-                aria-invalid={!!probeText.trim() && !probe}
-                placeholder="203.0.113.9 tcp/443"
-                value={probeText}
-                onChange={event => setProbeText(event.currentTarget.value)}
-              />
-              <button className="btn sm" disabled={!body || !!matchBlocked || (active && match.isPending)}>
-                {active && match.isPending ? '正在测试…' : '测试命中'}
-              </button>
-              <span className="cvm-route-probe-result" role="status">
-                {matchBlocked ? (
-                  <span className="hot">{matchBlocked}</span>
-                ) : result ? (
-                  result.kind === 'route' ? (
-                    <>
-                      命中 <b className="mono">{result.route.destination}</b> →{' '}
-                      {targetName(targetKey(result.route), options)}
-                      <span className="cvm-faint"> · 优先级 {result.priority}</span>
-                      {result.blocked === 'chain_requires_tcp_udp' && (
-                        <span className="hot">；该协议不会经线路转发。</span>
-                      )}
-                    </>
-                  ) : result.kind === 'default' ? (
-                    <>
-                      未命中目标路由 → {fallback}
-                      <span className="cvm-faint"> · 默认出口</span>
-                    </>
-                  ) : null
-                ) : probeText.trim() && !probe ? (
-                  <span className="cvm-faint">写成「IP 协议/端口」，例如 2001:db8::1 udp/53；未写协议按 TCP 443。</span>
-                ) : probe ? (
-                  <span className="cvm-faint">按 {probeLabel(probe)} 测试，只计算当前路由配置，不探测实际连通性。</span>
-                ) : (
-                  <span className="cvm-faint">输入目标地址，按服务端规则计算命中的路由与出口。</span>
-                )}
-              </span>
-              {active && match.error && <ErrorBox error={match.error} />}
-            </form>
-          ) : (
-            <p className="cvm-route-line note">命中测试需要路由配置权限。</p>
           )}
         </>
       )}

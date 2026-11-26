@@ -100,18 +100,18 @@ export function NetworkPublications({
     occupancy.set(nic.publication_id, total);
   }
   return (
-    <section className="panel titled cvm-net-panel cvm-resource-panel cvm-network-publications" aria-label="出口网络">
+    <section className="panel titled cvm-net-panel cvm-resource-panel cvm-network-publications" aria-label="出站方式">
       <header>
-        <PanelTitle of="outbound">出口网络</PanelTitle>
-        <span className="hint" title="挂载后获得独立网卡与地址，只承担出网。流量额度按单张网卡的 UTC 自然月计算。">
+        <PanelTitle of="outbound">出站方式</PanelTitle>
+        <span className="hint" title="添加后获得独立出站地址，只承担出网。流量额度按单个出站方式的 UTC 自然月计算。">
           <span className="header-stat">{data.publications.length} 个网络 · </span>
-          容器挂载后获得独立网卡与地址，只承担出网；按 UTC 自然月计量流量额度
+          容器添加后获得独立出站地址，只承担出网；按 UTC 自然月计量流量额度
         </span>
         {data.can_manage && (
           <span className="cvm-panel-tools">
             <button type="button" className="btn sm" onClick={onCreate}>
               <Icon of="plus" size={13} />
-              添加出口网络
+              添加出站方式
             </button>
           </span>
         )}
@@ -122,23 +122,23 @@ export function NetworkPublications({
         <EmptyState icon="forwarding" title="暂无可用网络">
           {data.can_manage
             ? '选择具备网络提供能力的机器，创建网络规格并授权给使用者。'
-            : '管理员创建网络并授权后，就可以在容器内挂载。'}
+            : '管理员创建出站方式并授权后，容器即可使用。'}
         </EmptyState>
       ) : (
-        <div className="cvm-resource-scroll" role="region" aria-label="出口网络列表" tabIndex={0}>
-          <table className="tbl cvm-resource-table" aria-label="出口网络">
+        <div className="cvm-resource-scroll" role="region" aria-label="出站方式列表" tabIndex={0}>
+          <table className="tbl cvm-resource-table" aria-label="出站方式">
             <thead>
               <tr>
                 <th scope="col">网络</th>
                 <th scope="col">地址模式</th>
                 <th scope="col">连接方式</th>
-                <th scope="col">网卡</th>
+                <th scope="col">出站方式</th>
                 <th scope="col">规格</th>
                 <th scope="col">月流量额度（UTC）</th>
                 {data.can_manage && (
                   <>
                     <th scope="col">授权使用者</th>
-                    <th scope="col">接受新挂载</th>
+                    <th scope="col">接受新增</th>
                     <th scope="col">操作</th>
                   </>
                 )}
@@ -189,12 +189,12 @@ export function NetworkPublications({
                           {p.spec.limits.max_attachments}
                         </span>
                       </span>
-                      {awaitingCleanup > 0 && <span className="cvm-pub-sub">{awaitingCleanup} 张待清理</span>}
+                      {awaitingCleanup > 0 && <span className="cvm-pub-sub">{awaitingCleanup} 个待清理</span>}
                     </td>
                     <td>
                       <span className="mono">v{p.revision}</span>
-                      {outdated > 0 && <span className="st st-gold">{outdated} 张旧规格</span>}
-                      {!data.can_manage && !p.admitting && <span className="st st-pending">已停止新挂载</span>}
+                      {outdated > 0 && <span className="st st-gold">{outdated} 个旧规格</span>}
+                      {!data.can_manage && !p.admitting && <span className="st st-pending">已停止新增</span>}
                     </td>
                     <td className="cvm-resource-nowrap">
                       {p.spec.limits.monthly_bytes == null ? '不限额' : bytes(p.spec.limits.monthly_bytes)}
@@ -205,12 +205,12 @@ export function NetworkPublications({
                           <ResourceGrantNames grants={p.spec.grants} workspace={workspace} />
                         </td>
                         <td>
-                          <label className="switch cvm-admission-switch" title="停止新挂载不影响已有网卡">
+                          <label className="switch cvm-admission-switch" title="停止新增不影响已有出站方式">
                             <input
                               type="checkbox"
                               role="switch"
                               checked={p.admitting}
-                              aria-label={`${p.spec.name} 接受新挂载`}
+                              aria-label={`${p.spec.name} 接受新增`}
                               disabled={admission.isPending}
                               onChange={() => admission.mutate(p)}
                             />
@@ -226,7 +226,7 @@ export function NetworkPublications({
                               { label: '修改规格', note: '在整页编辑规格及授权', onSelect: () => onEdit(p.id) },
                               {
                                 label: '删除网络',
-                                note: '删除前会检查网卡及清理依赖',
+                                note: '删除前会检查出站方式及清理依赖',
                                 danger: true,
                                 disabled: admission.isPending,
                                 onSelect: () => setDeleting(p),
@@ -283,7 +283,7 @@ export function NetworkPublicationEditor({
   return (
     <>
       <CvmPageHeader
-        title={id ? '出口网络' : '添加出口网络'}
+        title={id ? '出站方式' : '添加出站方式'}
         tools={
           <TitleActions>
             <button type="button" className="btn" onClick={onBack}>
@@ -299,7 +299,7 @@ export function NetworkPublicationEditor({
           <ErrorBox error={catalog.error} />
         ) : (
           <EmptyState icon="forwarding" title="没有可编辑的网络">
-            出口网络不存在或不在当前账号的管理范围内。
+            出站方式不存在或不在当前账号的管理范围内。
           </EmptyState>
         )}
       </div>
@@ -425,7 +425,7 @@ function PublicationForm({
     setLocalError(null);
     save.mutate();
   };
-  const title = publication ? '修改网络规格' : '添加出口网络';
+  const title = publication ? '修改出站方式规格' : '添加出站方式';
   const specFields = (
     <>
       <div className="cvm-form-grid">
@@ -559,8 +559,7 @@ function PublicationForm({
         )}
       </div>
       <p className="note">
-        地址池用于分配容器网卡的地址，例如 10.120.0.0/24。共享出口地址是外部服务看到的地址，应填写提供机器实际可用的
-        IP。
+        地址池用于分配容器出站地址，例如 10.120.0.0/24。共享出口地址是外部服务看到的地址，应填写提供机器实际可用的 IP。
       </p>
       <label className="cvm-field">
         可访问的目标 IP／网段
@@ -573,12 +572,12 @@ function PublicationForm({
         />
       </label>
       <label className="cvm-field">
-        挂载时初始化的路由（可选）
+        添加时初始化的路由（可选）
         <textarea className="f" rows={2} value={presets} onChange={e => setPresets(e.target.value)} />
       </label>
       <p className="note">
         目标网段限制此网络允许访问的地址。每行填写一个 IP 或网段，0.0.0.0/0 表示全部 IPv4，::/0 表示全部
-        IPv6。初始路由只在新挂载时添加，留空后需在容器路由表中手动添加。
+        IPv6。初始路由只在新增时添加，留空后需在容器路由表中手动添加。
       </p>
       <fieldset className="cvm-network-offers">
         <legend>支持的连接方式</legend>
@@ -701,7 +700,7 @@ function PublicationForm({
         </summary>
         <div className="cvm-form-grid">
           <label>
-            最多挂载网卡数
+            最多添加出站方式数
             <input
               className="f"
               type="number"
@@ -715,7 +714,7 @@ function PublicationForm({
             [
               ['upload_bps', '上传上限（bit/s）'],
               ['download_bps', '下载上限（bit/s）'],
-              ['monthly_bytes', '每张网卡月流量额度（UTC，字节）'],
+              ['monthly_bytes', '每个出站方式月流量额度（UTC，字节）'],
             ] as const
           ).map(([key, label]) => (
             <label key={key}>
@@ -850,8 +849,8 @@ function PublicationForm({
                 <div className="cvm-panel-body">
                   <p className="note">
                     {publication
-                      ? `保存将创建 v${baseRevision + 1}，已有网卡保留原版本。`
-                      : '设置并授权容器可使用的出口网络。'}{' '}
+                      ? `保存将创建 v${baseRevision + 1}，已有出站方式保留原版本。`
+                      : '设置并授权容器可使用的出站方式。'}{' '}
                     保存后在「发布」中统一应用。
                   </p>
                   {specFields}
@@ -933,7 +932,7 @@ function GrantEditor({
       <fieldset className="cvm-resource-grants" disabled={disabled}>
         <legend className="cvm-lane-head cvm-panel-head">授权使用者</legend>
         <div className="cvm-panel-body">
-          <p className="note">撤销授权后，使用者不能新挂载；已有网卡将被阻断，但地址和路由保留。</p>
+          <p className="note">撤销授权后，使用者不能新增；已有出站方式将被阻断，但地址和路由保留。</p>
           <div className="cvm-resource-chips">
             {grants.map(grant => {
               const key = grantKey(grant);
@@ -943,7 +942,7 @@ function GrantEditor({
                   <span>{name}</span>
                   <small>
                     {unattributed > 0 && '已核对 '}
-                    {counts.get(key) ?? 0} 张网卡
+                    {counts.get(key) ?? 0} 个出站方式
                   </small>
                   <button
                     type="button"
@@ -958,7 +957,9 @@ function GrantEditor({
             })}
             {!grants.length && <span className="note">尚未授权使用者</span>}
           </div>
-          {unattributed > 0 && <p className="note">另有 {unattributed} 张网卡的使用者暂不可核对，未计入以上数量。</p>}
+          {unattributed > 0 && (
+            <p className="note">另有 {unattributed} 个出站方式的使用者暂不可核对，未计入以上数量。</p>
+          )}
           {!!removed.length && (
             <ul className="cvm-resource-effects" aria-label="撤销授权影响">
               {removed.map(grant => {
@@ -966,8 +967,8 @@ function GrantEditor({
                 return (
                   <li key={grantKey(grant)}>
                     <span>
-                      待撤销 {grantName(names, grant)} 的授权{count ? `，将阻断其 ${count} 张网卡` : '，将停止其新挂载'}
-                      。
+                      待撤销 {grantName(names, grant)} 的授权
+                      {count ? `，将阻断其 ${count} 个出站方式` : '，将停止其新增'}。
                     </span>
                     <button
                       type="button"
@@ -1042,12 +1043,12 @@ function DerivedNics({
   const count = attached.filter(({ nic }) => nic.publication_revision < publication.revision).length;
   const names = ownerNames(workspace);
   return (
-    <section className="cvm-resource-derived" aria-label="派生网卡">
+    <section className="cvm-resource-derived" aria-label="已分配出站方式">
       <div className="cvm-resource-panel">
         <header className="cvm-resource-heading cvm-lane-head">
-          <h2>派生网卡</h2>
+          <h2>已分配出站方式</h2>
           <small className="header-stat">
-            {attached.length} 张{awaitingCleanup > 0 && ` · ${awaitingCleanup} 条待清理`}
+            {attached.length} 个{awaitingCleanup > 0 && ` · ${awaitingCleanup} 个待清理`}
           </small>
           {count > 0 && (
             <span className="cvm-lane-aside">
@@ -1058,21 +1059,21 @@ function DerivedNics({
                 title={dirty ? '请先保存或放弃本页修改' : undefined}
                 onClick={() => setBulk(true)}
               >
-                批量应用 v{publication.revision} · {count} 张
+                批量应用 v{publication.revision} · {count} 个
               </button>
             </span>
           )}
         </header>
         {!rows.length ? (
-          <EmptyState icon="topology" title="暂无派生网卡">
-            此网络尚未分配网卡。
+          <EmptyState icon="topology" title="暂无已分配出站方式">
+            此网络尚未分配给容器。
           </EmptyState>
         ) : (
-          <div className="cvm-resource-scroll" role="region" aria-label="派生网卡列表" tabIndex={0}>
-            <table className="tbl cvm-resource-table cvm-derived-table" aria-label="派生网卡">
+          <div className="cvm-resource-scroll" role="region" aria-label="已分配出站方式列表" tabIndex={0}>
+            <table className="tbl cvm-resource-table cvm-derived-table" aria-label="已分配出站方式">
               <thead>
                 <tr>
-                  <th scope="col">容器 / 网卡</th>
+                  <th scope="col">容器 / 出站方式</th>
                   <th scope="col">使用者</th>
                   <th scope="col">地址</th>
                   <th scope="col">连接方式</th>
@@ -1134,7 +1135,7 @@ function DerivedNics({
           </div>
         )}
       </div>
-      <p className="cvm-notice">删除出口网络前须卸载派生网卡并等待清理完成。关闭「接受新挂载」不影响已有网卡。</p>
+      <p className="cvm-notice">删除出站方式前须移除已分配项并等待清理完成。关闭「接受新增」不影响已有分配。</p>
       {bulk && (
         <BulkNicVersionDialog
           publication={publication}
@@ -1178,12 +1179,12 @@ function DeletePublication({
       onSubmit={() => remove.mutate()}
       submit="删除网络"
     >
-      <p>删除「{publication.spec.name}」。请先处理以下网卡引用并等待资源清理完成。</p>
+      <p>删除「{publication.spec.name}」。请先处理以下出站方式引用并等待资源清理完成。</p>
       {dependencies.map(n => (
         <article className="cvm-attached" key={n.allocation_id}>
           <b>{n.instance_name}</b>
           <p className="note">
-            {n.cleanup_pending ? '等待资源清理确认' : `仍挂载 · ${n.route_references} 个路由或优先级引用`}
+            {n.cleanup_pending ? '等待资源清理确认' : `仍在使用 · ${n.route_references} 个路由或优先级引用`}
           </p>
           <button
             className="btn small"

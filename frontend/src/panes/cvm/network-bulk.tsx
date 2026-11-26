@@ -76,7 +76,7 @@ export function BulkNicVersionDialog({
   }
   return (
     <NicDialog
-      title="批量应用网卡规格"
+      title="批量应用出站方式规格"
       onClose={onClose}
       pending={update.isPending}
       disabled={!pending.length}
@@ -84,21 +84,21 @@ export function BulkNicVersionDialog({
     >
       <p>
         将「{publication.spec.name}」更新至版本 {revision}
-        ，保留现有地址、连接方式和容器路由表。同一容器内的所选网卡在一次操作中保存。
+        ，保留现有地址、连接方式和容器路由表。同一容器内的所选出站方式在一次操作中保存。
       </p>
       <p className="note">
         每批最多 {MAX_BATCH}{' '}
         张。需要重新分配地址、更换连接方式或修改路由时，请在容器中处理后再更新。保存后在「发布」中统一应用。
       </p>
       <p className="note" role="status">
-        本次选中 {pending.length} / {choices.length} 张待更新网卡
+        本次选中 {pending.length} / {choices.length} 个待更新出站方式
         {saved.size > 0 && ` · ${saved.size} 个容器已保存`}
       </p>
       <div className="cvm-attached-list">
         {choices.map(nic => {
           const checked = selected.has(nic.allocation_id);
           const savedInstance = saved.has(nic.instance_id);
-          const result = savedInstance && !checked ? '请重新打开后更新此网卡' : results[nic.allocation_id];
+          const result = savedInstance && !checked ? '请重新打开后更新此出站方式' : results[nic.allocation_id];
           return (
             <label className="cvm-check cvm-network-bulk-choice" key={nic.allocation_id}>
               <input

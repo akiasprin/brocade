@@ -50,7 +50,7 @@ export function TransportDialog({
   });
   return (
     <NicDialog
-      title="更换网卡连接方式"
+      title="更换出站连接方式"
       error={save.error}
       uncertain={uncertainCvmResult(save.error)}
       pending={save.isPending}
@@ -60,7 +60,7 @@ export function TransportDialog({
 
       disabled={(kind === nic.allocated?.transport && !rebuild) || !available?.transports.includes(kind)}
     >
-      <p>切换容器宿主与出口机器之间的连接方式，网卡、地址和路由保持不变。发布时现有连接可能短暂中断。</p>
+      <p>切换容器宿主与出口机器之间的连接方式，出站分配、地址和路由保持不变。发布时现有连接可能短暂中断。</p>
       <label className="cvm-field">
         连接方式
         <select className="f" value={kind} onChange={e => setKind(e.target.value as CvmNicTransport)}>
@@ -74,7 +74,7 @@ export function TransportDialog({
       </label>
       <label className="cvm-check">
         <input type="checkbox" checked={rebuild} onChange={e => setRebuild(e.target.checked)} />
-        重新建立连接并更换连接凭据，保留网卡与地址
+        重新建立连接并更换连接凭据，保留出站分配与地址
       </label>
       {available?.error && <p className="cvm-notice">{available.error}</p>}
       {save.error && <ErrorBox error={save.error} />}
@@ -118,7 +118,7 @@ export function NicVersionDialog({
   });
   return (
     <NicDialog
-      title="应用网卡新规格"
+      title="应用出站方式新规格"
       error={save.error}
       uncertain={uncertainCvmResult(save.error)}
       pending={save.isPending}
@@ -130,7 +130,7 @@ export function NicVersionDialog({
     >
       <p>
         从版本 {allocated.publication_revision} 更新至版本 {publication?.revision ?? '不可用'}
-        。保留网卡和路由表。保存后等待发布，地址变化可能中断现有连接。
+        。保留出站方式和路由表。保存后等待发布，地址变化可能中断现有连接。
       </p>
       {publication && (
         <dl className="cvm-facts">

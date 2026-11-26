@@ -268,7 +268,7 @@ function InstanceActions({
             )}
             {canAccess &&
               item('使用授权', instance.user_id ? '收回或查看授权' : '授权给同租户用户', () => setAccessOpen(true))}
-            {!baremetal && item('查看网络', '访问入口、网卡与路由', () => openDetail(instance, 'network'))}
+            {!baremetal && item('查看网络', '入站方式、出站方式与路由', () => openDetail(instance, 'network'))}
             {canCopyNew &&
               item('复制为新容器', '沿用镜像与规格填写创建表单', () =>
                 navigate('cvm', { p: 'new', copy: instance.desired.id }),
@@ -610,7 +610,7 @@ export function InstanceList({
   const publications = new Map(catalog.data?.publications.map(item => [item.id, item.spec.name]));
   const chainNames = new Map(chains.data?.chains.map(item => [item.id, item.name]));
   const canAct = selectable || manage;
-  const headers = ['容器', '规格', 'CPU', '内存', '访问入口', '出口', '本月流量', ...(canAct ? ['操作'] : [])];
+  const headers = ['容器', '规格', 'CPU', '内存', '入站方式', '出站方式', '本月流量', ...(canAct ? ['操作'] : [])];
   return (
     <section
       className="cvm-instance-list"

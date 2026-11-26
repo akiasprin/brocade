@@ -123,12 +123,12 @@ export function AccessDialog({
             ? '请先发布收回授权，并等待关机和网络清理确认。'
             : checkingNetwork && networkInUse
               ? cleaning
-                ? '正在等待访问入口和业务网卡清理；确认完成后才能授权。'
+                ? '正在等待入站方式和出站方式清理；确认完成后才能授权。'
                 : '请先移除旧网络配置，并发布等待清理确认。'
               : checkingNetwork && (entries.error || network.error)
-                ? '无法确认访问入口和业务网卡已清理，暂不能授权。'
+                ? '无法确认入站方式和出站方式已清理，暂不能授权。'
                 : checkingNetwork && (!entries.data || !network.data)
-                  ? '正在检查访问入口和业务网卡…'
+                  ? '正在检查入站方式和出站方式…'
                   : null;
   const submitDisabled = !authorized || mutation.isPending || (!replay && (!!blocked || user === (opened.owner ?? '')));
   if (!authorized) return null;
@@ -169,7 +169,7 @@ export function AccessDialog({
               <b>更换使用者前，须先收回授权并完成清理。</b>
               <ul className="cvm-impact-list">
                 <li>保存后，{owner?.name ?? opened.owner} 立即失去控制台访问；收回授权不可撤回。</li>
-                <li>发布后，容器关机，撤下访问入口和业务网卡，清空路由，并轮换登录密码。</li>
+                <li>发布后，容器关机，撤下入站方式和出站方式，清空路由，并轮换登录密码。</li>
                 <li>保留系统盘和数据；确认关机和网络已清理后才能重新授权。</li>
               </ul>
             </div>

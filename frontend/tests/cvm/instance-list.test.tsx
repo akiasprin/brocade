@@ -127,7 +127,7 @@ it('keeps the list operable when the entry feed fails', async () => {
   fireEvent.click(screen.getByRole('button', more));
   fireEvent.click(within(screen.getByRole('dialog', more)).getByRole('menuitem', { name: /^删除容器/ }));
   const deletion = within(screen.getByRole('dialog', { name: '删除容器' }));
-  expect(deletion.getByText('撤销该容器的全部入口（明细暂不可用）')).toBeTruthy();
+  expect(deletion.getByText('撤销该容器的全部入站方式（明细暂不可用）')).toBeTruthy();
 });
 
 it('hides private fields and operations for a redacted account', async () => {
@@ -186,7 +186,7 @@ it('anchors restart confirmation and requires an exact name for clean deletion',
   const deletion = within(modal);
   expect(deletion.getByText(/销毁 .* 系统盘及其数据/)).toBeTruthy();
   expect(deletion.getByText(/撤销 TCP 203\.0\.113\.20:30022-30029/)).toBeTruthy();
-  expect(deletion.getByText('卸载 2 张网卡')).toBeTruthy();
+  expect(deletion.getByText('移除 2 个出站方式')).toBeTruthy();
   expect(deletion.getByText(/香港 HKIX · 清理确认后释放 1 vCPU/)).toBeTruthy();
   const save = deletion.getByRole<HTMLButtonElement>('button', { name: '保存删除容器' });
   expect(save.disabled).toBe(true);

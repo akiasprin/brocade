@@ -165,7 +165,7 @@ export function InstanceDetail({
   const networkBadge =
     networkDraftCount > 0 && canWrite
       ? { count: networkDraftCount, label: `${networkDraftCount} 处未保存的网络变更`, tone: 'gold' as const }
-      : { count: networkCount, label: `${networkCount} 个入口、网卡与路由`, tone: 'dim' as const };
+      : { count: networkCount, label: `${networkCount} 个入站方式、出站方式与路由`, tone: 'dim' as const };
   return (
     <>
       {topBar}
@@ -455,13 +455,13 @@ function RemoveInstanceDialog({
           <ul className="cvm-impact-list">
             {native ? (
               <>
-                <li>撤下受管访问入口、网卡与路由，关闭受管终端访问。</li>
+                <li>撤下受管入站方式、出站方式与路由，关闭受管终端访问。</li>
                 <li>保留宿主操作系统、本地磁盘和数据，不对宿主关机。</li>
               </>
             ) : (
               <>
                 <li>停止实例并永久销毁系统盘；清盘后数据无法恢复。</li>
-                <li>撤销访问入口，卸载网卡并清理关联路由。</li>
+                <li>撤销入站方式，移除出站方式并清理关联路由。</li>
                 <li>释放该容器在宿主上的资源分配。</li>
               </>
             )}

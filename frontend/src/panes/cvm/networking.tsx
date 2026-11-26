@@ -77,7 +77,7 @@ function MountNicEditor({
   return (
     <form
       className="cvm-composer"
-      aria-label="挂载网卡"
+      aria-label="添加出站方式"
       onSubmit={event => {
         event.preventDefault();
         if (valid)
@@ -90,9 +90,15 @@ function MountNicEditor({
       }}
     >
       <div className="cvm-composer-head">
-        <b>挂载出口网卡</b>
-        <span className="note">分配独立网卡与地址，承载取双方支持的交集</span>
-        <button className="btn icon cvm-row-btn" type="button" aria-label="收起挂载网卡" title="收起" onClick={onClose}>
+        <b>添加出站方式</b>
+        <span className="note">分配独立地址，连接方式取双方支持的交集</span>
+        <button
+          className="btn icon cvm-row-btn"
+          type="button"
+          aria-label="收起添加出站方式"
+          title="收起"
+          onClick={onClose}
+        >
           <Icon of="close" size={13} />
         </button>
       </div>
@@ -121,7 +127,7 @@ function MountNicEditor({
                   <small>
                     {transports.length
                       ? `默认路由 ${item.spec.route_presets.join('、') || '无'}`
-                      : (state.mount_options[item.id]?.error ?? '当前不可挂载')}
+                      : (state.mount_options[item.id]?.error ?? '当前不可添加')}
                   </small>
                 </span>
               </label>
@@ -129,7 +135,7 @@ function MountNicEditor({
           })}
         </div>
       ) : (
-        <p className="note">当前使用者没有获授权的出口网络。</p>
+        <p className="note">当前使用者没有获授权的出站方式。</p>
       )}
       {option?.error && (
         <p className="cvm-notice" role="status">
@@ -232,11 +238,11 @@ export function ManagedNetworking({
   const mountReason = !canEdit
     ? null
     : !host?.fresh
-      ? '宿主能力已过期，等待机器恢复后可挂载。'
+      ? '宿主能力已过期，等待机器恢复后可添加。'
       : used >= slots
-        ? `当前宿主开放 ${slots} 张网卡，设备槽位已用满。`
+        ? `当前宿主最多支持 ${slots} 个出站方式，数量已用满。`
         : needsStop
-          ? '宿主需要先关机再挂载网卡。'
+          ? '宿主需要先关机再添加出站方式。'
           : null;
   const publicationFor = (id: string) => catalog.data?.publications.find(item => item.id === id);
   const logAction = (
@@ -253,10 +259,10 @@ export function ManagedNetworking({
   );
   const nicName = (nic: (typeof nics)[number]) =>
     nic.allocated
-      ? (catalog.data?.publications.find(p => p.id === nic.allocated!.publication_id)?.spec.name ?? '业务网卡')
+      ? (catalog.data?.publications.find(p => p.id === nic.allocated!.publication_id)?.spec.name ?? '出站方式')
       : instance.desired.spec.execution.kind === 'baremetal'
         ? '宿主网络'
-        : '管理主网卡';
+        : '默认出站';
   const free = Math.max(0, slots - used);
   return (
     <div className="cvm-network-edit">
@@ -269,11 +275,11 @@ export function ManagedNetworking({
           onChange={draft.change}
           writable={writable}
         />
-        <section className="panel titled cvm-net-panel" aria-label="网卡">
+        <section className="panel titled cvm-net-panel" aria-label="出站方式">
           <header>
-            <PanelTitle of="client">网卡</PanelTitle>
+            <PanelTitle of="client">出站方式</PanelTitle>
             <span className="hint">
-              {used} / {slots || '—'} 张
+              {used} / {slots || '—'} 个
             </span>
             <span className="cvm-panel-tools">
               {logAction}
@@ -287,7 +293,7 @@ export function ManagedNetworking({
                   onClick={() => setMountOpen(true)}
                 >
                   <Icon of="plus" size={13} />
-                  挂载网卡
+                  添加出站方式
                 </button>
               )}
             </span>
@@ -295,7 +301,7 @@ export function ManagedNetworking({
           {network.error && <ErrorBox error={network.error} />}
           {catalog.error && <ErrorBox error={catalog.error} />}
           {(network.isPending || (!workspace.redacted && catalog.isPending)) && <Loading />}
-          <ul className="cvm-nrows" aria-label="网卡列表">
+          <ul className="cvm-nrows" aria-label="出站方式列表">
             {nics.map(nic => {
               const allocated = nic.allocated;
               const usage = network.data?.usage[nic.id];
@@ -372,7 +378,7 @@ export function ManagedNetworking({
                       </span>
                       {newer && <span className="st st-gold">可应用 v{publication!.revision}</span>}
                     </span>
-                    <small className="mono" title={allocated ? '网卡地址与本月计量' : undefined}>
+                    <small className="mono" title={allocated ? '出站地址与本月计量' : undefined}>
                       {[
                         addresses,
                         allocated && !workspace.redacted
@@ -425,7 +431,7 @@ export function ManagedNetworking({
                       className={`st ${removing ? 'st-pending' : deviceReady && linked && !blocked ? 'st-succeeded' : blocked ? 'st-halted' : 'st-pending'}`}
                       title={link ?? undefined}
                     >
-                      {removing ? '待卸载' : status}
+                      {removing ? '待移除' : status}
                     </span>
                   ) : (
                     <span className="st">自动</span>
@@ -433,7 +439,7 @@ export function ManagedNetworking({
                   {allocated && workspace.can_write && (
                     <span className="cvm-nrow-acts">
                       <ActionMenu
-                        label={`${nicName(nic)} 网卡操作`}
+                        label={`${nicName(nic)} 出站方式操作`}
                         items={[
                           {
                             label: '更换连接方式',
@@ -458,15 +464,15 @@ export function ManagedNetworking({
                               ]
                             : []),
                           {
-                            label: removing ? '取消卸载' : '卸载网卡',
-                            note: removing ? '保留这张网卡' : '释放地址与分配，保存后待发布',
+                            label: removing ? '取消移除' : '移除出站方式',
+                            note: removing ? '保留此出站方式' : '释放地址与分配，保存后待发布',
                             danger: !removing,
                             disabled: detachBlocked
                               ? !removing && referenced
-                                ? '请先在路由中移除此网卡的引用'
+                                ? '请先在路由中移除此出站方式的引用'
                                 : instance.desired.power === 'running' && !host?.capabilities.hot_detach
-                                  ? '宿主需要先关机再卸载网卡'
-                                  : '等待配置收敛后可卸载'
+                                  ? '宿主需要先关机再移除出站方式'
+                                  : '等待配置收敛后可移除'
                               : false,
                             onSelect: () =>
                               draft.change({
@@ -485,7 +491,7 @@ export function ManagedNetworking({
             })}
             {mounts.map(mount => (
               <li className="cvm-nrow" data-draft="" key={mount.draft_id}>
-                <span className="cvm-nrow-dev">新网卡</span>
+                <span className="cvm-nrow-dev">新出站</span>
                 <div className="cvm-nrow-main">
                   <span className="cvm-nrow-title">
                     {publicationFor(mount.publication_id)?.spec.name ?? mount.publication_id}
@@ -514,14 +520,14 @@ export function ManagedNetworking({
             ))}
             {canEdit && !mountOpen && (
               <li className="cvm-nrow cvm-nrow-hint">
-                {mountReason ?? `还可挂载 ${free} 张业务网卡 · 宿主开放 ${slots} 张`}
+                {mountReason ?? `还可添加 ${free} 个出站方式 · 宿主最多支持 ${slots} 个`}
                 {workspace.can_manage_network && catalog.data?.publications.length === 0 && (
                   <button
                     className="btn sm cvm-row-btn"
                     type="button"
                     onClick={() => navigate('cvm', { p: 'network-new' })}
                   >
-                    创建出口网络
+                    创建出站方式
                   </button>
                 )}
               </li>
@@ -557,8 +563,6 @@ export function ManagedNetworking({
         routing={routing}
         onChange={changeRouting}
         writable={routesWritable}
-        canTest={canEdit}
-        networkEdit={draft.draft?.request}
         redacted={workspace.redacted}
         extraTargets={mounts.map(mount => {
           const publication = publicationFor(mount.publication_id);
@@ -610,8 +614,8 @@ export function ContainerAccessPanel({
         port,
         label:
           entry.mode.kind === 'l3'
-            ? '整 IP 入口'
-            : `${entry.mode.kind === 'protocols' ? entryTrafficText(entry.mode) : entry.mode.protocol.toUpperCase().replace('_', '+')} 入口`,
+            ? '整 IP 入站'
+            : `${entry.mode.kind === 'protocols' ? entryTrafficText(entry.mode) : entry.mode.protocol.toUpperCase().replace('_', '+')} 入站`,
       });
   }
   const privateAddress = instance.report?.access_address;
@@ -622,7 +626,7 @@ export function ContainerAccessPanel({
     return (
       <>
         <p className="note cvm-ssh-empty">
-          暂无可用的 SSH 地址，可通过实例终端连接；需要外部 SSH 时，在「网络」为容器添加指向 22 端口的访问入口。
+          暂无可用的 SSH 地址，可通过实例终端连接；需要外部 SSH 时，在「网络」为容器添加指向 22 端口的入站方式。
         </p>
         {entries.error && <ErrorBox error={entries.error} />}
       </>

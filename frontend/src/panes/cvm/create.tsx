@@ -340,7 +340,7 @@ export function CreateForm({
             </div>
             <p className="cvm-new-hint">
               {copied
-                ? `复制 ${copied.desired.spec.name} 的镜像、规格与业务网卡选项；不复制系统盘数据、登录凭证、授权、访问入口或路由。`
+                ? `复制 ${copied.desired.spec.name} 的镜像、规格与出站方式选项；不复制系统盘数据、登录凭证、授权、入站方式或路由。`
                 : '管理员创建并配置容器，再授权给用户使用；也可以稍后在「使用授权」指定。'}
             </p>
           </CreateStep>
@@ -366,7 +366,7 @@ export function CreateForm({
                         <b>{item.name}</b> <small>{caps.backend}</small>
                       </span>
                       <small className={blocked ? 'cvm-new-why' : undefined}>
-                        {blocked ?? `${used.instances} 个容器 · 最多 ${caps.max_interfaces} 张网卡`}
+                        {blocked ?? `${used.instances} 个容器 · 最多 ${caps.max_interfaces} 个出站方式`}
                       </small>
                     </span>
                     {!blocked && item.fresh && !item.error && (
@@ -491,16 +491,16 @@ export function CreateForm({
               <p className="note">这台机器尚不支持设置 CPU 和内存，请管理员升级宿主组件。</p>
             )}
           </CreateStep>
-          <CreateStep step={5} title="网络与访问" meta="主网卡自动生成 · 密码自动生成">
+          <CreateStep step={5} title="网络与访问" meta="默认网络自动生成 · 密码自动生成">
             <div className="cvm-new-net">
               <div className="cvm-new-net-row">
-                <span className="cvm-new-net-label">主网卡</span>
+                <span className="cvm-new-net-label">默认网络</span>
                 <span className="cvm-chip via">
-                  <span>管理主网卡</span>
+                  <span>默认出站</span>
                   <i>宿主 NAT</i>
                 </span>
                 <span className="cvm-new-hint">
-                  创建时生成，优先级最低{host ? ` · 宿主开放 ${host.capabilities.max_interfaces} 张网卡` : ''}
+                  创建时生成，优先级最低{host ? ` · 宿主最多支持 ${host.capabilities.max_interfaces} 个出站方式` : ''}
                 </span>
               </div>
               <CreateNetworkFields
@@ -554,7 +554,7 @@ export function CreateForm({
               </dd>
               <dt>初始网络</dt>
               <dd>
-                主网卡 · 宿主 NAT
+                默认出站 · 宿主 NAT
                 {hasNetworkChoices &&
                   (choices.network
                     ? ['', entryPreview, ...choices.network.nics.map(choices.nicLabel)].filter(Boolean).join(' + ')

@@ -163,7 +163,7 @@ export function NetworkLogsDialog({
               <div className="cvm-log-domains">
                 {node.domains.map(domain => (
                   <span key={domain.domain}>
-                    {domain.domain === 'entry' ? '入口' : '网卡／出口'} · 期望 v{domain.desired_generation}／回报{' '}
+                    {domain.domain === 'entry' ? '入站' : '出站'} · 期望 v{domain.desired_generation}／回报{' '}
                     {domain.reported_generation === null ? '尚无' : `v${domain.reported_generation}`}
                     {domain.error && <strong>{domain.error}</strong>}
                   </span>

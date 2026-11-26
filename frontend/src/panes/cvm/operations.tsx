@@ -48,7 +48,7 @@ export function CommandDialog({
     restart: '重启实例',
     reinstall: '重装系统',
     configure: '修改配置',
-    detach: '卸载网卡',
+    detach: '移除出站方式',
   }[dialog.action];
   const operationId = useNicRequestId();
   const previewChange: CvmChange | null =
@@ -204,13 +204,13 @@ export function CommandDialog({
                 </label>
               </div>
               <p className="note">
-                修改配置会保留系统盘和网卡。发布生效后可以开机。系统盘容量为{' '}
+                修改配置会保留系统盘和出站方式。发布生效后可以开机。系统盘容量为{' '}
                 {capacity(instance.desired.spec.resources.root_disk_bytes)}。
               </p>
             </>
           ) : dialog.action === 'reinstall' ? (
             <>
-              <p>重装会清除系统盘中的全部数据，并重新生成系统访问身份。CPU、内存和已挂载网卡保留。</p>
+              <p>重装会清除系统盘中的全部数据，并重新生成系统访问身份。CPU、内存和已有出站方式保留。</p>
               <label className="cvm-field">
                 系统镜像
                 <select className="f" value={imageId} onChange={e => setImageId(e.target.value)} disabled={inputLocked}>
@@ -226,12 +226,12 @@ export function CommandDialog({
           ) : (
             <p>
               {dialog.action === 'restart'
-                ? '重启会短暂中断连接，系统盘数据和网卡配置保留。'
+                ? '重启会短暂中断连接，系统盘数据和出站配置保留。'
                 : dialog.action === 'stop'
-                  ? '停止会中断实例连接，系统盘和挂载配置保留。'
+                  ? '停止会中断实例连接，系统盘和网络配置保留。'
                   : dialog.action === 'detach'
-                    ? '发布后移除这张网卡，经由它的网络连接将中断。移除完成后释放该网卡的地址。'
-                    : '使用现有系统盘和网卡配置开机，保留系统盘数据。'}
+                    ? '发布后移除此出站方式，经由它的网络连接将中断。移除完成后释放地址。'
+                    : '使用现有系统盘和出站配置开机，保留系统盘数据。'}
             </p>
           )}
           <p className="note">保存后在「发布」中统一应用，发布前可在实例详情撤回。</p>

@@ -174,7 +174,7 @@ it('separates instance and host pages without removing creation and terminal man
   expect(screen.getByRole('switch', { name: `${data.hosts[0].name} WebShell` })).toBeTruthy();
   fireEvent.click(row);
   expect(row.getAttribute('aria-expanded')).toBe('true');
-  expect(screen.getByText(/网卡上限/)).toBeTruthy();
+  expect(screen.getByText(/出站方式上限/)).toBeTruthy();
   expect(await screen.findByText('线路出口', { exact: false })).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: '在此创建' }));
   expect(navigate).toHaveBeenLastCalledWith('cvm', { p: 'new', host: data.hosts[0].node_id });
@@ -338,7 +338,7 @@ it('keeps cleanup available on an unhealthy machine while disabling new runtime 
   fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
   expect((screen.getByRole('button', { name: '核查并重试原任务' }) as HTMLButtonElement).disabled).toBe(false);
   fireEvent.click(screen.getByRole('tab', { name: '网络' }));
-  expect((screen.getByRole('button', { name: '挂载网卡' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole('button', { name: '添加出站方式' }) as HTMLButtonElement).disabled).toBe(true);
 });
 it.each(['reader', 'public'])('keeps read-only %s identities outside creation while allowing detail', operatorId => {
   const viewer: Whoami = { ...who, operator_id: operatorId, role: 'readonly', masked_assets: true };
@@ -384,7 +384,7 @@ it('lets guests inspect redacted details and monitoring without instance writes 
   fireEvent.click(screen.getByRole('tab', { name: '网络' }));
   const network = within(screen.getByRole('tabpanel', { name: '网络' }));
   expect(network.getByText('访问地址已脱敏。')).toBeTruthy();
-  expect(network.queryByRole('button', { name: '挂载网卡' })).toBeNull();
+  expect(network.queryByRole('button', { name: '添加出站方式' })).toBeNull();
   expect(network.queryByText(/GreenVPS|remote-ingress|203\.0\.113\.20/)).toBeNull();
   fireEvent.click(screen.getByRole('tab', { name: '监控与诊断' }));
   expect(await screen.findByText('尚无实例监控数据。宿主更新采集能力后会自动上报。')).toBeTruthy();
@@ -511,7 +511,7 @@ it('keeps the staged entry visible and locks draft editing after an uncertain sa
   fireEvent.change(listen, { target: { value: '30040' } });
   fireEvent.change(target, { target: { value: '30040 → 8080' } });
   fireEvent.click(add);
-  const list = screen.getByRole('list', { name: '访问入口列表' });
+  const list = screen.getByRole('list', { name: '入站方式列表' });
   expect(await within(list).findByText('203.0.113.20 · TCP 30040；映射 30040 → 8080', { exact: true })).toBeTruthy();
   expect(writes).toEqual([]);
   fireEvent.click(await screen.findByRole('button', { name: '保存网络变更' }));
@@ -742,7 +742,7 @@ it('opens diagnostics while retaining overview state and requests real history r
   fireEvent.keyDown(screen.getByRole('tab', { name: '监控与诊断' }), { key: 'Home' });
   expect(screen.getByRole('tab', { name: '概览' }).getAttribute('aria-selected')).toBe('true');
   fireEvent.click(screen.getByRole('tab', { name: '网络' }));
-  expect(screen.getByRole('region', { name: '路由与命中测试' })).toBeTruthy();
+  expect(screen.getByRole('region', { name: '路由' })).toBeTruthy();
 });
 
 it('manages WebShell from the 容器 page and preserves versioned server state', async () => {
@@ -832,7 +832,7 @@ it('labels a bare-metal local exit as the existing host network', async () => {
   fireEvent.click(await screen.findByRole('button', { name: 'baremetal-workspace' }));
   expect(navigate).toHaveBeenCalledWith('cvm', { p: 'instance', id: data.instances[0].desired.id });
   fireEvent.click(screen.getByRole('tab', { name: '网络' }));
-  const nics = screen.getByRole('region', { name: '网卡' });
+  const nics = screen.getByRole('region', { name: '出站方式' });
   expect(within(nics).getByText(/宿主原有网络/)).toBeTruthy();
   expect(within(nics).queryByText(/宿主机? NAT/)).toBeNull();
 });
@@ -845,7 +845,7 @@ it.each(['system-admin', 'user'] as const)(
     if (role !== 'system-admin') expect(nicCatalog(false).providers).toEqual([]);
     mount(data, { p: 'instance', id: data.instances[0].desired.id }, { ...who, role });
     fireEvent.click(await screen.findByRole('tab', { name: '网络' }));
-    const entries = screen.getByRole('list', { name: '访问入口列表' });
+    const entries = screen.getByRole('list', { name: '入站方式列表' });
     expect((await within(entries).findAllByText(/GreenVPS · 香港网络/)).length).toBeGreaterThan(0);
     expect(entries.textContent).not.toContain('remote-ingress');
   },
@@ -1092,8 +1092,8 @@ it('retrieves a password only on explicit request and can hide it again', async 
 async function openSharedEntryForm() {
   const network = await screen.findByRole('tab', { name: '网络' });
   if (network.getAttribute('aria-selected') !== 'true') fireEvent.click(network);
-  fireEvent.click(screen.getByRole('button', { name: '添加入口' }));
-  const form = screen.getByRole('form', { name: '添加访问入口' });
+  fireEvent.click(screen.getByRole('button', { name: '添加入站方式' }));
+  const form = screen.getByRole('form', { name: '添加入站方式' });
   const addresses = await within(form).findByRole('radiogroup', { name: '入口地址' });
   fireEvent.click(await within(addresses).findByRole('radio', { name: /203\.0\.113\.20/ }));
   return {
@@ -1184,7 +1184,7 @@ it.each([
     await screen.findByText('保存响应丢失，请重试');
     const bar = within(screen.getByLabelText('容器草稿与待发布变更'));
     expect(bar.getByRole<HTMLButtonElement>('button', { name: '丢弃当前草稿' }).disabled).toBe(true);
-    expect(screen.queryByRole('button', { name: '添加入口' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '添加入站方式' })).toBeNull();
     fireEvent.click(bar.getByRole('button', { name: '重试原保存' }));
     await bar.findByRole('button', { name: '1 个容器待发布' });
     await waitFor(() => expect(bar.queryByRole('button', { name: '1 处未保存' })).toBeNull());

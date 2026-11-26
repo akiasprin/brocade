@@ -10,14 +10,7 @@ import { networkLogs } from './log-data';
 import { entryBoard } from './entry-data';
 import { artifactHistory, artifactReceipt } from './artifact-data';
 import { chainCatalog } from './chain-data';
-import type {
-  CvmChange,
-  CvmCreate,
-  CvmNetworkQuotaLimits,
-  CvmRouteMatchRequest,
-  CvmRouteMatchResult,
-  DeploymentPlan,
-} from '../../../src/api';
+import type { CvmChange, CvmCreate, CvmNetworkQuotaLimits, DeploymentPlan } from '../../../src/api';
 import type { CvmNetworkEditRequest } from '../../../src/api/cvm-network-edit';
 import '../../../src/styles.css';
 
@@ -182,36 +175,6 @@ if (scene.startsWith('chain-')) {
   instance.desired.spec.routing.priorities.push({ chain_id: 'chain-us', ipv4: 200, ipv6: 200 });
   instance.desired.spec.routing.routes.push({ destination: '203.0.113.0/24', chain_id: 'chain-us' });
 }
-/** Preview-only route matcher: longest prefix, then service rules, then exit priority. IPv6 only matches `::/0`. */
-function matchRoute(request: CvmRouteMatchRequest): CvmRouteMatchResult {
-  const routing = request.routes ?? request.network_edit?.routes?.routes ?? workspace.instances[0].desired.spec.routing;
-  const v6 = request.destination.includes(':');
-  const ip = v6 ? 0 : request.destination.split('.').reduce((value, octet) => value * 256 + Number(octet), 0);
-  const candidates = routing.routes.flatMap((route, route_index) => {
-    const [network, bits = v6 ? '128' : '32'] = route.destination.split('/');
-    if (network.includes(':') !== v6) return [];
-    const prefix = Number(bits);
-    if (v6 ? prefix !== 0 : prefix > 0) {
-      if (v6) return [];
-      const base = network.split('.').reduce((value, octet) => value * 256 + Number(octet), 0);
-      const size = 2 ** (32 - prefix);
-      if (Math.floor(ip / size) !== Math.floor(base / size)) return [];
-    }
-    const service = route.service;
-    if (service && (service.protocol !== request.protocol || request.port == null)) return [];
-    if (service && (request.port! < service.port_start || request.port! > service.port_end)) return [];
-    const target = route.chain_id ? { chain_id: route.chain_id } : { interface_id: route.interface_id };
-    const priority = routing.priorities.find(
-      p => p.chain_id === target.chain_id && p.interface_id === target.interface_id,
-    )?.[v6 ? 'ipv6' : 'ipv4'];
-    return priority == null ? [] : [{ route_index, route, prefix, service: !!service, priority }];
-  });
-  candidates.sort((a, b) => b.prefix - a.prefix || Number(b.service) - Number(a.service) || a.priority - b.priority);
-  const best = candidates[0];
-  return best
-    ? { kind: 'route', route_index: best.route_index, route: best.route, priority: best.priority }
-    : { kind: 'default' };
-}
 const initialInstance = structuredClone(workspace.instances[0]);
 const mutations: unknown[] = [];
 const entries = entryBoard(workspace, scene);
@@ -338,7 +301,7 @@ globalThis.fetch = async (input, init) => {
       return Response.json(entry, { status: 201 });
     }
     const entry = entries.entries.find(item => url.pathname.split('/')[3] === item.id);
-    if (!entry) return Response.json({ error: '访问入口不存在' }, { status: 404 });
+    if (!entry) return Response.json({ error: '入站方式不存在' }, { status: 404 });
     entry.revision += 1;
     if (method === 'PUT') entry.instance_id = body.instance_id;
     if (method === 'DELETE') entry.state = 'releasing';
@@ -530,6 +493,7 @@ globalThis.fetch = async (input, init) => {
       expires_in_seconds: 30,
       max_sessions_per_node: 3,
       history_bytes: 4 * 1024 ** 2,
+      latency_supported: params.get('latency') === '1',
       webrtc: { supported: params.get('rtc') === '1', stun_servers: ['stun:stun.cloudflare.com:3478'] },
     });
   }
@@ -560,8 +524,6 @@ globalThis.fetch = async (input, init) => {
     workspace.instances.push(item);
     return Response.json(item, { status: 202 });
   }
-  if (url.pathname.endsWith('/routes/match') && method === 'POST')
-    return Response.json(matchRoute(JSON.parse(String(init?.body))));
   if (url.pathname.startsWith('/cvm/') && method === 'POST') {
     const body = JSON.parse(String(init?.body)) as CvmChange;
     mutations.push(body);

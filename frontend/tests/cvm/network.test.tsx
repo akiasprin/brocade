@@ -68,10 +68,10 @@ function Network({ workspace }: { workspace: ReturnType<typeof cvmWorkspace> }) 
 it('stages unmounting only after routes and priorities are cleared, without writing to the server', async () => {
   const { writes } = mount(<Network workspace={cvmWorkspace('detail')} />);
   await screen.findByTitle('两端已连接');
-  const editor = within(screen.getByRole('region', { name: '路由与命中测试' }));
-  const actions = screen.getByRole('button', { name: /网卡操作$/ });
+  const editor = within(screen.getByRole('region', { name: '路由' }));
+  const actions = screen.getByRole('button', { name: /出站方式操作$/ });
   fireEvent.click(actions);
-  expect(screen.getByRole<HTMLButtonElement>('menuitem', { name: /^卸载/ }).disabled).toBe(true);
+  expect(screen.getByRole<HTMLButtonElement>('menuitem', { name: /^移除出站方式/ }).disabled).toBe(true);
   fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
   await waitFor(() => expect(actions.getAttribute('aria-expanded')).toBe('false'));
   expect(editor.getAllByRole('textbox', { name: '目标 IP／网段' })).toHaveLength(1);
@@ -81,11 +81,11 @@ it('stages unmounting only after routes and priorities are cleared, without writ
     expect(within(editor.getByRole('table', { name: '目标路由' })).getAllByRole('row')).toHaveLength(3),
   );
   expect(editor.queryAllByRole('spinbutton', { name: /优先级/ })).toHaveLength(0);
-  fireEvent.click(screen.getByRole('button', { name: /网卡操作$/ }));
-  const detach = await screen.findByRole<HTMLButtonElement>('menuitem', { name: /^卸载/ });
+  fireEvent.click(screen.getByRole('button', { name: /出站方式操作$/ }));
+  const detach = await screen.findByRole<HTMLButtonElement>('menuitem', { name: /^移除出站方式/ });
   expect(detach.disabled).toBe(false);
   fireEvent.click(detach);
-  expect(await screen.findByText('待卸载')).toBeTruthy();
+  expect(await screen.findByText('待移除')).toBeTruthy();
   expect(writes).toHaveLength(0);
 });
 it('changes transport without asking for another IP or route allocation', async () => {
@@ -128,8 +128,8 @@ it('recommends only active entries to SSH and keeps the management address as an
     .getAllByRole('option')
     .map(option => option.textContent);
   expect(options).toEqual([
-    'TCP 入口 · 203.0.113.20:30022',
-    '整 IP 入口 · 198.51.100.30:22',
+    'TCP 入站 · 203.0.113.20:30022',
+    '整 IP 入站 · 198.51.100.30:22',
     '宿主内管理地址 · 192.168.0.21:22',
   ]);
   expect(panel.textContent).not.toContain('30023');

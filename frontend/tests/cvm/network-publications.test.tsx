@@ -61,17 +61,17 @@ it('lists entry and outbound resources in tables with actual addresses, quotas a
     catalog,
     entries,
   );
-  const entry = within(await screen.findByRole('table', { name: '访问入口地址' }));
+  const entry = within(await screen.findByRole('table', { name: '入站方式' }));
   expect(entry.getByText('30000–30999')).toBeTruthy();
   expect(entry.getByText('端口 443')).toBeTruthy();
   expect(entry.getByText('独占地址')).toBeTruthy();
-  const outbound = within(await screen.findByRole('table', { name: '出口网络' }));
+  const outbound = within(await screen.findByRole('table', { name: '出站方式' }));
   expect(outbound.getByText('100.00 GiB')).toBeTruthy();
-  expect(outbound.getByText('1 张旧规格')).toBeTruthy();
+  expect(outbound.getByText('1 个旧规格')).toBeTruthy();
   expect(outbound.getByText('alice')).toBeTruthy();
   fireEvent.click(outbound.getByRole('button', { name: '香港 · 公网出口' }));
   expect(edit).toHaveBeenCalledExactlyOnceWith('network-hk');
-  fireEvent.click(screen.getByRole('button', { name: '添加出口网络' }));
+  fireEvent.click(screen.getByRole('button', { name: '添加出站方式' }));
   expect(create).toHaveBeenCalledTimes(1);
   expect(screen.queryByRole('dialog')).toBeNull();
 });
@@ -85,15 +85,15 @@ it('shows grant impact before saving, supports adding an owner and preserves aut
   await screen.findByRole('heading', { name: '香港 · 公网出口', level: 1 });
   expect(screen.queryByRole('dialog')).toBeNull();
   const grants = within(screen.getByRole('group', { name: '授权使用者' }));
-  expect(grants.getByText('1 张网卡')).toBeTruthy();
+  expect(grants.getByText('1 个出站方式')).toBeTruthy();
   fireEvent.click(grants.getByRole('button', { name: '撤销 alice 的授权' }));
-  expect(grants.getByText(/待撤销 alice 的授权，将阻断其 1 张网卡/)).toBeTruthy();
+  expect(grants.getByText(/待撤销 alice 的授权，将阻断其 1 个出站方式/)).toBeTruthy();
   expect(writes).toHaveLength(0);
   const select = grants.getByRole('combobox', { name: '选择授权使用者' });
   const option = grants.getByRole<HTMLOptionElement>('option', { name: 'bob · 平台' });
   fireEvent.change(select, { target: { value: option.value } });
   fireEvent.click(grants.getByRole('button', { name: '＋ 授权' }));
-  expect(grants.getByText('0 张网卡')).toBeTruthy();
+  expect(grants.getByText('0 个出站方式')).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: '保存为 v3' }));
   await waitFor(() => expect(back).toHaveBeenCalledTimes(1));
   expect(writes).toMatchObject([
@@ -125,15 +125,15 @@ it('shows all derived allocations and batches only attached old versions into on
     cleanup_pending: true,
   });
   const writes = mount(<NetworkPublicationEditor workspace={workspace} id="network-hk" onBack={vi.fn()} />, catalog);
-  const table = within(await screen.findByRole('table', { name: '派生网卡' }));
+  const table = within(await screen.findByRole('table', { name: '已分配出站方式' }));
   expect(table.getAllByRole('row')).toHaveLength(5);
   expect(table.getAllByText('旧规格')).toHaveLength(2);
   expect(table.getByText('最新规格')).toBeTruthy();
   expect(table.getByText('等待清理')).toBeTruthy();
   expect(table.getAllByText('10.60.0.2')).toHaveLength(3);
-  expect(screen.getByRole('group', { name: '授权使用者' }).textContent).toContain('3 张网卡');
-  fireEvent.click(screen.getByRole('button', { name: '批量应用 v2 · 2 张' }));
-  const bulk = within(await screen.findByRole('dialog', { name: '批量应用网卡规格' }));
+  expect(screen.getByRole('group', { name: '授权使用者' }).textContent).toContain('3 个出站方式');
+  fireEvent.click(screen.getByRole('button', { name: '批量应用 v2 · 2 个' }));
+  const bulk = within(await screen.findByRole('dialog', { name: '批量应用出站方式规格' }));
   expect(bulk.getAllByRole<HTMLInputElement>('checkbox').map(option => option.checked)).toEqual([true, true]);
   fireEvent.click(bulk.getByRole('button', { name: '保存变更' }));
   await bulk.findByText(/1 个容器已保存/);

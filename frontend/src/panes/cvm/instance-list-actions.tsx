@@ -100,9 +100,9 @@ export function useListCommandRecovery() {
 }
 
 const actionDescription: Record<ListAction, string> = {
-  start: '发布后使用现有系统盘和网卡配置开机。',
-  stop: '发布后关机会中断连接，系统盘与网卡配置保留。',
-  restart: '发布后重启会短暂中断连接，系统盘与网卡配置保留。',
+  start: '发布后使用现有系统盘和出站配置开机。',
+  stop: '发布后关机会中断连接，系统盘与出站配置保留。',
+  restart: '发布后重启会短暂中断连接，系统盘与出站配置保留。',
   retry: '提交后由宿主核查并重试，沿用原任务身份。',
   undo_pending: '恢复到上一次已发布的配置。',
   delete: '保存后等待发布。发布并执行清盘后，系统盘数据无法恢复。',
@@ -131,16 +131,16 @@ function DeleteImpact({ instance, host, entries }: { instance: CvmInstance; host
     <dl className="cvm-list-delete-impact">
       <dt>系统盘</dt>
       <dd>销毁 {capacity(resources.root_disk_bytes)} 系统盘及其数据</dd>
-      <dt>访问入口</dt>
+      <dt>入站方式</dt>
       <dd>
         {entriesText
           ? entriesText.length
             ? `撤销 ${entriesText.join('、')}`
             : '无'
-          : '撤销该容器的全部入口（明细暂不可用）'}
+          : '撤销该容器的全部入站方式（明细暂不可用）'}
       </dd>
-      <dt>网卡</dt>
-      <dd>{nicCount ? `卸载 ${nicCount} 张网卡` : '清理该容器的受管网卡'}</dd>
+      <dt>出站方式</dt>
+      <dd>{nicCount ? `移除 ${nicCount} 个出站方式` : '清理该容器的受管出站方式'}</dd>
       <dt>宿主分配</dt>
       <dd>
         {host?.name ?? instance.node_id} · 清理确认后释放 {resources.vcpus} vCPU · {capacity(resources.memory_bytes)}{' '}

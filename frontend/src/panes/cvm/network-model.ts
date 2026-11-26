@@ -150,7 +150,7 @@ export function parseService(text: string): CvmRouteService | null {
   return { protocol: match[1].toLowerCase() as 'tcp' | 'udp', port_start, port_end };
 }
 
-/** 新路由加在末尾；网卡还没有优先级时补一个比现有都低的。 */
+/** 新路由加在末尾；出站方式还没有优先级时补一个比现有都低的。 */
 export function withRoute(
   routing: CvmContainerRoutes,
   route: CvmContainerRoute,

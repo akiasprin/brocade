@@ -10,7 +10,7 @@ export const requestId = randomKey;
 export const hasPendingCvmChange = (instance: CvmInstance) =>
   instance.reserved && instance.revision_id != null && instance.revision_id > (instance.published_revision_id ?? 0);
 export const operationText: Record<string, string> = {
-  entries: '修改访问入口',
+  entries: '修改入站方式',
   create: '创建容器',
   adopt: '纳管裸机',
   start: '开机',
@@ -22,13 +22,13 @@ export const operationText: Record<string, string> = {
   delete: '删除容器',
   release_host: '解除纳管',
   force_node_retirement: '随机器强制退役',
-  detach: '卸载网卡',
+  detach: '移除出站方式',
   routes: '修改路由',
-  mount: '挂载网卡',
-  network_edit: '修改入口、网卡与路由',
+  mount: '添加出站方式',
+  network_edit: '修改入站、出站与路由',
   reset_password: '重置登录密码',
-  nic_version: '更新网卡规格',
-  nic_transport: '更换网卡连接方式',
+  nic_version: '更新出站方式规格',
+  nic_transport: '更换出站连接方式',
   undo_pending: '撤回变更',
 };
 export const supportsGuestTerminal = (caps: CvmCapabilities | undefined) =>

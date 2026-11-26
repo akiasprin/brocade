@@ -100,7 +100,7 @@ it('copies tenant-eligible specs and publication intent without copying assignme
   expect(screen.getByRole('alert').textContent).toMatch(/选择获授权的使用者/);
 
   fireEvent.change(screen.getByLabelText('使用者'), { target: { value: 'alice' } });
-  const entry = screen.getByLabelText('访问入口地址');
+  const entry = screen.getByLabelText('入站方式');
   const shared = await within(entry).findByRole('option', { name: /香港共享入口/ });
   expect(within(entry).queryByRole('option', { name: /198\.51\.100\.30/ })).toBeNull();
   expect(within(entry).getByRole('option', { name: /198\.51\.100\.31/ })).toBeTruthy();

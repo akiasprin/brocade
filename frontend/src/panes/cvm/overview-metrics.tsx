@@ -178,7 +178,7 @@ export function CvmOverviewMetrics({
         {tile(
           'network',
           '网络',
-          '网卡收发',
+          '网络收发',
           '',
           rxReading && txReading ? (
             <>
@@ -196,7 +196,7 @@ export function CvmOverviewMetrics({
           className={`kpi${toneClass(monthShare)}`}
           title={
             !metered
-              ? '未挂载计量网卡'
+              ? '未配置计量出站方式'
               : meter.error
                 ? '本月流量读取失败'
                 : `UTC 自然月${monthly?.month_coverage_gap ? ' · 统计有缺口' : ''}`

@@ -6,7 +6,7 @@ import { entryPortText, entryTrafficText } from './entry-ports';
 import { GIB, MIB } from './queries';
 import { targetKey } from './route-target';
 
-/* 清单与详情概览共用的网络标记。访问入口按「协议 · 入口端口 → 容器端口」写，地址进提示：
+/* 清单与详情概览共用的网络标记。入站方式按「协议 · 入站端口 → 容器端口」写，地址进提示：
    同一台入口机器上的多条入口通常共用一个地址，逐条重复地址会把端口挤出视野。 */
 
 export type NetChip = {
@@ -81,7 +81,7 @@ export function exitChips(
     }
     const nic = spec.interfaces.find(item => item.id === first.interface_id);
     const publicationId = nic?.allocated?.publication_id;
-    const text = publicationId ? (publicationName(publicationId) ?? '出口网卡') : nic ? '主网卡' : '网卡待确认';
+    const text = publicationId ? (publicationName(publicationId) ?? '出站方式') : nic ? '默认出站' : '出站方式待确认';
     return { key, text, tail, kind: 'via' };
   });
   if (!spec.routing.routes.some(route => isDefault(route.destination) && !route.service))
@@ -89,7 +89,7 @@ export function exitChips(
       key: 'local',
       lead: '其余',
       text: spec.execution.kind === 'baremetal' ? '宿主路由' : '本机',
-      title: '未命中路由的流量经主网卡出网',
+      title: '未匹配路由的流量经默认出站方式发送',
       kind: 'local',
     });
   return chips;

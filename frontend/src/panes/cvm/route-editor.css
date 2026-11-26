@@ -1,5 +1,5 @@
 /* 路由表：只读行 + 一行新增（就地编辑同一行格式）+ 其余流量；下方依次是出口优先级、
-   提示、容器 DNS 与命中测试。各段之间一条细分隔线，整张卡沿用 .panel.titled。 */
+   提示与容器 DNS。各段之间一条细分隔线，整张卡沿用 .panel.titled。 */
 .cvm-route-panel {
   container-type: inline-size;
 }
@@ -60,18 +60,6 @@
 .cvm-route-via > .ui-icon {
   flex: none;
   color: var(--ink-4);
-}
-.cvm-route-hit.st {
-  margin: 0 0 0 auto;
-  border-color: color-mix(in srgb, var(--action) 50%, var(--line));
-  background: var(--action-wash);
-  color: var(--action);
-}
-.cvm-route-table tr[data-hit] td {
-  background: color-mix(in srgb, var(--action) 6%, var(--card));
-}
-.cvm-route-table tr[data-hit] td:first-child {
-  box-shadow: inset 2px 0 0 var(--action);
 }
 .cvm-route-acts {
   text-align: right;
@@ -246,7 +234,7 @@
   font-size: 11.5px;
 }
 
-/* 单行信息条：提示、容器 DNS、命中测试。 */
+/* 单行信息条：提示与容器 DNS。 */
 .cvm-route-line {
   --ctl-h: 28px;
   display: flex;
@@ -269,30 +257,6 @@
 }
 .cvm-route-notice {
   color: var(--ink-3);
-}
-.cvm-route-probe {
-  background: color-mix(in srgb, var(--action) 4%, var(--band));
-}
-.cvm-route-probe > .ui-icon {
-  color: var(--action);
-}
-.cvm-route-probe > input.f {
-  flex-basis: 200px;
-}
-.cvm-route-probe-result {
-  flex: 1 1 260px;
-  min-width: 0;
-  color: var(--ink-2);
-}
-.cvm-route-probe-result b {
-  font-weight: 500;
-}
-.cvm-route-probe-result .hot {
-  color: var(--gold);
-}
-.cvm-route-probe > .error-box,
-.cvm-route-probe > [role='alert'] {
-  flex: 1 0 100%;
 }
 @container (max-width: 560px) {
   .cvm-route-table thead {

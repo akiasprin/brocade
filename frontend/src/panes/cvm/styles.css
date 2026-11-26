@@ -42,9 +42,17 @@
 .panel.titled.cvm-net-panel > :is(header, summary) {
   padding: 0 12px;
 }
+.panel.titled.cvm-net-panel > :is(header, summary) .panel-title {
+  /* 四字的「出站方式」与右侧操作并排时仍作为一个标题，不在手机上按字竖排。 */
+  white-space: nowrap;
+}
 /* 窄页面的标题栏只留标题、状态与操作（同全站手机标题栏约定）：数量、匹配顺序、执行方式等说明
    在正文里都有，挤在标题旁会把标题或说明压成竖排。 */
 @container (max-width: 560px) {
+  .panel.titled.cvm-net-panel > :is(header, summary) {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
   .panel.titled.cvm-net-panel > :is(header, summary) > .hint {
     display: none;
   }
@@ -716,7 +724,7 @@
   display: block;
   color: var(--gold);
 }
-/* 待发布条经 DraftSlot 落到顶栏下方；只有编辑出口网络的资源草稿仍在纸面顶部，与标题栏拼成一块。 */
+/* 待发布条经 DraftSlot 落到顶栏下方；只有编辑出站方式的资源草稿仍在纸面顶部，与标题栏拼成一块。 */
 .cvm-page > .nd-paper > .cvm-resource-draft:first-child {
   border-radius: 11px 11px 0 0;
 }

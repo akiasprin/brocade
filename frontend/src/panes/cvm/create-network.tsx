@@ -148,12 +148,12 @@ export function useCreateNetwork({
   if (entry.selection || draft.nics.length) {
     try {
       if (!user) throw new Error('请为新容器选择获授权的使用者，或移除待配置的网络项。');
-      if (draft.nics.length > nicSlots) throw new Error(`所选宿主最多可添加 ${nicSlots} 张业务网卡。`);
+      if (draft.nics.length > nicSlots) throw new Error(`所选宿主最多可添加 ${nicSlots} 个出站方式。`);
       if (draft.nics.some(choice => !availableNics.has(nicKey(choice))))
-        throw new Error('有业务网卡对当前宿主或使用者不可用，请重新选择或移除。');
+        throw new Error('有出站方式对当前宿主或使用者不可用，请重新选择或移除。');
       for (const id of new Set(draft.nics.map(choice => choice.publication_id))) {
         if (draft.nics.filter(choice => choice.publication_id === id).length > (remainingNics.get(id) ?? 0))
-          throw new Error('所选业务网卡数量超过对应网络的可用挂载数。');
+          throw new Error('所选出站方式数量超过对应网络的可用数量。');
       }
       network = { nics: draft.nics };
       if (entry.selection) {
@@ -203,7 +203,7 @@ export function CreateNetworkFields({
   return (
     <div className="cvm-create-network-fields">
       {!user && (
-        <p className="note">选择获授权的使用者后，可以选配访问入口和业务网卡。也可以只创建容器，稍后配置网络。</p>
+        <p className="note">选择获授权的使用者后，可以选配入站方式和出站方式。也可以只创建容器，稍后配置网络。</p>
       )}
       {(user || nics.length > 0) && (board.isLoading || catalog.isLoading) && (
         <p className="note" role="status">
@@ -215,7 +215,7 @@ export function CreateNetworkFields({
       {(user || entry.selection) && (
         <div className="cvm-create-network-choice">
           <label className="cvm-field">
-            访问入口地址
+            入站方式
             <select
               className="f"
               value={entry.selection}
@@ -231,7 +231,7 @@ export function CreateNetworkFields({
                 });
               }}
             >
-              <option value="">不添加入口</option>
+              <option value="">不添加入站方式</option>
               {entry.selection && !entryOption && (
                 <option value={entry.selection} disabled>
                   上次选择的地址已不可用
@@ -260,7 +260,7 @@ export function CreateNetworkFields({
       {(user || nics.length > 0) && (
         <div className="cvm-create-network-choice">
           <label className="cvm-field">
-            业务网卡
+            出站方式
             <select
               className="f"
               value=""
@@ -270,7 +270,7 @@ export function CreateNetworkFields({
                 if (next) onChange({ ...draft, nics: [...nics, next] });
               }}
             >
-              <option value="">添加业务网卡</option>
+              <option value="">添加出站方式</option>
               {nicOptions.map(choice => (
                 <option key={nicKey(choice)} value={nicKey(choice)}>
                   {nicLabel(choice)}
@@ -289,7 +289,7 @@ export function CreateNetworkFields({
                   <button
                     type="button"
                     className="btn small"
-                    aria-label={`移除业务网卡 ${index + 1}：${nicLabel(choice)}`}
+                    aria-label={`移除出站方式 ${index + 1}：${nicLabel(choice)}`}
                     onClick={() => onChange({ ...draft, nics: nics.filter((_, itemIndex) => index !== itemIndex) })}
                   >
                     移除
@@ -300,7 +300,7 @@ export function CreateNetworkFields({
           )}
           {user && !catalog.isLoading && !catalog.error && !nicOptions.length && (
             <p className="note">
-              {nicSlots === 0 ? '当前宿主没有额外的网卡槽位。' : '当前宿主和使用者没有可用的业务网卡。'}
+              {nicSlots === 0 ? '当前宿主不能添加更多出站方式。' : '当前宿主和使用者没有可用的出站方式。'}
             </p>
           )}
         </div>
