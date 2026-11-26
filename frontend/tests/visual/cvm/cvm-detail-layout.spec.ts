@@ -17,7 +17,7 @@ for (const [width, theme] of [
     await expect(page.getByRole('tab', { name: '网络', exact: true })).toHaveCount(0);
     await page.getByRole('button', { name: 'home-workspace', exact: true }).click();
     await page.getByRole('tab', { name: '网络', exact: true }).click();
-    const entries = page.getByRole('list', { name: '访问入口列表' });
+    const entries = page.getByRole('list', { name: '入站方式列表' });
     const ssh = entries.getByRole('listitem').filter({ hasText: '203.0.113.20:30022' });
     await expect(ssh).toContainText('GreenVPS · 香港网络');
     await expect(entries).not.toContainText('remote-ingress');
@@ -99,10 +99,10 @@ for (const [width, theme, role] of [
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
     await page.getByRole('tab', { name: '网络', exact: true }).click();
     const network = page.getByRole('tabpanel', { name: '网络', exact: true });
-    const nics = network.getByRole('region', { name: '网卡', exact: true });
-    const routes = network.getByRole('region', { name: '路由与命中测试', exact: true });
-    await expect(nics.getByRole('heading', { name: '网卡', exact: true })).toBeVisible();
-    // 网卡列表末尾的「还可挂载」提示行不算网卡。
+    const nics = network.getByRole('region', { name: '出站方式', exact: true });
+    const routes = network.getByRole('region', { name: '路由', exact: true });
+    await expect(nics.getByRole('heading', { name: '出站方式', exact: true })).toBeVisible();
+    // 出站方式列表末尾的「还可添加」提示行不算已配置项。
     const cards = nics.locator('.cvm-nrows > .cvm-nrow:not(.cvm-nrow-hint)');
     await expect(cards).toHaveCount(2);
     for (const [index, card] of (await cards.all()).entries()) {
@@ -112,10 +112,10 @@ for (const [width, theme, role] of [
     if (redacted) {
       for (const name of ['终端', '开机', '关机', '重启', '实例更多操作'])
         await expect(header.getByRole('button', { name, exact: true })).toHaveCount(0);
-      for (const name of ['挂载网卡', '添加入口', '添加路由'])
+      for (const name of ['添加出站方式', '添加入站方式', '添加路由'])
         await expect(network.getByRole('button', { name, exact: true })).toHaveCount(0);
-      // 卸载、更换连接方式都在网卡的 ⋯ 菜单里。
-      await expect(network.getByRole('button', { name: /网卡操作$/ })).toHaveCount(0);
+      // 移除、更换连接方式都在出站方式的 ⋯ 菜单里。
+      await expect(network.getByRole('button', { name: /出站方式操作$/ })).toHaveCount(0);
       await expect(routes.getByRole('table', { name: '目标路由' })).toHaveCount(0);
     } else {
       await expect(routes.getByRole('table', { name: '目标路由' })).toBeVisible();

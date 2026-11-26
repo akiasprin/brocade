@@ -10,7 +10,9 @@ for (const width of [390, 1440]) {
     for (const name of ['旧 Agent（未上报身份）', '旧 Agent（身份为空）', '基础版 Agent']) {
       await expect(page.getByRole('checkbox', { name: `升级 ${name}` })).toBeEnabled();
     }
+    // 基础版 Console 只下发基础版；容器版 Agent 无法在线换回，原因写在机器名下。
     await expect(page.getByRole('checkbox', { name: '升级 容器版 Agent' })).toBeDisabled();
+    await expect(page.getByText('容器版 Agent 换回基础版须停机重装')).toBeVisible();
     await expect(page.locator('.cgc-st').filter({ hasText: /^可升级$/ })).toHaveCount(3);
     await expect(page).toHaveScreenshot(`legacy-agent-base-${width}.png`);
   });

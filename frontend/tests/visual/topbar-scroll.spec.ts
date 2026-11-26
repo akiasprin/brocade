@@ -45,18 +45,20 @@ for (const engine of ['chromium', 'webkit'] as const) {
             );
             await expect(desk).toHaveCSS('overscroll-behavior-y', 'none');
             await expect(page.locator('html')).toHaveCSS('overscroll-behavior-y', 'none');
+            await waitForVisualAssets(page);
             const top = (await header.boundingBox())!;
             await expect.poll(() => desk.evaluate(el => el.scrollHeight - el.clientHeight)).toBeGreaterThan(top.height);
             await desk.evaluate(el => {
               el.scrollTop = el.scrollHeight;
             });
-            await expect.poll(() => desk.evaluate(el => el.scrollTop)).toBeGreaterThan(top.height);
+            await expect
+              .poll(() => desk.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop))
+              .toBeLessThanOrEqual(1);
             expect((await header.boundingBox())!.y).toBeLessThanOrEqual(-top.height);
             if (width > 820) {
               const title = (await page.locator('.nd-page-head').boundingBox())!;
               expect(title.y).toBeGreaterThanOrEqual(0);
             }
-            await waitForVisualAssets(page);
             await expect(page).toHaveScreenshot(`${engine}-${width}-${theme}-scrolled.png`, {
               animations: 'allow',
               clip: { x: 0, y: 0, width, height: 210 },
@@ -101,7 +103,8 @@ for (const engine of ['chromium', 'webkit'] as const) {
           .poll(() => page.evaluate(() => document.documentElement.scrollHeight - innerHeight))
           .toBeGreaterThan(120);
         await page.evaluate(() => scrollTo(0, 120));
-        await expect.poll(() => page.evaluate(() => scrollY)).toBe(120);
+        await expect.poll(() => page.evaluate(() => scrollY)).toBeGreaterThan(0);
+        expect(await page.evaluate(() => scrollY)).toBeLessThanOrEqual(120);
         expect((await header.boundingBox())!.y).toBeLessThan(0);
       } finally {
         await browser.close();

@@ -32,24 +32,35 @@ for (const width of [1440, 390, 320])
       await load(page, width, theme, 'detail');
       await page.getByRole('button', { name: '使用授权', exact: true }).click();
       const dialog = page.getByRole('dialog', { name: '容器使用授权' });
-      await expect(dialog).toHaveScreenshot(`cvm-access-${width}-${theme}.png`);
+      const surface = dialog.locator('.cvm-access-dialog');
+      await expect(dialog).toBeInViewport();
+      await expect(surface).toBeInViewport();
+      expect(await surface.evaluate(element => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
+      // Capture the surface that this case owns against a stable backdrop. Its translucent material
+      // otherwise includes unrelated live page pixels even in an element screenshot.
+      await page.locator('.forge').evaluate(element => {
+        element.style.visibility = 'hidden';
+      });
+      await expect(surface).toHaveScreenshot(`cvm-access-${width}-${theme}.png`);
     });
-    test(`inline NIC mount stages before saving ${width} ${theme}`, async ({ page }) => {
+    test(`inline outbound method stages before saving ${width} ${theme}`, async ({ page }) => {
       await load(page, width, theme, 'detail');
       await page.getByRole('tab', { name: '网络', exact: true }).click();
-      const nics = page.getByRole('region', { name: '网卡', exact: true });
-      // 网卡列表里还有一行「还可挂载」提示，只数真实网卡行。
+      const nics = page.getByRole('region', { name: '出站方式', exact: true });
+      // 出站方式列表里还有一行「还可添加」提示，只数真实配置行。
       const rows = nics.locator('.cvm-nrows > .cvm-nrow:not(.cvm-nrow-hint, [data-draft])');
       // 连通状态写在状态徽标的提示里，可见文字只说配置是否已应用。
       await expect(nics.getByTitle('两端已连接', { exact: true })).toHaveText('已应用');
-      const contact = rows.filter({ hasText: '管理主网卡' });
+      const contact = rows.filter({ hasText: '默认出站' });
       await expect(contact).toHaveCount(1);
-      // 管理主网卡不能卸载，所以没有网卡操作菜单。
-      await expect(contact.getByRole('button', { name: /网卡操作$/ })).toHaveCount(0);
-      await expect(rows.filter({ hasNotText: '管理主网卡' }).getByRole('button', { name: /网卡操作$/ })).toHaveCount(1);
+      // 默认出站不能移除，所以没有出站方式操作菜单。
+      await expect(contact.getByRole('button', { name: /出站方式操作$/ })).toHaveCount(0);
+      await expect(rows.filter({ hasNotText: '默认出站' }).getByRole('button', { name: /出站方式操作$/ })).toHaveCount(
+        1,
+      );
       await expect(rows).toHaveCount(2);
-      await nics.getByRole('button', { name: '挂载网卡', exact: true }).click();
-      const form = nics.getByRole('form', { name: '挂载网卡' });
+      await nics.getByRole('button', { name: '添加出站方式', exact: true }).click();
+      const form = nics.getByRole('form', { name: '添加出站方式' });
       const add = form.getByRole('button', { name: '加入变更', exact: true });
       await expect(add).toBeDisabled();
       await form.getByRole('radiogroup', { name: '网络' }).locator('input[value="network-hk"]').check();
@@ -96,10 +107,10 @@ test('create keeps images separate and initializes only the independent manageme
   await load(page, 1440, 'light', 'new');
   await page.getByLabel('容器名称', { exact: true }).fill('three-interface-workspace');
   const network = page.getByRole('region', { name: '网络与访问', exact: true });
-  await expect(network.locator('.cvm-chip')).toContainText('管理主网卡宿主 NAT');
+  await expect(network.locator('.cvm-chip')).toContainText('默认出站宿主 NAT');
   await expect(network.getByText(/^创建时生成，优先级最低/)).toBeVisible();
   // 未选使用者时没有可预填的网络，只提示稍后配置；核对预填网络的说明只在选了网络后出现。
-  await expect(network.getByText(/^选择获授权的使用者后，可以选配访问入口和业务网卡/)).toBeVisible();
+  await expect(network.getByText(/^选择获授权的使用者后，可以选配入站方式和出站方式/)).toBeVisible();
   await expect(network.getByText(/到新容器的「网络」中核对并保存/)).toHaveCount(0);
   await expect(page.getByRole('region', { name: '创建后的宿主分配' })).toBeVisible();
   await expect(page.getByRole('button', { name: /Debian 13/ })).not.toContainText('MiB');
@@ -117,7 +128,7 @@ test('create from copy puts fresh network choices in the new container draft', a
   await page.getByLabel('复制现有容器').selectOption({ label: 'home-workspace' });
   await expect(page.getByLabel('使用者', { exact: true })).toHaveValue('');
   await page.getByLabel('使用者', { exact: true }).selectOption({ label: 'alice' });
-  await page.getByLabel('访问入口地址').selectOption({ label: '香港共享入口 · 203.0.113.20 · 端口 30000-30999' });
+  await page.getByLabel('入站方式').selectOption({ label: '香港共享入口 · 203.0.113.20 · 端口 30000-30999' });
   await page.getByLabel('入口端口').fill('30054');
   await expect(page.getByText(/到新容器的「网络」中核对并保存/)).toBeVisible();
   await expect(
@@ -132,8 +143,8 @@ test('create from copy puts fresh network choices in the new container draft', a
   await expect(draft.getByRole('button', { name: '2 处未保存' })).toBeVisible();
   await expect(draft.getByRole('button', { name: '1 个容器待发布' })).toBeVisible();
   await draft.getByRole('button', { name: '2 处未保存' }).click();
-  await expect(draft.getByText(/添加入口.*30054/)).toBeVisible();
-  await expect(draft.getByText(/挂载网卡.*network-hk/)).toBeVisible();
+  await expect(draft.getByText(/添加入站方式.*30054/)).toBeVisible();
+  await expect(draft.getByText(/添加出站方式.*network-hk/)).toBeVisible();
   await draft.getByRole('button', { name: '保存网络变更', exact: true }).click();
   await expect(draft.getByRole('button', { name: '保存网络变更', exact: true })).toHaveCount(0);
   await expect(draft.getByRole('button', { name: '1 个容器待发布' })).toBeVisible();
@@ -187,16 +198,16 @@ test('read-only detail conceals access and route details and offers no network m
   await load(page, 390, 'dark', 'detail', 'readonly');
   await page.getByRole('tab', { name: '网络', exact: true }).click();
   const panel = page.getByRole('tabpanel', { name: '网络', exact: true });
-  const nics = panel.getByRole('region', { name: '网卡', exact: true });
-  await expect(nics.getByRole('button', { name: '挂载网卡', exact: true })).toHaveCount(0);
-  await expect(nics.getByRole('button', { name: /网卡操作$/ })).toHaveCount(0);
-  const rows = nics.getByRole('list', { name: '网卡列表' }).getByRole('listitem');
+  const nics = panel.getByRole('region', { name: '出站方式', exact: true });
+  await expect(nics.getByRole('button', { name: '添加出站方式', exact: true })).toHaveCount(0);
+  await expect(nics.getByRole('button', { name: /出站方式操作$/ })).toHaveCount(0);
+  const rows = nics.getByRole('list', { name: '出站方式列表' }).getByRole('listitem');
   await expect(rows).toHaveCount(2);
   for (const row of await rows.all()) await expect(row).toContainText('已脱敏');
-  const entries = panel.getByRole('region', { name: '访问入口', exact: true });
+  const entries = panel.getByRole('region', { name: '入站方式', exact: true });
   await expect(entries).toContainText('访问地址已脱敏。');
-  await expect(entries.getByRole('button', { name: '添加入口', exact: true })).toHaveCount(0);
-  const routes = panel.getByRole('region', { name: '路由与命中测试' });
+  await expect(entries.getByRole('button', { name: '添加入站方式', exact: true })).toHaveCount(0);
+  const routes = panel.getByRole('region', { name: '路由' });
   await expect(routes).toContainText('当前权限不显示目标网段、出口和 DNS 等路由详情。');
   await expect(routes.getByRole('table', { name: '目标路由' })).toHaveCount(0);
   await expect(panel).not.toContainText(/192\.0\.2\.21|10\.60\.0\.2|203\.0\.113\.20/);

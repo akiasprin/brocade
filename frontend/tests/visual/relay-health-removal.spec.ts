@@ -73,6 +73,21 @@ for (const [width, theme] of [
   [1440, 'dark'],
   [390, 'light'],
 ] as const) {
+  test(`combined CUBE support stays one chip at ${width}px ${theme}`, async ({ page }) => {
+    await page.clock.setFixedTime(new Date('2026-10-31T06:00:00Z'));
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto(
+      `/tests/fixtures/node-list-preview.html?scene=typical&theme=${theme}&cube=combined#/nodes/node/hk-hkix`,
+    );
+    const extensions = page
+      .locator('.nd-runtime .nd-rt-c')
+      .filter({ has: page.getByText('扩展应用', { exact: true }) });
+    await expect(extensions.getByText('CUBE[KVM]', { exact: true })).toHaveCount(1);
+    await expect(extensions.getByText('宿主系统', { exact: true })).toHaveCount(0);
+    await waitForVisualAssets(page);
+    await expect(extensions).toHaveScreenshot(`extensions-combined-${width}-${theme}.png`);
+  });
+
   test(`CUBE reports PVM at ${width}px ${theme}`, async ({ page }) => {
     await page.clock.setFixedTime(new Date('2026-10-31T06:00:00Z'));
     await page.setViewportSize({ width, height: 900 });

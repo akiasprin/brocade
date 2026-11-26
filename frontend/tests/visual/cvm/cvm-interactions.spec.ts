@@ -35,6 +35,9 @@ for (const width of [1440, 390, 320])
       await dialog.getByRole('button', { name: '保存变更' }).click();
       await expect(page.getByRole('button', { name: '1 个容器待发布' })).toBeVisible();
       await expect(dialog.getByText(/上次保存结果尚未确认/)).toBeVisible();
+      const errorNotice = dialog.locator('.callout.err');
+      await expect(errorNotice).toHaveText('保存响应丢失，请重试');
+      await expect(errorNotice).toHaveCSS('opacity', '1');
       await expect(dialog.getByRole('button', { name: '保存变更' })).toBeEnabled();
       await expect(dialog).toHaveScreenshot(`uncertain-command-${width}-${theme}.png`);
       await dialog.getByRole('button', { name: '保存变更' }).click();
@@ -49,7 +52,7 @@ for (const width of [1440, 390, 320])
       test(`DNS validation explains the field and preserves input ${theme}`, async ({ page }) => {
         await open(page, width, theme, 'detail');
         await page.getByRole('tab', { name: '网络', exact: true }).click();
-        const editor = page.getByRole('region', { name: '路由与命中测试' });
+        const editor = page.getByRole('region', { name: '路由' });
         const dns = editor.getByRole('textbox', { name: '容器 DNS', exact: true });
         await dns.fill('127.0.0.1');
         const message = '容器 DNS 不能使用回环、组播或未指定地址，请填写容器可访问的 DNS 服务器 IP';
@@ -79,7 +82,7 @@ for (const width of [1440, 390, 320])
       test(`automatic check errors remain recoverable ${theme}`, async ({ page }) => {
         await open(page, 390, theme, 'detail');
         await page.getByRole('tab', { name: '网络', exact: true }).click();
-        const editor = page.getByRole('region', { name: '路由与命中测试' });
+        const editor = page.getByRole('region', { name: '路由' });
         const routes = editor.getByRole('table', { name: '目标路由' });
         // 路由编辑器先在本地校验目标格式；这里让一条合法路由被服务端检查拒绝。
         await routes.getByRole('textbox', { name: '目标 IP／网段' }).fill('203.0.113.0/24');
@@ -134,8 +137,8 @@ for (const width of [1440, 390, 320])
     test(`one network draft saves an entry, NIC and route with safe retry ${width} ${theme}`, async ({ page }) => {
       await open(page, width, theme, 'detail');
       await page.getByRole('tab', { name: '网络', exact: true }).click();
-      await page.getByRole('button', { name: '添加入口', exact: true }).click();
-      const entry = page.getByRole('form', { name: '添加访问入口' });
+      await page.getByRole('button', { name: '添加入站方式', exact: true }).click();
+      const entry = page.getByRole('form', { name: '添加入站方式' });
       await entry
         .getByRole('radiogroup', { name: '入口地址' })
         .locator('input[value="entrypub-hk:203.0.113.20"]')
@@ -150,12 +153,12 @@ for (const width of [1440, 390, 320])
       await waitForVisualAssets(page);
       await expect(entry).toHaveScreenshot(`inline-entry-editor-${width}-${theme}.png`);
       await entry.getByRole('button', { name: '加入变更' }).click();
-      await page.getByRole('button', { name: '挂载网卡' }).click();
-      const mount = page.getByRole('form', { name: '挂载网卡' });
+      await page.getByRole('button', { name: '添加出站方式' }).click();
+      const mount = page.getByRole('form', { name: '添加出站方式' });
       await mount.getByRole('radiogroup', { name: '网络' }).locator('input[value="network-hk"]').check();
       await mount.getByRole('button', { name: '加入变更' }).click();
-      const routes = page.getByRole('region', { name: '路由与命中测试' });
-      // 常驻添加行：未保存的新网卡也能直接作为出口。
+      const routes = page.getByRole('region', { name: '路由' });
+      // 常驻添加行：未保存的新出站方式也能直接作为出口。
       await routes.getByRole('textbox', { name: '目标 IP／网段' }).fill('198.51.100.0/24');
       const via = routes.getByRole('combobox', { name: '经由', exact: true });
       const staged = await via.locator('option[value^="draft-"]').getAttribute('value');

@@ -11,6 +11,10 @@ test.beforeEach(async ({ page }) => {
   await expectInsecureHttp(page);
 });
 
+test.afterEach(async ({ page }) => {
+  await page.unrouteAll({ behavior: 'wait' });
+});
+
 test('HTTP copy writes the full UUID and preserves keyboard focus', async ({ page, context }) => {
   const button = page.locator('.user-dhead .user-uuid-copy');
   await button.click();

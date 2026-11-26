@@ -83,13 +83,13 @@ for (const [width, theme] of [
       if (view === 'hosts') {
         const hosts = page.getByRole('table', { name: '宿主' });
         await expect(hosts.getByRole('rowheader')).toHaveCount(2);
-        await expect(hosts.getByText('整机独占 · 无容器隔离')).toBeVisible();
+        await expect(hosts.getByRole('cell', { name: 'Cube + 宿主系统', exact: true })).toHaveCount(2);
         const search = page.getByRole('searchbox', { name: '搜索宿主' });
         await search.fill('hkix');
         await expect(hosts.getByRole('rowheader')).toHaveCount(1);
         await search.clear();
         await hosts.getByRole('button', { name: '构建裸机', exact: true }).click();
-        await expect(hosts.getByRole('button', { name: '在此创建' })).toHaveCount(0);
+        await expect(hosts.getByRole('button', { name: '在此创建' })).toHaveCount(1);
         const host = hosts.getByRole('button', { name: '香港 HKIX', exact: true });
         await host.press('Enter');
         await expect(host).toHaveAttribute('aria-expanded', 'true');

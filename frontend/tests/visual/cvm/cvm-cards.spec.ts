@@ -36,13 +36,13 @@ for (const width of [1440, 390, 320])
       await page.getByRole('tab', { name: '网络', exact: true }).click();
       await expect(page).toHaveURL(/#\/cvm\/networks$/);
       const resources = page.getByRole('tabpanel', { name: '网络', exact: true });
-      const egress = resources.getByRole('region', { name: '出口网络', exact: true });
-      const table = egress.getByRole('table', { name: '出口网络', exact: true });
+      const egress = resources.getByRole('region', { name: '出站方式', exact: true });
+      const table = egress.getByRole('table', { name: '出站方式', exact: true });
       const row = table
         .getByRole('row')
         .filter({ has: page.getByRole('button', { name: '香港 · 公网出口', exact: true }) });
       await expect(row.getByRole('cell', { name: 'WireGuard · Xray', exact: true })).toBeVisible();
-      await expect(row.getByRole('switch', { name: '香港 · 公网出口 接受新挂载', exact: true })).toBeChecked();
+      await expect(row.getByRole('switch', { name: '香港 · 公网出口 接受新增', exact: true })).toBeChecked();
       await expect(egress).toHaveScreenshot(`egress-network-table-${width}-${theme}.png`);
       expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
       expect(errors).toEqual([]);

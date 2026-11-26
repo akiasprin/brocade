@@ -62,7 +62,7 @@ for (const engine of ['chromium', 'webkit'] as const)
             if (scene.name === 'containers') {
               await expect(actions.getByRole('button', { name: '纳管裸机', exact: true })).toBeVisible();
               await expect(
-                actions.locator('.title-action-primary').getByRole('button', { name: '＋ 创建容器', exact: true }),
+                actions.locator('.title-action-primary').getByRole('button', { name: '创建容器', exact: true }),
               ).toBeVisible();
             }
             const height = width <= 820 ? 36 : 30;

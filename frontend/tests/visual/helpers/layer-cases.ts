@@ -200,12 +200,11 @@ export const layerCases: LayerCase[] = [
     },
   },
   {
-    id: 'cvm-quota',
-    url: '/tests/fixtures/cvm/preview.html?scene=list',
+    id: 'cvm-operation',
+    url: '/tests/fixtures/cvm/preview.html?scene=detail',
     mode: 'modal',
     open: async page => {
-      await page.getByRole('tab', { name: '额度', exact: true }).click();
-      await page.getByRole('button', { name: '编辑额度', exact: true }).click();
+      await page.getByRole('button', { name: '关机', exact: true }).click();
     },
   },
   {
@@ -214,7 +213,7 @@ export const layerCases: LayerCase[] = [
     mode: 'modal',
     open: async page => {
       await page.getByRole('tab', { name: '网络', exact: true }).click();
-      await page.getByRole('button', { name: '路由表', exact: true }).click();
+      await page.getByRole('button', { name: '查看入口网络日志', exact: true }).first().click();
     },
   },
   {

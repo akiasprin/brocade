@@ -19,10 +19,10 @@ const webkitDesktopCases = new Set([
   'dns-import',
   'node-inflow',
   'tunnel-editor',
-  'cvm-quota',
+  'cvm-operation',
   'cvm-terminal',
 ]);
-const shortDesktopCases = new Set(['dynamic-confirmation', 'dns-import', 'node-inflow', 'cvm-quota']);
+const shortDesktopCases = new Set(['dynamic-confirmation', 'dns-import', 'node-inflow', 'cvm-operation']);
 
 async function ready(page: Page) {
   await waitForVisualAssets(page);
@@ -155,6 +155,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
         await expect(main).toBeVisible();
         if (route === 'cvm') {
           await expect(main.locator('.cvm-detail')).toBeVisible();
+          await expect(main.locator('.history-chart-cap').first()).toContainText('网卡流量');
         }
         await expect(main.locator('.cardpage, .nd-page').first()).toBeVisible();
         await expect(main.locator('.callout.err')).toHaveCount(0);

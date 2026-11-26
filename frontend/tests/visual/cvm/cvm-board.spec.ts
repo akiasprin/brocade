@@ -35,9 +35,9 @@ for (const width of [1440, 1280, 390])
       await expect(list).toHaveScreenshot(`instance-list-network-${width}-${theme}.png`);
       await ssh.click();
       await expect(page.getByRole('tab', { name: '网络', exact: true, selected: true })).toBeVisible();
-      const entries = page.getByRole('region', { name: '访问入口', exact: true });
-      await entries.getByRole('button', { name: '添加入口', exact: true }).click();
-      const form = entries.getByRole('form', { name: '添加访问入口' });
+      const entries = page.getByRole('region', { name: '入站方式', exact: true });
+      await entries.getByRole('button', { name: '添加入站方式', exact: true }).click();
+      const form = entries.getByRole('form', { name: '添加入站方式' });
       await form
         .getByRole('radiogroup', { name: '入口地址' })
         .locator('input[value="entrypub-hk:203.0.113.20"]')
@@ -51,7 +51,7 @@ for (const width of [1440, 1280, 390])
       await form.getByRole('button', { name: '加入变更', exact: true }).click();
       const draft = page.getByLabel('容器草稿与待发布变更');
       await draft.getByRole('button', { name: '1 处未保存' }).click();
-      await expect(draft).toContainText('添加入口 · 203.0.113.20 · TCP 30000；映射 30000 → 22');
+      await expect(draft).toContainText('添加入站方式 · 203.0.113.20 · TCP 30000；映射 30000 → 22');
       expect(await mutations(page)).toEqual([]);
       await expect(draft).toHaveScreenshot(`entry-draft-${width}-${theme}.png`);
       await draft.getByRole('button', { name: '保存网络变更', exact: true }).click();
@@ -90,8 +90,8 @@ for (const width of [1440, 390])
     test(`network resource table and instance entries ${width} ${theme}`, async ({ page }) => {
       const errors = await open(page, width, theme, 'list');
       await page.getByRole('tab', { name: '网络', exact: true }).click();
-      const admin = page.getByRole('region', { name: '访问入口地址', exact: true });
-      const table = admin.getByRole('table', { name: '访问入口地址', exact: true });
+      const admin = page.getByRole('region', { name: '入站方式', exact: true });
+      const table = admin.getByRole('table', { name: '入站方式', exact: true });
       await expect(table.getByRole('row')).toHaveCount(3);
       await expect(table.getByRole('row').filter({ hasText: '香港共享入口' })).toContainText('共享地址');
       await expect(table.getByRole('row').filter({ hasText: '香港独立地址' })).toContainText('独占地址');
@@ -122,7 +122,7 @@ for (const width of [1440, 390])
       await page.getByRole('tab', { name: '容器', exact: true }).click();
       await page.getByRole('button', { name: 'home-workspace', exact: true }).click();
       await page.getByRole('tab', { name: '网络', exact: true }).click();
-      const list = page.getByRole('list', { name: '访问入口列表' });
+      const list = page.getByRole('list', { name: '入站方式列表' });
       await expect(list.getByRole('listitem')).toHaveCount(3);
       await expect(list).toHaveScreenshot(`instance-entry-list-${width}-${theme}.png`);
       await noOverflow(page);
@@ -138,11 +138,11 @@ for (const [width, theme] of [
     const errors = await open(page, width, theme, 'detail');
     await page.getByRole('tab', { name: '网络', exact: true }).click();
     const entry = page
-      .getByRole('list', { name: '访问入口列表' })
+      .getByRole('list', { name: '入站方式列表' })
       .getByRole('listitem')
       .filter({ hasText: '203.0.113.20:30022' });
-    await entry.getByRole('button', { name: '查看入口网络日志', exact: true }).click();
-    const dialog = page.getByRole('dialog', { name: '入口网络日志', exact: true });
+    await entry.getByRole('button', { name: '查看入站网络日志', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: '入站网络日志', exact: true });
     await expect(dialog).toContainText('Agent 将继续重试');
     await expect(dialog.getByText('Phantun server started; listening on port 44000')).toBeVisible();
     await expect(dialog).toHaveScreenshot(`entry-network-logs-${width}-${theme}.png`);
@@ -157,7 +157,7 @@ for (const width of [1440, 390])
       test(`NIC section configuration log control ${scene} ${width} ${theme}`, async ({ page }) => {
         const errors = await open(page, width, theme, scene);
         await page.getByRole('tab', { name: '网络', exact: true }).click();
-        const nics = page.getByRole('region', { name: '网卡', exact: true });
+        const nics = page.getByRole('region', { name: '出站方式', exact: true });
         const trigger = nics.getByRole('button', { name: '查看实例网络配置日志', exact: true });
         await expect(trigger).toBeVisible();
         await expect(nics.locator(':scope > header')).toHaveScreenshot(

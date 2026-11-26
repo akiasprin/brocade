@@ -22,9 +22,9 @@ for (const width of [1440, 390, 320])
       await openListInstance(page);
       await expect(page.getByRole('region', { name: 'SSH 登录' })).toContainText('ssh -l cube -p 30042');
       await page.getByRole('tab', { name: '网络', exact: true }).click();
-      const entries = page.getByRole('region', { name: '访问入口', exact: true });
-      await entries.getByRole('button', { name: '添加入口', exact: true }).click();
-      const form = entries.getByRole('form', { name: '添加访问入口' });
+      const entries = page.getByRole('region', { name: '入站方式', exact: true });
+      await entries.getByRole('button', { name: '添加入站方式', exact: true }).click();
+      const form = entries.getByRole('form', { name: '添加入站方式' });
       await form
         .getByRole('radiogroup', { name: '入口地址' })
         .locator('input[value="entrypub-hk:203.0.113.20"]')
@@ -42,7 +42,7 @@ for (const width of [1440, 390, 320])
       await expect(form).toHaveScreenshot(`entry-range-inline-${width}-${theme}.png`);
       expect(await form.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(false);
       await add.click();
-      await expect(entries.getByRole('list', { name: '访问入口列表' })).toContainText(
+      await expect(entries.getByRole('list', { name: '入站方式列表' })).toContainText(
         '203.0.113.20 · TCP 30060-30063；映射 30060-30063 → 80-83',
       );
       expect(await page.evaluate(() => (window as unknown as { __cvmMutations: unknown[] }).__cvmMutations)).toEqual(
@@ -61,9 +61,9 @@ for (const width of [1440, 390])
       page.on('pageerror', error => errors.push(error.message));
       await page.goto(`/tests/fixtures/cvm/preview.html?scene=detail&policy=1&theme=${theme}`);
       await page.getByRole('tab', { name: '网络', exact: true }).click();
-      const entries = page.getByRole('region', { name: '访问入口', exact: true });
-      await entries.getByRole('button', { name: '添加入口', exact: true }).click();
-      const form = entries.getByRole('form', { name: '添加访问入口' });
+      const entries = page.getByRole('region', { name: '入站方式', exact: true });
+      await entries.getByRole('button', { name: '添加入站方式', exact: true }).click();
+      const form = entries.getByRole('form', { name: '添加入站方式' });
       await form
         .getByRole('radiogroup', { name: '入口地址' })
         .locator('input[value="entrypub-local:10.8.0.31"]')

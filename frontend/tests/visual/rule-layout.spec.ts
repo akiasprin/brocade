@@ -2,6 +2,21 @@ import { waitForVisualAssets } from './helpers/visual-ready';
 import { devices, expect, test, type Locator, type Page } from '@playwright/test';
 
 async function expectRuleLayout(table: Locator) {
+  // ResizeObserver updates the shared row flow on the next animation frame. Under a full
+  // cross-browser run WebKit can expose the pre-update cell widths for one measurement.
+  // Wait for that existing layout contract to converge without relaxing its 1px limit.
+  await expect
+    .poll(
+      () =>
+        table.evaluate(table =>
+          Math.max(
+            table.scrollWidth - table.clientWidth,
+            ...[...table.querySelectorAll('td')].map(cell => cell.scrollWidth - cell.clientWidth),
+          ),
+        ),
+      { message: 'rule table and cells fit after the responsive layout settles' },
+    )
+    .toBeLessThanOrEqual(1);
   const layout = await table.evaluate(table => {
     const bounds = table.getBoundingClientRect();
     const editor = table.closest('.rule-editor');

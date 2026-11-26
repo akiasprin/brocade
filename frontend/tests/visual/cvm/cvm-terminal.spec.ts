@@ -25,6 +25,7 @@ async function installTransport(page: Page, { text = output, bracketed = false, 
   const input: string[] = [];
   const urls: string[] = [];
   const sockets = new Map<string, WebSocketRoute>();
+  const probes: number[] = [];
   const sessions = [FIRST, SECOND].map(id => ({ id, running: true, history_bytes: 2048, history_truncated: false }));
   let attaches = 0,
     detaches = 0;
@@ -38,6 +39,7 @@ async function installTransport(page: Page, { text = output, bracketed = false, 
       }
       const command = JSON.parse(message);
       input.push(command.type ?? 'attach');
+      if (command.type === 'ping') probes.push(command.nonce);
       if (command.ticket) {
         attaches++;
         if (failure) {
@@ -73,7 +75,7 @@ async function installTransport(page: Page, { text = output, bracketed = false, 
       detaches++;
     });
   });
-  return { input, urls, sockets, sessions, attaches: () => attaches, detaches: () => detaches };
+  return { input, urls, sockets, probes, sessions, attaches: () => attaches, detaches: () => detaches };
 }
 async function openTerminal(
   page: Page,
@@ -82,6 +84,7 @@ async function openTerminal(
   options: Parameters<typeof installTransport>[1] = {},
   origin = '',
   rtc = false,
+  latency = false,
 ) {
   const errors: string[] = [];
   page.on('pageerror', e => errors.push(e.message));
@@ -89,7 +92,7 @@ async function openTerminal(
   const transport = await installTransport(page, options);
   await page.setViewportSize({ width, height: width < 820 ? 844 : 900 });
   await page.goto(
-    `${origin}/tests/fixtures/cvm/preview.html?scene=detail&theme=${theme}&webshell=cvm-alice${rtc ? '&rtc=1' : ''}`,
+    `${origin}/tests/fixtures/cvm/preview.html?scene=detail&theme=${theme}&webshell=cvm-alice${rtc ? '&rtc=1' : ''}${latency ? '&latency=1' : ''}`,
   );
   const terminal = page.getByRole('main', { name: '终端 · home-workspace', exact: true });
   await expect(terminal).toBeVisible();
@@ -113,7 +116,7 @@ async function context(page: Page, item: string) {
   await page.getByRole('menuitem', { name: item, exact: true }).click();
 }
 
-test('direct candidates require a user action and a failed attempt preserves the Shell', async ({ page }) => {
+test('WebRTC is preferred by default and permission failure falls back on the same attachment', async ({ page }) => {
   await page.addInitScript(() => {
     let attempts = 0;
     Object.defineProperty(window, '__rtcAttempts', { get: () => attempts });
@@ -132,23 +135,52 @@ test('direct candidates require a user action and a failed attempt preserves the
     } as unknown as typeof RTCPeerConnection;
   });
   const { attaches, input } = await openTerminal(page, 1440, 'dark', {}, '', true);
-  expect(await page.evaluate(() => Reflect.get(window, '__rtcAttempts'))).toBe(0);
-  await menu(page, '尝试直连');
+  expect(await page.evaluate(() => Reflect.get(window, '__rtcAttempts'))).toBe(1);
+  expect(attaches()).toBe(1);
+  await expect(page.locator('.cvm-terminal-connection')).toHaveText('WebSocket · — ms');
+  await menu(page, 'WebRTC');
   await expect.poll(attaches).toBe(2);
   await expect(page.getByRole('status').first()).toHaveText('已连接');
-  expect(await page.evaluate(() => Reflect.get(window, '__rtcAttempts'))).toBe(1);
+  expect(await page.evaluate(() => Reflect.get(window, '__rtcAttempts'))).toBe(2);
   await page.getByRole('button', { name: '更多', exact: true }).click();
-  await expect(page.locator('.cvm-terminal-info')).toContainText('Console 转发');
-  await expect(page.locator('.cvm-terminal-info')).toContainText('直连暂不可用');
+  await expect(page.locator('.cvm-terminal-info')).toContainText('WebSocket');
+  await expect(page.locator('.cvm-terminal-info')).toContainText('WebRTC 暂不可用');
   expect(input.filter(value => value === 'attach')).toHaveLength(2);
   const mutations = await page.evaluate(() => Reflect.get(window, '__cvmMutations'));
   expect(mutations.at(-1)).toEqual({ terminal_id: FIRST });
 });
 
+for (const width of [1440, 390])
+  test(`terminal data RTT ${width}`, async ({ page }, testInfo) => {
+    await page.clock.install({ time: new Date('2026-11-23T12:00:00Z') });
+    const { probes, sockets } = await openTerminal(page, width, width === 390 ? 'light' : 'dark', {}, '', false, true);
+    await expect.poll(() => probes.length).toBeGreaterThan(0);
+    await page.clock.pauseAt(new Date('2026-11-23T12:00:01Z'));
+    await page.clock.runFor(5000);
+    const nonce = probes.at(-1)!;
+    sockets.get(FIRST)!.send(JSON.stringify({ type: 'pong', nonce: nonce + 1 }));
+    await expect(page.locator('.cvm-terminal-connection')).toHaveText('WebSocket · — ms');
+    await page.clock.runFor(24);
+    sockets.get(FIRST)!.send(JSON.stringify({ type: 'pong', nonce }));
+    await expect(page.locator('.cvm-terminal-connection')).toHaveText(/WebSocket · \d+ ms/);
+    const latency = Number((await page.locator('.cvm-terminal-connection').innerText()).match(/(\d+) ms/)![1]);
+    expect(latency).toBeGreaterThanOrEqual(24);
+    expect(latency).toBeLessThan(5000);
+    await page.getByRole('button', { name: '更多', exact: true }).click();
+    await expect(page.locator('.cvm-terminal-info')).toContainText(`${latency} ms`);
+    await page.screenshot({ path: testInfo.outputPath('latency-live.png'), caret: 'hide' });
+    await page.clock.runFor(10_000);
+    await expect(page.locator('.cvm-terminal-connection')).toHaveText('WebSocket · — ms');
+    sockets.get(FIRST)!.send(JSON.stringify({ type: 'pong', nonce }));
+    await expect(page.locator('.cvm-terminal-connection')).toHaveText('WebSocket · — ms');
+    await expect(page).toHaveScreenshot(`terminal-latency-${width}.png`, { caret: 'hide' });
+  });
+
 for (const width of [1440, 390, 320])
   for (const theme of ['dark', 'light']) {
     test(`B terminal ${width} ${theme}`, async ({ page }) => {
       const { terminal, input, errors } = await openTerminal(page, width, theme);
+      expect(input).not.toContain('ping');
       const screen = await terminal.locator('.cvm-terminal-screen').boundingBox();
       expect(screen?.x).toBe(0);
       expect(screen?.width).toBe(width);
@@ -558,12 +590,12 @@ test('denied clipboard opens the command editor and a clean window closes withou
   await page.evaluate(() => {
     window.close = () => {};
   });
-  await menu(page, '关闭窗口，保留会话');
+  await menu(page, '关闭页面，保留会话');
   await expect(page.getByRole('button', { name: '终端', exact: true })).toBeVisible();
   expect(input).not.toContain('close');
 });
 
-test('one independent terminal window survives navigating from the list to another instance and can reopen', async ({
+test('one independent terminal page survives navigating from the list to another instance and can reopen', async ({
   page,
   context: browser,
 }) => {
@@ -572,35 +604,53 @@ test('one independent terminal window survives navigating from the list to anoth
   const list = page.getByRole('table', { name: '按宿主分组的容器' });
   const row = list.getByRole('row').filter({ has: page.getByRole('button', { name: 'home-workspace', exact: true }) });
   const launcher = row.getByRole('button', { name: '终端', exact: true });
-  const popupEvent = page.waitForEvent('popup');
+  await page.evaluate(() => {
+    const nativeOpen = window.open.bind(window);
+    const calls: { target: string | null; features: string | null }[] = [];
+    Reflect.set(window, '__terminalOpenCalls', calls);
+    window.open = (url, target, features) => {
+      calls.push({ target: target ?? null, features: features ?? null });
+      return nativeOpen(url, target, features);
+    };
+  });
+  // Playwright calls every Page opened by another Page a popup event, including a normal browser tab.
+  const terminalPageEvent = page.waitForEvent('popup');
   await launcher.click();
-  const popup = await popupEvent;
-  // The popup uses the authenticated production route; the instance list remains in the parent.
-  const terminal = popup.getByRole('main', { name: '终端 · home-workspace', exact: true });
+  const terminalPage = await terminalPageEvent;
+  expect(await page.evaluate(() => Reflect.get(window, '__terminalOpenCalls'))).toEqual([
+    { target: '_blank', features: null },
+  ]);
+  // The new page uses the authenticated production route; the instance list remains in the original page.
+  const terminal = terminalPage.getByRole('main', { name: '终端 · home-workspace', exact: true });
   await expect(terminal).toBeVisible();
   await expect(list).toBeVisible();
   await launcher.click();
   expect(browser.pages()).toHaveLength(2);
+  expect(await page.evaluate(() => Reflect.get(window, '__terminalOpenCalls'))).toHaveLength(1);
   await list.getByRole('button', { name: 'build-runner', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'build-runner', exact: true })).toBeVisible();
   await expect(terminal).toBeVisible();
-  await popup.close();
+  await terminalPage.close();
   await page.getByRole('button', { name: '上一个容器', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'home-workspace', exact: true })).toBeVisible();
   const next = page.waitForEvent('popup');
   await page.getByRole('button', { name: '终端', exact: true }).click();
   const reopened = await next;
   await expect(reopened.getByRole('main', { name: '终端 · home-workspace', exact: true })).toBeVisible();
+  expect(await page.evaluate(() => Reflect.get(window, '__terminalOpenCalls'))).toEqual([
+    { target: '_blank', features: null },
+    { target: '_blank', features: null },
+  ]);
   await reopened.close();
 });
 
-test('popup blocking offers a usable new-tab link and read only cannot open a terminal', async ({ page }) => {
+test('new-page blocking offers a usable link and read only cannot open a terminal', async ({ page }) => {
   await page.goto('/tests/fixtures/cvm/preview.html?scene=detail');
   await page.evaluate(() => {
     window.open = () => null;
   });
   await page.getByRole('button', { name: '终端', exact: true }).click();
-  await expect(page.getByRole('link', { name: '弹窗被拦截，改在新标签页打开' })).toHaveAttribute(
+  await expect(page.getByRole('link', { name: '新页面未能打开，请手动打开' })).toHaveAttribute(
     'href',
     /webshell=cvm-alice/,
   );

@@ -34,7 +34,7 @@ for (const [width, theme] of [
     await page.getByRole('tab', { name: '网络', exact: true }).click();
     const network = page.getByRole('tabpanel', { name: '网络', exact: true });
     await expect(network.getByText('访问地址已脱敏。', { exact: true })).toBeVisible();
-    await expect(network.getByRole('button', { name: '挂载网卡', exact: true })).toHaveCount(0);
+    await expect(network.getByRole('button', { name: '添加出站方式', exact: true })).toHaveCount(0);
     await page.getByRole('tab', { name: '监控与诊断', exact: true }).click();
     await expect(page.getByRole('region', { name: '容器 监控', exact: true })).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);

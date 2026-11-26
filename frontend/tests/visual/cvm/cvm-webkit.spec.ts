@@ -23,7 +23,7 @@ for (const [width, theme] of [
     await expect(page).toHaveScreenshot(`webkit-detail-${width}-${theme}.png`);
     await page.getByRole('tab', { name: '网络', exact: true }).click();
     const network = page.getByRole('tabpanel', { name: '网络', exact: true });
-    await expect(network.getByRole('heading', { name: '网卡', exact: true })).toBeVisible();
+    await expect(network.getByRole('heading', { name: '出站方式', exact: true })).toBeVisible();
     await expect(network.getByRole('table', { name: '目标路由', exact: true })).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
   });

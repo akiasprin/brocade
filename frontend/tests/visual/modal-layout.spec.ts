@@ -27,29 +27,26 @@ for (const [width, height] of [
   [320, 480],
 ] as const)
   for (const theme of ['light', 'dark']) {
-    test(`CVM quota stays inside ${width}x${height} ${theme}`, async ({ page }) => {
+    test(`CVM operation stays inside ${width}x${height} ${theme}`, async ({ page }) => {
       await page.clock.install({ time: new Date('2026-11-04T10:30:00Z') });
       await page.setViewportSize({ width, height });
-      await page.goto(`/tests/fixtures/cvm/preview.html?scene=list&theme=${theme}`);
-      await page.getByRole('tab', { name: '额度', exact: true }).click();
-      await page.getByRole('button', { name: '编辑额度', exact: true }).click();
-      const dialog = page.getByRole('dialog', { name: '容器 用户额度' });
+      await page.goto(`/tests/fixtures/cvm/preview.html?scene=detail&theme=${theme}`);
+      const trigger = page.getByRole('button', { name: '关机', exact: true });
+      await trigger.click();
+      const dialog = page.getByRole('dialog', { name: '关机', exact: true });
       const surface = dialog.locator('.dialog-surface');
       await bounded(page, surface);
-      await expect(dialog.getByRole('button', { name: '保存额度' })).toBeInViewport();
+      await expect(dialog.getByRole('button', { name: '保存变更' })).toBeInViewport();
       const body = dialog.locator('.tunnel-dialog-body');
       await body.evaluate(el => {
         el.scrollTop = el.scrollHeight;
       });
-      await expect(dialog.getByRole('button', { name: '保存额度' })).toBeInViewport();
+      await expect(dialog.getByRole('button', { name: '保存变更' })).toBeInViewport();
       await waitForVisualAssets(page);
-      await expect(dialog).toHaveScreenshot(`quota-short-${width}-${theme}.png`);
-      await dialog
-        .getByRole('button', { name: '关闭', exact: true })
-        .filter({ has: page.locator('svg') })
-        .click();
+      await expect(dialog).toHaveScreenshot(`operation-short-${width}-${theme}.png`);
+      await dialog.locator('header').getByRole('button', { name: '关闭', exact: true }).click();
       await expect(dialog).toBeHidden();
-      await expect(page.getByRole('button', { name: '编辑额度', exact: true })).toBeFocused();
+      await expect(trigger).toBeFocused();
     });
     test(`shared deployment confirmation fits ${width}x${height} ${theme}`, async ({ page }) => {
       await page.clock.install({ time: new Date('2026-10-25T12:00:00Z') });
