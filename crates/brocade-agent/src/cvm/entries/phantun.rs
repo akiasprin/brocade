@@ -311,6 +311,13 @@ pub(super) fn retain(desired: &EntryDesired) -> Result<()> {
     Ok(())
 }
 fn ruleset(desired: &EntryDesired) -> String {
+    if !desired
+        .tunnels
+        .iter()
+        .any(|t| t.wireguard_transport == EntryWireguardTransport::Phantun)
+    {
+        return format!("add table inet {TABLE}\ndelete table inet {TABLE}\n");
+    }
     let mut script=format!("add table inet {TABLE}\ndelete table inet {TABLE}\ntable inet {TABLE} {{\n chain incoming {{ type nat hook prerouting priority -100; }}\n chain outgoing {{ type nat hook postrouting priority 100; }}\n chain forward {{ type filter hook forward priority -4; policy accept; }}\n}}\n");
     for t in desired
         .tunnels
@@ -339,6 +346,7 @@ fn ruleset(desired: &EntryDesired) -> String {
     }
     script
 }
+
 pub(super) fn apply_rules(root: &Path, desired: &EntryDesired) -> Result<()> {
     let path = root.join("cvm-entries/phantun.nft");
     atomic_write_private(&path, ruleset(desired).as_bytes())?;
@@ -411,4 +419,17 @@ fn docker_rules(root: &Path, desired: &EntryDesired) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ruleset_tests {
+    use super::*;
+
+    #[test]
+    fn desired_without_phantun_removes_the_owned_table() {
+        assert_eq!(
+            ruleset(&EntryDesired::default()),
+            "add table inet brocade_entry_phantun\ndelete table inet brocade_entry_phantun\n"
+        );
+    }
 }

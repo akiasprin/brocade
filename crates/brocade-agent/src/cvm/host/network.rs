@@ -242,13 +242,11 @@ pub(super) fn interfaces(
 }
 // A delivery address is the existing primary address. Entry rules below explicitly
 // authorize local INPUT rather than exposing every service reachable over a tunnel.
-pub(super) fn delivery(_: &Path, desired: &InstanceDesired) -> Result<Option<String>> {
+pub(super) fn delivery(config: &Config, desired: &InstanceDesired) -> Result<Option<String>> {
     if desired.power != PowerState::Running {
         return Ok(None);
     }
-    let report = super::super::backend::config_path()?;
-    let config = load_config(&report)?;
-    Ok(primary(&config, "host")?
+    Ok(primary(config, "host")?
         .addresses
         .into_iter()
         .find_map(|a| {

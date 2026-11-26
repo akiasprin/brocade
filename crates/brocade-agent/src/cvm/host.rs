@@ -443,7 +443,7 @@ impl Backend {
             report.power = Some(PowerState::Running);
             report.runtime_id = Some(runtime_id(&desired.id, &boot_id()?));
             report.interfaces = network::interfaces(&self.0.config, desired)?;
-            report.access_address = network::delivery(&self.0.root, desired)?;
+            report.access_address = network::delivery(&self.0.config, desired)?;
             report.network = Some(NetworkObservation {
                 chain_egress_configured: !desired.spec.routing.chain_ids().is_empty()
                     && super::chain_egress::ready(&desired.id, &desired.spec.routing),

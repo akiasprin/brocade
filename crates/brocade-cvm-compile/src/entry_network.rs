@@ -258,6 +258,9 @@ pub fn ruleset(
 ) -> Result<String> {
     // Frozen addresses are late bindings; port intervals must already be executable.
     desired.validate_ports()?;
+    if desired.rules.is_empty() && desired.deliveries.is_empty() && desired.tunnels.is_empty() {
+        return Ok(format!("add table ip {TABLE}\ndelete table ip {TABLE}\n"));
+    }
     let mut out = format!(
         "add table ip {TABLE}\ndelete table ip {TABLE}\ntable ip {TABLE} {{\n\
          chain steer {{ type filter hook prerouting priority -150; policy accept; }}\n\
@@ -437,6 +440,21 @@ pub fn ruleset(
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+
+    #[test]
+    fn empty_desired_removes_the_owned_table() {
+        let nft = ruleset(
+            &EntryDesired::default(),
+            &BTreeSet::new(),
+            &BTreeSet::from([(L4Protocol::Tcp, 443)]),
+        )
+        .unwrap();
+        assert_eq!(
+            nft,
+            "add table ip brocade_cvm_entries\ndelete table ip brocade_cvm_entries\n"
+        );
+    }
+
     #[test]
     fn full_protocol_policy_keeps_host_ssh_during_target_failure_without_port_expansion() {
         let desired = EntryDesired {

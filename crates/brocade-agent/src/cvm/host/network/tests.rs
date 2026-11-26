@@ -339,6 +339,14 @@ fn native_network_namespace_convergence() {
         protected_destinations: vec!["192.0.2.0/24".parse().unwrap()],
     };
     let mut d = desired();
+    assert_eq!(
+        delivery(&config, &d).unwrap().as_deref(),
+        Some("192.0.2.1"),
+        "physical-host delivery must use its own verified configuration alongside Cube"
+    );
+    let mut stopped = d.clone();
+    stopped.power = PowerState::Stopped;
+    assert_eq!(delivery(&config, &stopped).unwrap(), None);
     d.spec.routing.routes[0].destination = "0.0.0.0/0".parse().unwrap();
     d.spec.routing.routes[1].destination = "::/0".parse().unwrap();
     let preparing = transport(&root, &d, BindingPhase::Preparing);
