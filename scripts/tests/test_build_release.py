@@ -419,6 +419,42 @@ time.sleep(30)
                 BUILD.frontend(root, state, {}, BUILD.BuildTimer())
                 self.assertEqual(sum(c[:2] == ['npm', 'ci'] for c in calls), 2)
 
+    def test_ci_zig_cc_wrapper_normalizes_musl_arguments_and_disables_ubsan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / 'bin'
+            binary.mkdir()
+            captured = root / 'zig-arguments'
+            zig = binary / 'zig'
+            zig.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$BROCADE_ZIG_CAPTURE"\n')
+            zig.chmod(0o700)
+            wrapper = PATH.parent / 'zig-cc'
+            for arch in ['x86_64', 'aarch64']:
+                with self.subTest(arch=arch):
+                    triple = f'{arch}-unknown-linux-musl'
+                    env = os.environ.copy()
+                    env.update(
+                        {
+                            'PATH': str(binary) + os.pathsep + env['PATH'],
+                            'BROCADE_ZIG_CAPTURE': str(captured),
+                            'BROCADE_ZIG_TARGET': f'{arch}-linux-musl',
+                        }
+                    )
+                    subprocess.run(
+                        [str(wrapper), f'--target={triple}', '-nostdlibinc', '-O0', '-c', 'native.c'],
+                        check=True,
+                        env=env,
+                    )
+                    self.assertEqual(
+                        captured.read_text().splitlines(),
+                        ['cc', '-fno-sanitize=undefined', '-target', f'{arch}-linux-musl', '-O0', '-c', 'native.c'],
+                    )
+
+            env.pop('BROCADE_ZIG_TARGET')
+            missing = subprocess.run([str(wrapper)], capture_output=True, env=env, text=True)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn('BROCADE_ZIG_TARGET is required', missing.stderr)
+
     def test_agents_use_one_dual_target_cargo_graph_and_feed_console_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -520,52 +556,62 @@ class ZigNativeLinkTests(unittest.TestCase):
                 'extern "C" { fn native_add(a: i32, b: i32) -> i32; }\nfn main() { assert_eq!(unsafe { native_add(20, 22) }, 42); }\n'
             )
             for arch in ['x86_64', 'aarch64']:
-                with self.subTest(arch=arch):
-                    triple = f'{arch}-unknown-linux-musl'
-                    output = root / arch
-                    output.mkdir()
-                    # Like AWS-LC's entropy sources, this stays unoptimized in release.
-                    subprocess.run(
-                        [
-                            str(wrappers[arch][0]),
-                            f'--target={triple}',
-                            '-nostdlibinc',
-                            '-O0',
-                            '-c',
-                            str(native),
-                            '-o',
-                            str(output / 'native.o'),
-                        ],
-                        check=True,
-                        capture_output=True,
-                    )
-                    subprocess.run(
-                        [str(wrappers[arch][1]), 'crs', str(output / 'libnative.a'), str(output / 'native.o')],
-                        check=True,
-                        capture_output=True,
-                    )
-                    binary = output / 'fixture'
-                    subprocess.run(
-                        [
-                            'rustc',
-                            '--target',
-                            triple,
-                            '-C',
-                            'linker=rust-lld',
-                            str(rust),
-                            '-L',
-                            str(output),
-                            '-l',
-                            'static=native',
-                            '-o',
-                            str(binary),
-                        ],
-                        check=True,
-                        capture_output=True,
-                    )
-                    self.assertEqual(binary.read_bytes()[:4], b'\x7fELF')
-                    if arch == 'x86_64':
-                        subprocess.run([str(binary)], check=True)
+                triple = f'{arch}-unknown-linux-musl'
+                ci_env = os.environ.copy()
+                ci_env['BROCADE_ZIG_TARGET'] = f'{arch}-linux-musl'
+                ci_env['PATH'] = str(Path(zig).parent) + os.pathsep + ci_env['PATH']
+                variants = [
+                    ('generated', wrappers[arch][0], wrappers[arch][1], None),
+                    ('ci', PATH.parent / 'zig-cc', PATH.parent / 'zig-ar', ci_env),
+                ]
+                for name, cc, ar, environment in variants:
+                    with self.subTest(arch=arch, wrapper=name):
+                        output = root / f'{arch}-{name}'
+                        output.mkdir()
+                        # Like AWS-LC's entropy sources, this stays unoptimized in release.
+                        subprocess.run(
+                            [
+                                str(cc),
+                                f'--target={triple}',
+                                '-nostdlibinc',
+                                '-O0',
+                                '-c',
+                                str(native),
+                                '-o',
+                                str(output / 'native.o'),
+                            ],
+                            check=True,
+                            capture_output=True,
+                            env=environment,
+                        )
+                        subprocess.run(
+                            [str(ar), 'crs', str(output / 'libnative.a'), str(output / 'native.o')],
+                            check=True,
+                            capture_output=True,
+                            env=environment,
+                        )
+                        binary = output / 'fixture'
+                        subprocess.run(
+                            [
+                                'rustc',
+                                '--target',
+                                triple,
+                                '-C',
+                                'linker=rust-lld',
+                                str(rust),
+                                '-L',
+                                str(output),
+                                '-l',
+                                'static=native',
+                                '-o',
+                                str(binary),
+                            ],
+                            check=True,
+                            capture_output=True,
+                        )
+                        self.assertEqual(binary.read_bytes()[:4], b'\x7fELF')
+                        if arch == 'x86_64':
+                            subprocess.run([str(binary)], check=True)
 
 
 if __name__ == '__main__':
