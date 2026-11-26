@@ -7,7 +7,7 @@ import { App } from '../../src/app';
 import { CVM_ENABLED } from '../../src/product';
 import { theme } from '../../src/forge/theme';
 import type { Session } from '../../src/session';
-import { cvmWorkspace } from './cvm/data';
+import { baremetalWorkspace, cvmWorkspace } from './cvm/data';
 import {
   loadOverview,
   loadListView,
@@ -86,8 +86,8 @@ globalThis.fetch = async (input, init) => {
   const url = new URL(String(input instanceof Request ? input.url : input), location.origin);
   const path = url.pathname;
   if (path === '/cvm' && (!init?.method || init.method === 'GET')) {
-    const workspace = cvmWorkspace('list', role);
     const cube = params.get('cube');
+    const workspace = cube === 'combined' ? baremetalWorkspace('baremetal-hosts', role) : cvmWorkspace('list', role);
     if (cube === 'pvm') workspace.hosts[0].capabilities.backend = 'cube-pvm-v1';
     if (cube === 'error' || cube === 'unmanaged') {
       workspace.hosts[0].error = 'CVM Rust executor configuration is unavailable';

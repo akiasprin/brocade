@@ -5095,7 +5095,9 @@ export function AppliedCard({
   const hasCubeRuntime = !!cubeHost?.capabilities.backend.startsWith('cube');
   const cubeLabel = cubeExtensionLabel(cubeHost?.capabilities.backend);
   const cubeManaged = cubeExpected || hasCubeRuntime;
-  const cubeReady = cubeStatus === 'ready' && hasCubeRuntime && !!cubeHost?.fresh && !cubeHost.error;
+  const hostSystemError = cubeHost?.capabilities.host_system_error;
+  const cubeReady =
+    cubeStatus === 'ready' && hasCubeRuntime && !!cubeHost?.fresh && !cubeHost.error && !hostSystemError;
   const cubeTitle =
     cubeStatus === 'pending'
       ? '等待能力上报'
@@ -5109,9 +5111,11 @@ export function AppliedCard({
               ? `执行能力异常：${cubeHost.error}`
               : !cubeHost.fresh
                 ? '能力报告已过期'
-                : cubeReady
-                  ? '已启用'
-                  : '尚未确认运行栈';
+                : hostSystemError
+                  ? `宿主系统管理异常：${hostSystemError}`
+                  : cubeReady
+                    ? '已启用'
+                    : '尚未确认运行栈';
   const cubeState =
     cubeStatus !== 'ready'
       ? 'unknown'
@@ -5119,20 +5123,17 @@ export function AppliedCard({
         ? 'disabled'
         : cubeHost?.error
           ? 'error'
-          : cubeReady
-            ? 'present'
-            : 'unknown';
+          : !cubeHost?.fresh
+            ? 'unknown'
+            : hostSystemError
+              ? 'error'
+              : cubeReady
+                ? 'present'
+                : 'unknown';
   const extensions = (
     <span className="nd-rt-chips">
       {openvpn}
       {CVM_ENABLED && <StateChip label={cubeLabel} state={cubeState} title={`${cubeLabel} 扩展 · ${cubeTitle}`} />}
-      {CVM_ENABLED && (cubeHost?.capabilities.host_system || cubeHost?.capabilities.host_system_error) && (
-        <StateChip
-          label="宿主系统"
-          state={!cubeHost.fresh ? 'unknown' : cubeHost.capabilities.host_system_error ? 'error' : 'present'}
-          title={cubeHost.capabilities.host_system_error ?? cubeHost.capabilities.host_system?.os}
-        />
-      )}
     </span>
   );
   const rev = a?.source_deployment_id != null ? revisionOf(a.source_deployment_id) : undefined;
@@ -5149,7 +5150,7 @@ export function AppliedCard({
         <RuntimeCells
           items={[
             ['状态', <span className="note">还没收敛过。</span>, 'w3'],
-            ['扩展应用', extensions],
+            ['扩展应用', extensions, 'w3'],
           ]}
         />
       </RuntimeBand>
@@ -5178,7 +5179,7 @@ export function AppliedCard({
             </span>,
             'w3',
           ],
-          ['扩展应用', extensions],
+          ['扩展应用', extensions, 'w3'],
         ]}
       />
       {/* 此处原有 xray 和 wg 的 sha256，已移除：这条带表示的是收敛来源和各产物状态，

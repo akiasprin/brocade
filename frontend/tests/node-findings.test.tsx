@@ -1,7 +1,7 @@
 import { cleanup, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { NodeAgentStateItem } from '../src/api';
-import { cvmWorkspace } from './fixtures/cvm/data';
+import { baremetalWorkspace, cvmWorkspace } from './fixtures/cvm/data';
 
 let runtimeFindings: typeof import('../src/panes/nodes').runtimeFindings;
 let runtimeFindingAttentionCount: typeof import('../src/panes/nodes').runtimeFindingAttentionCount;
@@ -268,7 +268,7 @@ describe('OpenVPN runtime status', () => {
 
     const configBand = screen.getByText('CONFIG').closest('section');
     expect(configBand).not.toBeNull();
-    expect(within(configBand!).getByText('扩展应用')).toBeTruthy();
+    expect(within(configBand!).getByText('扩展应用').parentElement?.classList.contains('w3')).toBe(true);
     expect(within(configBand!).getByText('来自').parentElement?.classList.contains('w2')).toBe(false);
     expect(within(configBand!).getByText('产物').parentElement?.classList.contains('w3')).toBe(true);
     const chip = within(configBand!).getByText('OPENVPN');
@@ -332,6 +332,26 @@ describe('CUBE extension display', () => {
     render(<AppliedCard node={node(false)} revisionOf={() => undefined} cubeHost={host} cubeStatus="ready" />);
     const chip = screen.getByText(label);
     expect(chip.getAttribute('title')).toBe(`${label} 扩展 · 已启用`);
+  });
+
+  it('folds host system support into the single CUBE chip', () => {
+    const host = baremetalWorkspace('baremetal-hosts').hosts[0];
+    render(<AppliedCard node={node(false)} revisionOf={() => undefined} cubeHost={host} cubeStatus="ready" />);
+
+    const chip = screen.getByText('CUBE[KVM]');
+    expect(chip.getAttribute('title')).toBe('CUBE[KVM] 扩展 · 已启用');
+    expect(screen.queryByText('宿主系统', { exact: true })).toBeNull();
+  });
+
+  it('surfaces a host system failure through the single CUBE chip', () => {
+    const host = cvmWorkspace('detail').hosts[0];
+    host.capabilities.host_system_error = '宿主配置不可用';
+    render(<AppliedCard node={node(false)} revisionOf={() => undefined} cubeHost={host} cubeStatus="ready" />);
+
+    const chip = screen.getByText('CUBE[KVM]');
+    expect(chip.classList.contains('st-halted')).toBe(true);
+    expect(chip.getAttribute('title')).toBe('CUBE[KVM] 扩展 · 宿主系统管理异常：宿主配置不可用');
+    expect(screen.queryByText('宿主系统', { exact: true })).toBeNull();
   });
 
   it('keeps a reserved instance in scope when its Cube capabilities are unavailable', () => {
