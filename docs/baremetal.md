@@ -9,7 +9,7 @@ Brocade 可以把 Cube 节点当前运行的物理操作系统纳管为一个宿
 节点使用匹配 Console 的 `cvm` Agent。以系统权限执行安装命令并带上 `--enable-cvm`：
 
 ```sh
-sh brocade-install.sh --server https://console.example/agent --enable-cvm
+sudo sh brocade-install.sh --server https://console.example/agent --enable-cvm
 ```
 
 安装器一次准备 Cube、物理宿主管理和宿主终端服务。它为两套执行状态使用独立目录：
@@ -29,7 +29,9 @@ sh brocade-install.sh --server https://console.example/agent --enable-cvm
 }
 ```
 
-`terminal_user` 必须是本机已有账号，WebShell 使用它的 UID、组、home 和 shell。`primary_device` 是保留管理联络的原有网卡。保护目标应包含远程运维网络和必须走原路径的服务；Agent 还会保护实际 Console 地址及受管传输端点。原默认路由和 DNS 继续由操作系统维护。
+`terminal_user` 必须是本机已有账号，WebShell 使用它的 UID、组、home 和 shell。配置使用默认账号 `brocade-native` 且该账号当前不能免密 sudo 时，安装器会在写入 sudoers 前询问是否允许它免密使用 `sudo`，并明确说明这等同于从 WebShell 取得完整 root 权限。只有交互终端中回答 `y` 或 `yes` 才会授权；回车、拒绝或非交互安装都不授权，但其余 CVM 安装继续。接受后，安装器以 root 所有、权限 `0440` 写入 `/etc/sudoers.d/90-brocade-webshell`，先用 `visudo` 校验，再以 `brocade-native` 实际执行 `sudo -n id -u` 验证；失败会恢复原文件并中止，避免留下看似可用的半成品。账号本来已经能免密 sudo 时保留现有策略且不重复询问；自定义 `terminal_user` 永远不会被自动提权。
+
+`primary_device` 是保留管理联络的原有网卡。保护目标应包含远程运维网络和必须走原路径的服务；Agent 还会保护实际 Console 地址及受管传输端点。原默认路由和 DNS 继续由操作系统维护。
 
 可分别检查 Cube 与宿主配置：
 

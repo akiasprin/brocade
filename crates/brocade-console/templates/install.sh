@@ -38,6 +38,7 @@ CVM_SUPPORTED=__BROCADE_CVM_SUPPORTED__
 REUSE_NODE_TOKEN=0
 HOST_SYSTEM_CONFIG=/etc/brocade/cvm-host.json
 HOST_SYSTEM_DROPIN=/etc/systemd/system/brocade-agent.service.d/30-brocade-host-system.conf
+HOST_SYSTEM_SUDOERS=/etc/sudoers.d/90-brocade-webshell
 CVM_MODE=${BROCADE_CVM_MODE:-}
 CVM_REBOOT_PENDING=0
 CVM_BUNDLE_URL=${BROCADE_CVM_BUNDLE_URL:-}
@@ -126,6 +127,106 @@ install_pkg() {
   else
     return 1
   fi
+}
+
+brocade_native_sudo_answer_allows() {
+  case "$1" in
+  y | Y | yes | YES | Yes) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+request_brocade_native_sudo() {
+  if [ ! -t 0 ]; then
+    echo "未检测到交互终端，不会授予 brocade-native sudo；CVM 其余部分继续安装。" >&2
+    echo "如需授权，请在交互终端重新执行同一条 --enable-cvm 安装命令。" >&2
+    return 1
+  fi
+  echo "WebShell 默认账号 brocade-native 当前不能使用 sudo。" >&2
+  printf '是否授予它免密 sudo（等同完整 root 权限）？[y/N] ' >&2
+  native_sudo_answer=
+  IFS= read -r native_sudo_answer || return 1
+  brocade_native_sudo_answer_allows "$native_sudo_answer"
+}
+
+brocade_native_sudo_works() {
+  have sudo || return 1
+  native_sudo_uid=
+  if have runuser; then
+    native_sudo_uid=$(runuser -u brocade-native -- sudo -n id -u 2>/dev/null || true)
+  elif have su; then
+    native_sudo_uid=$(su -s /bin/sh -c 'sudo -n id -u' brocade-native 2>/dev/null || true)
+  fi
+  [ "$native_sudo_uid" = "0" ]
+}
+
+install_brocade_native_sudo() {
+  if ! have sudo || ! have visudo; then
+    echo "正在安装 WebShell sudo 授权所需的 sudo ..." >&2
+    install_pkg sudo || {
+      echo "无法安装 sudo；未授予 brocade-native root 权限" >&2
+      return 1
+    }
+  fi
+  have sudo && have visudo || {
+    echo "sudo 安装后仍缺少 sudo 或 visudo；未授予 brocade-native root 权限" >&2
+    return 1
+  }
+  visudo -c >/dev/null || {
+    echo "现有 sudoers 配置校验失败；未修改 sudo 权限" >&2
+    return 1
+  }
+
+  sudoers_dir=${HOST_SYSTEM_SUDOERS%/*}
+  [ "$sudoers_dir" != "$HOST_SYSTEM_SUDOERS" ] || {
+    echo "WebShell sudoers 路径无效" >&2
+    return 1
+  }
+  install -d -m 0755 "$sudoers_dir" || return 1
+  native_sudoers_marker='# Managed by Brocade for the default WebShell account.'
+  if [ -L "$HOST_SYSTEM_SUDOERS" ]; then
+    echo "$HOST_SYSTEM_SUDOERS 是符号链接；为避免覆盖本机策略，未修改 sudo 权限" >&2
+    return 1
+  fi
+  if [ -e "$HOST_SYSTEM_SUDOERS" ] && ! grep -Fqx "$native_sudoers_marker" "$HOST_SYSTEM_SUDOERS"; then
+    echo "$HOST_SYSTEM_SUDOERS 不是 Brocade 管理的文件；为避免覆盖本机策略，未修改 sudo 权限" >&2
+    return 1
+  fi
+
+  native_sudoers_candidate=$(mktemp "$sudoers_dir/.brocade-webshell.XXXXXX") || return 1
+  TMPFILES="$TMPFILES $native_sudoers_candidate"
+  {
+    printf '%s\n' "$native_sudoers_marker"
+    printf '%s\n' 'brocade-native ALL=(ALL:ALL) NOPASSWD: ALL'
+  } >"$native_sudoers_candidate" || return 1
+  chmod 0440 "$native_sudoers_candidate" || return 1
+  visudo -cf "$native_sudoers_candidate" >/dev/null || {
+    echo "WebShell sudoers 候选配置校验失败；未修改 sudo 权限" >&2
+    return 1
+  }
+
+  native_sudoers_backup=
+  if [ -e "$HOST_SYSTEM_SUDOERS" ]; then
+    native_sudoers_backup=$(mktemp "$sudoers_dir/.brocade-webshell-backup.XXXXXX") || return 1
+    TMPFILES="$TMPFILES $native_sudoers_backup"
+    cp -p "$HOST_SYSTEM_SUDOERS" "$native_sudoers_backup" || return 1
+  fi
+  mv -f "$native_sudoers_candidate" "$HOST_SYSTEM_SUDOERS" || return 1
+  chmod 0440 "$HOST_SYSTEM_SUDOERS" || return 1
+
+  if ! visudo -c >/dev/null || ! brocade_native_sudo_works; then
+    if [ -n "$native_sudoers_backup" ]; then
+      mv -f "$native_sudoers_backup" "$HOST_SYSTEM_SUDOERS" || {
+        echo "sudo 验证失败，且无法恢复原 sudoers 文件：$HOST_SYSTEM_SUDOERS" >&2
+        return 1
+      }
+    else
+      rm -f "$HOST_SYSTEM_SUDOERS"
+    fi
+    echo "sudo 授权未能通过实际提权验证，原配置已恢复" >&2
+    return 1
+  fi
+  echo "已授权 brocade-native 在 WebShell 中免密使用 sudo。" >&2
 }
 
 # Optional system-layer protection. Application-layer limits do not require these tools.
@@ -976,6 +1077,17 @@ PY
     ln "$host_system_candidate" "$HOST_SYSTEM_CONFIG"
   else
     "$AGENT_BIN" cvm-check --host-config "$HOST_SYSTEM_CONFIG" >/dev/null
+  fi
+
+  host_terminal_user=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["terminal_user"])' "$HOST_SYSTEM_CONFIG") || exit 1
+  if [ "$host_terminal_user" = "brocade-native" ]; then
+    if brocade_native_sudo_works; then
+      echo "brocade-native 已可免密使用 sudo，保留现有授权。" >&2
+    elif request_brocade_native_sudo; then
+      install_brocade_native_sudo || exit 1
+    else
+      echo "未授予 brocade-native sudo；CVM 其余部分继续安装。" >&2
+    fi
   fi
 
   # Remove the legacy exclusive-backend environment before the Cube installer can reload or
