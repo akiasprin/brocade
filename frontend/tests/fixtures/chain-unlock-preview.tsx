@@ -1,6 +1,6 @@
 // Production chain list and detail, served by a synthetic Console.
 // scene=typical|calm, role=system-admin|readonly|public, theme=dark|light,
-// pages=1 exercises pagination, error=1 exercises recovery, view=cards starts in the card view.
+// pages=1 exercises pagination, error=1 exercises recovery, view=cards keeps the initial card view.
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type {
@@ -406,22 +406,26 @@ if (!location.hash) history.replaceState(null, '', `${location.search}#/chains`)
 // A cold Vite transform is fixture setup, not the interaction under test.
 await preloadPaneForHash(location.hash);
 const root = document.getElementById('root')!;
-if (params.get('view') !== 'cards') {
-  const selectUnlock = () => {
-    const tab = [...root.querySelectorAll<HTMLElement>('[role="tab"]')].find(
-      item => item.textContent?.trim() === '解锁',
-    );
-    if (!tab) return false;
-    tab.click();
-    return true;
-  };
-  const observer = new MutationObserver(() => {
-    if (selectUnlock()) observer.disconnect();
-  });
-  observer.observe(root, { childList: true, subtree: true });
-}
 createRoot(root).render(
   <QueryClientProvider client={client}>
     <App />
   </QueryClientProvider>,
 );
+
+// Unlock previews still enter through the production tab instead of seeding a persisted app preference.
+if (params.get('view') !== 'cards')
+  await new Promise<void>(resolve => {
+    const selectUnlock = () => {
+      const tab = [...root.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find(
+        candidate => candidate.textContent?.trim() === '解锁',
+      );
+      if (!tab) return false;
+      tab.click();
+      resolve();
+      return true;
+    };
+    const observer = new MutationObserver(() => {
+      if (selectUnlock()) observer.disconnect();
+    });
+    if (!selectUnlock()) observer.observe(root, { childList: true, subtree: true });
+  });

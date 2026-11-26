@@ -88,7 +88,7 @@ test('390px touch viewport preserves the production card width', async ({ browse
   }
 });
 
-test('page tabs support keyboard navigation and reload from cards', async ({ page }) => {
+test('page tabs support keyboard navigation and reset unlock after reload', async ({ page }) => {
   const errors = await openCards(page, 1440);
   const tabs = page.getByRole('tablist', { name: '线路视图' });
   const cards = tabs.getByRole('tab', { name: '卡片', exact: true });
@@ -99,6 +99,7 @@ test('page tabs support keyboard navigation and reload from cards', async ({ pag
     const selected = key === 'ArrowLeft' || key === 'Home' ? cards : unlock;
     // Restore the starting tab without crossing a navigation boundary.
     await source.click();
+    await expect(source).toHaveAttribute('aria-selected', 'true');
     await source.press(key);
     await expect(selected).toHaveAttribute('aria-selected', 'true');
     await expect(selected).toBeFocused();
@@ -108,7 +109,7 @@ test('page tabs support keyboard navigation and reload from cards', async ({ pag
   }
   await unlock.click();
   await expect(page.getByRole('table', { name: /线路服务解锁/ })).toBeVisible();
-  expect(await page.evaluate(() => localStorage.getItem('brocade-console:chain-view'))).toBeNull();
+  await page.evaluate(() => localStorage.setItem('brocade-console:chain-view', 'unlock'));
   await page.reload();
   await expect(page.getByRole('tab', { name: '卡片', exact: true })).toHaveAttribute('aria-selected', 'true');
   await expect(page.locator('.chain-card')).toHaveCount(16);

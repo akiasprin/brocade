@@ -4234,10 +4234,8 @@ type ChainListView = (typeof CHAIN_LIST_VIEWS)[number]['key'];
 
 function ChainList({ go }: { go: (d: Drill) => void }) {
   const pressCard = useCardPressFeedback();
-  // Unlock is a diagnostic detour rather than the operator's default workspace. A new page load
-  // always starts from cards so an old diagnostic choice cannot unexpectedly replace the route's
-  // primary content.
-  const [view, changeView] = useState<'cards' | 'unlock'>('cards');
+  // 解锁是临时诊断视图，不是线路页偏好；重新进入或加载线路页时始终先展示卡片。
+  const [view, setView] = useState<ChainListView>('cards');
   const tabIdBase = useId();
   const tabId = (key: ChainListView) => `${tabIdBase}-${key}-tab`;
   const panelId = `${tabIdBase}-panel`;
@@ -4696,7 +4694,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     if (next === null) return;
     event.preventDefault();
     const key = CHAIN_LIST_VIEWS[next].key;
-    changeView(key);
+    setView(key);
     window.requestAnimationFrame(() => document.getElementById(tabId(key))?.focus());
   };
 
@@ -4802,7 +4800,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                   tabIndex={view === item.key ? 0 : -1}
                   disabled={viewLocked && view !== item.key}
                   onKeyDown={event => moveViewTab(event, item.key)}
-                  onClick={() => view !== item.key && changeView(item.key)}
+                  onClick={() => view !== item.key && setView(item.key)}
                 >
                   <Icon of={item.icon} size={14} className="nd-tab-ic" />
                   {item.label}
