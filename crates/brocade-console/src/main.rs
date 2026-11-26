@@ -493,17 +493,7 @@ async fn database_command() -> Result<bool, Box<dyn std::error::Error>> {
         Ok(value) if value == "1" => true,
         _ => return Err("BROCADE_PRERELEASE_0007_COMPAT 仅接受临时值 1".into()),
     };
-    let cvm_0009_compat = match env::var("BROCADE_PRERELEASE_0009_COMPAT") {
-        Err(env::VarError::NotPresent) => false,
-        Ok(value) if value == "1" => true,
-        _ => return Err("BROCADE_PRERELEASE_0009_COMPAT 仅接受临时值 1".into()),
-    };
-    if cvm_0009_compat && (ip_compat || node_notification_compat) {
-        return Err("0007 与 0009 预发布兼容模式不能同时启用".into());
-    }
-    let check = if cvm_0009_compat {
-        store.check_prerelease_0009_upgrade().await
-    } else if ip_compat || node_notification_compat {
+    let check = if ip_compat || node_notification_compat {
         store.check_prerelease_0007_upgrade().await
     } else {
         store.check_database_upgrade().await
@@ -514,9 +504,7 @@ async fn database_command() -> Result<bool, Box<dyn std::error::Error>> {
         return Err("数据库不在支持的升级路径中，未执行迁移".into());
     }
     if migrate {
-        let result = if cvm_0009_compat {
-            store.migrate_prerelease_0009_schema().await
-        } else if ip_compat || node_notification_compat {
+        let result = if ip_compat || node_notification_compat {
             store.migrate_prerelease_0007_schema().await
         } else {
             store.migrate_database_schema().await

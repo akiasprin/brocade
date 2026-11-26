@@ -36,7 +36,6 @@ mod pg;
 mod ping_probe;
 mod port_reservations;
 mod prerelease_0003;
-mod prerelease_0009;
 mod prerelease_user_cycle;
 mod probe;
 mod provision;
