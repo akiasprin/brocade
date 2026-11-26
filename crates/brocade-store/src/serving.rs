@@ -1,10 +1,11 @@
 //! Durable input for user-facing subscriptions.
 //!
-//! A subscription is rebuilt on every request, but "dynamic" does not mean "read whatever was
-//! most recently committed". Configuration and runtime grants are released independently, so the
-//! serving model is the topology from the last successful configuration release composed with the
-//! permissions from the last successful grants release, then overlays the independently committed
-//! client configuration. The three immutable snapshots are the cache; rendered URI/YAML never is.
+//! Configuration and runtime grants are released independently, so the serving model is the
+//! topology from the last successful configuration release composed with the permissions from the
+//! last successful grants release, then overlays the independently committed client configuration.
+//! User artifacts are materialized from this durable checkpoint. A replacement is exposed only
+//! after its complete render is ready; publication and uncertain machine state keep serving the
+//! previous complete generation instead of blocking pulls.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,6 +24,9 @@ pub(crate) struct SubscriptionServingProjection {
 }
 
 impl SubscriptionServingProjection {
+    /// Internal probes which need a truthful, currently converged fleet still stop on dirty
+    /// runtime state. User artifact pulls deliberately do not call this method: they serve their
+    /// last complete materialization while the replacement converges.
     pub(crate) fn ensure_available(&self) -> Result<()> {
         match &self.unavailable_reason {
             Some(reason) => Err(StoreError::Unavailable(reason.clone())),
@@ -43,9 +47,9 @@ impl SubscriptionServingProjection {
     }
 }
 
-/// Read all checkpoint pointers and the availability decision from one PostgreSQL statement. A release
-/// which commits immediately after this statement is ordered after this request. Open releases leave
-/// these pointers unchanged, while dirty non-isolated runtime state blocks serving. The snapshots are
+/// Read all checkpoint pointers from one PostgreSQL statement. A release which commits immediately
+/// after this statement is ordered after this request. Open and uncertain releases leave these
+/// pointers unchanged, so pulls keep receiving the last complete generation. The snapshots are
 /// immutable, so loading them afterwards cannot mix their contents with a newer model.
 pub(crate) async fn load_subscription_serving_projection(
     pool: &PgPool,
@@ -124,6 +128,23 @@ pub(crate) async fn load_subscription_serving_projection(
         client_snapshot_id: revision_to_u64("client_snapshot_id", client_snapshot_id)?,
         unavailable_reason,
     })
+}
+
+/// The cheap read used by the process-local artifact cache on every pull. A missing row means the
+/// first configuration release has not completed yet; it is not a cache miss which can be filled
+/// from mutable model tables.
+pub(crate) async fn subscription_generation(pool: &PgPool) -> Result<u64> {
+    let generation = sqlx::query_scalar::<_, i64>(
+        "SELECT generation FROM subscription_serving_state WHERE id = TRUE",
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| {
+        StoreError::Unavailable(
+            "订阅尚无已成功发布的 serving 状态；完成首次配置发布后再拉取".to_owned(),
+        )
+    })?;
+    revision_to_u64("subscription generation", generation)
 }
 
 /// Advance the appropriate serving line in the same transaction which turns the deployment into

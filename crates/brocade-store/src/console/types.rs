@@ -405,8 +405,8 @@ impl UserTrafficAccountingMode {
 }
 
 /// A subscription served by the Clash endpoint for one active user, optionally negotiated as
-/// native Shadowrocket URIs. This is a response value, not a stored entity; the public endpoint
-/// builds it from the stable serving projection on every GET.
+/// native Shadowrocket URIs. This is a response value, not a stored entity; its content comes from
+/// a complete process-local Serving materialization while usage remains live per request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DynamicClashSubscription {
     pub tenant_id: String,

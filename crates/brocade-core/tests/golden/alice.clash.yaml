@@ -1,4 +1,4 @@
-# Brocade · SubBoost 标准版（请求时动态生成）
+# Brocade · SubBoost 标准版（按生效配置生成）
 mixed-port: 7897
 allow-lan: true
 mode: rule

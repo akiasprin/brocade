@@ -139,7 +139,7 @@ fn uri_skips_front_entries_and_clash_renders_dialer_proxy_group() {
     assert!(!clash_text.contains("priv-i-us"));
 
     assert!(
-        haitun_text.starts_with("# Brocade · koipy 测速（请求时动态生成）"),
+        haitun_text.starts_with("# Brocade · koipy 测速（按生效配置生成）"),
         "{haitun_text}"
     );
     assert!(haitun_text.contains("server: hk.example.net"));

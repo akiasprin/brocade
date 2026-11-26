@@ -2477,14 +2477,19 @@ function UserList({
                       className="dg"
                       disabled={rotate.isPending || (!editable && !selfService)}
                       onClick={() => {
-                        if (!window.confirm(`确定更换 ${u.id} 的 UUID？旧订阅和现有连接会立即失效。`)) return;
+                        if (
+                          !window.confirm(
+                            `确定更换 ${u.id} 的 UUID？新 UUID 会在授权同步和订阅渲染完成后生效，期间旧订阅继续可用。`,
+                          )
+                        )
+                          return;
                         rotate.mutate({ user: u, selfService });
                       }}
                     >
                       <Icon of="settings" size={14} className="user-action-menu-icon" />
                       <span>
                         更换 UUID
-                        <small>当前连接将断开，订阅需要重新导入</small>
+                        <small>同步完成后当前连接断开，订阅需要重新导入</small>
                       </span>
                     </button>
                   </div>

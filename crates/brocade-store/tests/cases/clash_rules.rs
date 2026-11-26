@@ -57,7 +57,29 @@ async fn user_rules_save_without_revision_and_only_change_standard_clash() {
             .rules,
         rules
     );
-    let after = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    let first_after_save = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert_eq!(first_after_save.revision, revision);
+    assert!(
+        first_after_save.content == before.content
+            || first_after_save
+                .content
+                .contains("DOMAIN-SUFFIX,example.invalid,DIRECT"),
+        "rule refresh must return one complete old or new subscription"
+    );
+    let after = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let subscription = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+            if subscription
+                .content
+                .contains("DOMAIN-SUFFIX,example.invalid,DIRECT")
+            {
+                break subscription;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the saved rule generation must finish rendering");
     assert_eq!(after.revision, revision);
     assert_ne!(after.content, before.content);
     assert!(after

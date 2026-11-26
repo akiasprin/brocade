@@ -1,4 +1,6 @@
 //! Operational user routing preferences, independent of the revision/publication pipeline.
+use std::collections::BTreeMap;
+
 use crate::{AdminContext, AdminRole, PgStore, Result, StoreError};
 use brocade_core::{
     artifacts::subscription::{self, Subscription},
@@ -68,6 +70,30 @@ pub(crate) async fn load(
         )),
         None => Ok((0, RulePreferences::default())),
     }
+}
+
+pub(crate) async fn load_all(
+    pool: &sqlx::PgPool,
+) -> Result<BTreeMap<(String, String), (i64, RulePreferences)>> {
+    let rows = sqlx::query(
+        "SELECT tenant_id,user_id,version,rules
+           FROM user_clash_rules
+          ORDER BY tenant_id,user_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                (row.try_get("tenant_id")?, row.try_get("user_id")?),
+                (
+                    row.try_get("version")?,
+                    serde_json::from_value(row.try_get("rules")?)
+                        .map_err(|_| invalid("已保存的订阅规则无法读取"))?,
+                ),
+            ))
+        })
+        .collect()
 }
 async fn artifact(
     store: &PgStore,
@@ -167,6 +193,7 @@ impl PgStore {
             .bind(tenant).bind(user).bind(version).bind(serde_json::to_value(&write.rules).map_err(|_|invalid("规则无法保存"))?).execute(&mut *tx).await?;
         sqlx::query("UPDATE subscription_connectors SET verified=false,next_check=now() WHERE tenant_id=$1 AND user_id=$2 AND sealed IS NOT NULL").bind(tenant).bind(user).execute(&mut *tx).await?;
         tx.commit().await?;
+        self.refresh_rendered_subscriptions();
         Ok(View {
             version,
             rules: write.rules,

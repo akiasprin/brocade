@@ -79,6 +79,7 @@ use brocade_deployment::plan::DeploymentKind;
 pub struct PgStore {
     pub(crate) pool: PgPool,
     listener_pool: PgPool,
+    pub(crate) subscription_render: Arc<crate::subscription_render::SubscriptionRenderRuntime>,
     usage_runtime: Arc<usage::UsageRuntimeState>,
 }
 
@@ -235,6 +236,9 @@ impl PgStore {
         Self {
             pool,
             listener_pool,
+            subscription_render: Arc::new(
+                crate::subscription_render::SubscriptionRenderRuntime::default(),
+            ),
             usage_runtime: Arc::new(usage::UsageRuntimeState::default()),
         }
     }
@@ -279,6 +283,12 @@ impl PgStore {
         materialize::ensure_current_snapshot(&self.pool).await?;
         crate::subscription_client::ensure_checkpoint(&self.pool).await?;
         settings::ensure_anytls_padding_scheme(&self.pool).await?;
+        // Existing installations may already have a Serving generation. Warm it before the
+        // listener starts accepting pulls; a fresh installation has no generation yet and will
+        // be warmed by its first successful release.
+        if let Err(error) = self.rendered_subscriptions().await {
+            log::debug!("subscription artifact warmup deferred: {error}");
+        }
         Ok(())
     }
 
@@ -571,7 +581,9 @@ impl PgStore {
         actor: &AdminContext,
         certificate_id: &str,
     ) -> Result<()> {
-        cert::promote_certificate(&self.pool, actor, certificate_id).await
+        cert::promote_certificate(&self.pool, actor, certificate_id).await?;
+        self.refresh_rendered_subscriptions();
+        Ok(())
     }
 
     pub async fn delete_certificate(
@@ -579,7 +591,9 @@ impl PgStore {
         actor: &AdminContext,
         certificate_id: &str,
     ) -> Result<()> {
-        cert::delete_certificate(&self.pool, actor, certificate_id).await
+        cert::delete_certificate(&self.pool, actor, certificate_id).await?;
+        self.refresh_rendered_subscriptions();
+        Ok(())
     }
 
     pub async fn certificate_dns_targets(&self) -> Result<Vec<crate::CertificateDnsTarget>> {
@@ -658,7 +672,11 @@ impl PgStore {
     }
 
     pub async fn record_certificate(&self, issued: crate::IssuedCertificate<'_>) -> Result<bool> {
-        cert::record_certificate(&self.pool, issued).await
+        let changed = cert::record_certificate(&self.pool, issued).await?;
+        if changed {
+            self.refresh_rendered_subscriptions();
+        }
+        Ok(changed)
     }
 
     pub async fn record_certificate_observation(
@@ -949,7 +967,9 @@ impl PgStore {
         ops: Vec<crate::ModelOp>,
         note: Option<String>,
     ) -> Result<crate::ApplyDraftResult> {
-        crate::draft::apply_ops(&self.pool, actor, ops, note).await
+        let result = crate::draft::apply_ops(&self.pool, actor, ops, note).await?;
+        self.refresh_rendered_subscriptions();
+        Ok(result)
     }
 
     pub async fn apply_draft_checked<F, Fut>(
@@ -963,7 +983,10 @@ impl PgStore {
         F: FnOnce(brocade_core::model::ModelSnapshot, brocade_core::model::ModelSnapshot) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        crate::draft::apply_ops_checked(&self.pool, actor, ops, note, validate).await
+        let result =
+            crate::draft::apply_ops_checked(&self.pool, actor, ops, note, validate).await?;
+        self.refresh_rendered_subscriptions();
+        Ok(result)
     }
 
     /// Internal typed view for validation; callers must not serialize secrets to HTTP.
@@ -1093,7 +1116,7 @@ impl PgStore {
         allow_insecure: bool,
     ) -> Result<ArtifactContent> {
         console::serving_user_artifact_content(
-            &self.pool,
+            self,
             actor,
             target_id,
             artifact_kind,
@@ -1104,7 +1127,7 @@ impl PgStore {
     }
 
     pub async fn clash_subscription_by_uuid(&self, uuid: &str) -> Result<DynamicClashSubscription> {
-        console::clash_subscription_by_uuid(&self.pool, uuid).await
+        console::clash_subscription_by_uuid(self, uuid).await
     }
 
     pub async fn clash_subscription_by_uuid_for_family(
@@ -1112,7 +1135,7 @@ impl PgStore {
         uuid: &str,
         family: Option<IpFamily>,
     ) -> Result<DynamicClashSubscription> {
-        console::clash_subscription_by_uuid_for_family(&self.pool, uuid, family).await
+        console::clash_subscription_by_uuid_for_family(self, uuid, family).await
     }
 
     pub async fn clash_subscription_by_uuid_filtered(
@@ -1120,7 +1143,7 @@ impl PgStore {
         uuid: &str,
         filter: SubscriptionFilter,
     ) -> Result<DynamicClashSubscription> {
-        console::clash_subscription_by_uuid_filtered(&self.pool, uuid, filter).await
+        console::clash_subscription_by_uuid_filtered(self, uuid, filter).await
     }
 
     pub async fn shadowrocket_subscription_by_uuid_filtered(
@@ -1128,7 +1151,7 @@ impl PgStore {
         uuid: &str,
         filter: SubscriptionFilter,
     ) -> Result<DynamicClashSubscription> {
-        console::shadowrocket_subscription_by_uuid_filtered(&self.pool, uuid, filter).await
+        console::shadowrocket_subscription_by_uuid_filtered(self, uuid, filter).await
     }
 
     pub async fn clash_subscription_by_haitun_token_for_family(
@@ -1136,7 +1159,7 @@ impl PgStore {
         token: &str,
         family: Option<IpFamily>,
     ) -> Result<DynamicClashSubscription> {
-        console::clash_subscription_by_haitun_token_for_family(&self.pool, token, family).await
+        console::clash_subscription_by_haitun_token_for_family(self, token, family).await
     }
 
     pub async fn clash_subscription_by_haitun_token_filtered(
@@ -1144,7 +1167,7 @@ impl PgStore {
         token: &str,
         filter: SubscriptionFilter,
     ) -> Result<DynamicClashSubscription> {
-        console::clash_subscription_by_haitun_token_filtered(&self.pool, token, filter).await
+        console::clash_subscription_by_haitun_token_filtered(self, token, filter).await
     }
 
     pub async fn clash_subscription_for_user(
@@ -1153,7 +1176,7 @@ impl PgStore {
         tenant_id: &str,
         user_id: &str,
     ) -> Result<DynamicClashSubscription> {
-        console::clash_subscription_for_user(&self.pool, actor, tenant_id, user_id).await
+        console::clash_subscription_for_user(self, actor, tenant_id, user_id).await
     }
 
     pub async fn user_grant_probe_plan(
@@ -1483,7 +1506,11 @@ impl PgStore {
         &self,
         report: TargetConvergenceReport,
     ) -> Result<ReportTargetResult> {
-        deployment::report_target_result(&self.pool, report).await
+        let result = deployment::report_target_result(&self.pool, report).await?;
+        if result.deployment_status == "succeeded" {
+            self.refresh_rendered_subscriptions();
+        }
+        Ok(result)
     }
 
     pub async fn record_node_route_ips(
@@ -1645,8 +1672,16 @@ impl PgStore {
         node_id: &str,
         request: brocade_deployment::protocol::IsolateDeploymentTargetRequest,
     ) -> Result<brocade_deployment::protocol::NodeIsolationCommandResult> {
-        deployment::isolate_deployment_target(&self.pool, actor, deployment_id, node_id, request)
-            .await
+        let result = deployment::isolate_deployment_target(
+            &self.pool,
+            actor,
+            deployment_id,
+            node_id,
+            request,
+        )
+        .await?;
+        self.refresh_rendered_subscriptions();
+        Ok(result)
     }
 
     pub async fn isolate_node(
@@ -1655,7 +1690,9 @@ impl PgStore {
         node_id: &str,
         request: brocade_deployment::protocol::IsolateNodeRequest,
     ) -> Result<brocade_deployment::protocol::NodeIsolationCommandResult> {
-        deployment::isolate_node(&self.pool, actor, node_id, request).await
+        let result = deployment::isolate_node(&self.pool, actor, node_id, request).await?;
+        self.refresh_rendered_subscriptions();
+        Ok(result)
     }
 
     pub async fn restore_node_service(
@@ -1663,7 +1700,9 @@ impl PgStore {
         actor: &AdminContext,
         node_id: &str,
     ) -> Result<brocade_deployment::protocol::NodeIsolationCommandResult> {
-        deployment::restore_node_service(&self.pool, actor, node_id).await
+        let result = deployment::restore_node_service(&self.pool, actor, node_id).await?;
+        self.refresh_rendered_subscriptions();
+        Ok(result)
     }
 
     /// Advance at most one online node's durable first-initialization task.
@@ -1916,7 +1955,12 @@ impl PgStore {
         tenant_id: &str,
         user_id: &str,
     ) -> Result<RotateUserUuidResult> {
-        console::rotate_user_uuid(&self.pool, actor, tenant_id, user_id).await
+        let result = console::rotate_user_uuid(&self.pool, actor, tenant_id, user_id).await?;
+        // The active render still contains the deployed UUID. This prepares the worker without
+        // switching credentials; the later grants activation wakes it again with the new Serving
+        // generation.
+        self.refresh_rendered_subscriptions();
+        Ok(result)
     }
 
     pub async fn user_profile(
@@ -2070,7 +2114,9 @@ impl PgStore {
 
     /// Merge and release the next batch of permission changes recorded in the durable outbox.
     pub async fn process_grant_automation(&self) -> Result<crate::GrantAutomationOutcome> {
-        grant_automation::process_jobs(&self.pool).await
+        let result = grant_automation::process_jobs(&self.pool).await?;
+        self.refresh_rendered_subscriptions();
+        Ok(result)
     }
 
     pub async fn grant_automation_status(&self) -> Result<crate::GrantAutomationStatus> {

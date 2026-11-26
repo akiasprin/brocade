@@ -233,7 +233,8 @@ const HAITUN_STATUS: Record<ClashHaitunSubscriptionInfo['status'], string> = {
   'not-created': '尚未生成',
 };
 
-const CREDENTIAL_NOTE = '订阅地址与二维码包含访问凭据，请勿公开分享；内容按当前授权实时生成。';
+const CREDENTIAL_NOTE =
+  '订阅地址与二维码包含访问凭据，请勿公开分享；内容按当前生效授权生成，更新期间可能暂时提供上一版本。';
 const HAITUN_NOTE =
   '测速订阅包含用户 UUID 等真实节点凭据，持有地址的人无需登录即可获取并使用节点，请仅交给可信测速服务。' +
   '撤销仅停止测速地址的后续拉取，不会自动生成新地址，不影响普通订阅，也不会使已下载的节点配置失效。' +

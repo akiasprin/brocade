@@ -1,22 +1,21 @@
-//! Serving client subscriptions. Every pull renders fresh content
-//! from the last fully converged serving projection and accounts the current user billing cycle.
-//! Committed-but-unpublished revisions are intentionally invisible, while an open/uncertain
-//! release makes pulls temporarily unavailable instead of returning a configuration which may not
-//! match the fleet. Administrator-only sharing links are separate operational state.
+//! Serving client subscriptions. Pulls read a complete process-local materialization of the last
+//! fully converged Serving projection and account the current user billing cycle. A replacement
+//! generation is rendered in the background; publication and rendering never make the previous
+//! complete generation unavailable. Administrator-only sharing links are separate operational
+//! state.
 
-use std::collections::BTreeSet;
-
+#[cfg(test)]
 use brocade_core::{
     artifacts::subscription,
     format::{uri, yaml},
-    model::IpFamily,
-    physical::user::{project_user, SubscriptionFilter},
 };
+use brocade_core::{model::IpFamily, physical::user::SubscriptionFilter};
 use sqlx::{PgPool, Row};
 
 use super::*;
 use crate::{
-    credentials::generate_uuid_v4, input::required_text, AdminContext, Result, StoreError,
+    credentials::generate_uuid_v4, input::required_text,
+    subscription_render::RenderedSubscriptionUser, AdminContext, PgStore, Result, StoreError,
 };
 
 const PUBLIC_NOT_FOUND: &str = "subscription not found";
@@ -31,22 +30,22 @@ enum DynamicClashTemplate {
 /// Resolve an active user by bearer UUID and compile their serving subscription. Inactive users
 /// are absent from the serving snapshot, so absent and inactive credentials have one answer.
 pub async fn clash_subscription_by_uuid(
-    pool: &PgPool,
+    store: &PgStore,
     uuid: &str,
 ) -> Result<DynamicClashSubscription> {
-    clash_subscription_by_uuid_filtered(pool, uuid, SubscriptionFilter::default()).await
+    clash_subscription_by_uuid_filtered(store, uuid, SubscriptionFilter::default()).await
 }
 
 /// The family-specific public URLs are alternate views of the same serving projection. Keeping the
 /// filter here ensures VLESS artifacts and Clash subscriptions both use `UserPlan::retain_family`
 /// rather than growing subtly different notions of an IPv4/IPv6-capable entry.
 pub async fn clash_subscription_by_uuid_for_family(
-    pool: &PgPool,
+    store: &PgStore,
     uuid: &str,
     family: Option<IpFamily>,
 ) -> Result<DynamicClashSubscription> {
     clash_subscription_by_uuid_filtered(
-        pool,
+        store,
         uuid,
         SubscriptionFilter {
             family,
@@ -60,59 +59,42 @@ pub async fn clash_subscription_by_uuid_for_family(
 /// protocol. Both filters operate on the same compiled plan so a combined URL cannot drift from
 /// the individual views.
 pub async fn clash_subscription_by_uuid_filtered(
-    pool: &PgPool,
+    store: &PgStore,
     uuid: &str,
     filter: SubscriptionFilter,
 ) -> Result<DynamicClashSubscription> {
-    subscription_by_uuid(pool, uuid, filter, DynamicClashTemplate::Standard).await
+    subscription_by_uuid(store, uuid, filter, DynamicClashTemplate::Standard).await
 }
 
 pub async fn shadowrocket_subscription_by_uuid_filtered(
-    pool: &PgPool,
+    store: &PgStore,
     uuid: &str,
     filter: SubscriptionFilter,
 ) -> Result<DynamicClashSubscription> {
-    subscription_by_uuid(pool, uuid, filter, DynamicClashTemplate::Shadowrocket).await
+    subscription_by_uuid(store, uuid, filter, DynamicClashTemplate::Shadowrocket).await
 }
 
 async fn subscription_by_uuid(
-    pool: &PgPool,
+    store: &PgStore,
     uuid: &str,
     filter: SubscriptionFilter,
     template: DynamicClashTemplate,
 ) -> Result<DynamicClashSubscription> {
-    let serving = crate::serving::load_subscription_serving_projection(pool).await?;
-    let user = serving
-        .snapshot
-        .users
-        .iter()
-        .find(|user| user.uuid == uuid)
-        .ok_or_else(public_not_found)?;
-    let tenant_id = user.tenant.clone();
-    let user_id = user.id.clone();
-    serving.ensure_available()?;
-    build_dynamic_clash(
-        pool,
-        &serving.snapshot,
-        &tenant_id,
-        &user_id,
-        filter,
-        template,
-        true,
-    )
-    .await
+    let serving = store.rendered_subscriptions().await?;
+    let user = serving.user_by_uuid(uuid).ok_or_else(public_not_found)?;
+    build_rendered_clash(store.pool(), &user, filter, template, true).await
 }
 
 /// Resolve a separately revocable Haitun bearer. The lookup deliberately happens before model
 /// projection: revoked, unknown, disabled and currently unusable users all have the same public
 /// answer and disclose no account state.
 pub async fn clash_subscription_by_haitun_token_for_family(
-    pool: &PgPool,
+    store: &PgStore,
     token: &str,
     family: Option<IpFamily>,
 ) -> Result<DynamicClashSubscription> {
     clash_subscription_by_haitun_token_filtered(
-        pool,
+        store,
         token,
         SubscriptionFilter {
             family,
@@ -123,7 +105,7 @@ pub async fn clash_subscription_by_haitun_token_for_family(
 }
 
 pub async fn clash_subscription_by_haitun_token_filtered(
-    pool: &PgPool,
+    store: &PgStore,
     token: &str,
     filter: SubscriptionFilter,
 ) -> Result<DynamicClashSubscription> {
@@ -134,27 +116,19 @@ pub async fn clash_subscription_by_haitun_token_filtered(
            AND revoked_at IS NULL",
     )
     .bind(token)
-    .fetch_optional(pool)
+    .fetch_optional(store.pool())
     .await?
     .ok_or_else(public_not_found)?;
     let tenant_id: String = link.try_get("tenant_id")?;
     let user_id: String = link.try_get("user_id")?;
-    let serving = crate::serving::load_subscription_serving_projection(pool).await?;
-    if !serving
-        .snapshot
-        .users
-        .iter()
-        .any(|user| user.tenant == tenant_id && user.id == user_id)
-    {
-        return Err(public_not_found());
-    }
-    serving.ensure_available()?;
-
-    build_dynamic_clash(
-        pool,
-        &serving.snapshot,
-        &tenant_id,
-        &user_id,
+    let user = store
+        .rendered_subscriptions()
+        .await?
+        .user(&tenant_id, &user_id)
+        .ok_or_else(public_not_found)?;
+    build_rendered_clash(
+        store.pool(),
+        &user,
         filter,
         DynamicClashTemplate::Haitun,
         true,
@@ -166,7 +140,7 @@ pub async fn clash_subscription_by_haitun_token_filtered(
 /// tenant administrator can obtain URLs only for users in their scope, and cannot accidentally
 /// validate a URL against a committed-but-unpublished user.
 pub async fn clash_subscription_for_user(
-    pool: &PgPool,
+    store: &PgStore,
     actor: &AdminContext,
     tenant_id: &str,
     user_id: &str,
@@ -174,21 +148,14 @@ pub async fn clash_subscription_for_user(
     let tenant_id = required_text(tenant_id, "tenant_id")?;
     let user_id = required_text(user_id, "user id")?;
     actor.require_tenant_access(&tenant_id, "Clash subscription")?;
-    let serving = crate::serving::load_subscription_serving_projection(pool).await?;
-    if !serving
-        .snapshot
-        .users
-        .iter()
-        .any(|user| user.tenant == tenant_id && user.id == user_id)
-    {
-        return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
-    }
-    serving.ensure_available()?;
-    build_dynamic_clash(
-        pool,
-        &serving.snapshot,
-        &tenant_id,
-        &user_id,
+    let user = store
+        .rendered_subscriptions()
+        .await?
+        .user(&tenant_id, &user_id)
+        .ok_or_else(|| StoreError::NotFound(format!("user {tenant_id}/{user_id}")))?;
+    build_rendered_clash(
+        store.pool(),
+        &user,
         SubscriptionFilter::default(),
         DynamicClashTemplate::Standard,
         false,
@@ -319,11 +286,9 @@ fn clash_haitun_link_from_row(row: sqlx::postgres::PgRow) -> Result<ClashHaitunL
     })
 }
 
-async fn build_dynamic_clash(
+async fn build_rendered_clash(
     pool: &PgPool,
-    snapshot: &brocade_core::model::ModelSnapshot,
-    tenant_id: &str,
-    user_id: &str,
+    user: &RenderedSubscriptionUser,
     filter: SubscriptionFilter,
     template: DynamicClashTemplate,
     hide_reason: bool,
@@ -334,8 +299,8 @@ async fn build_dynamic_clash(
         "SELECT EXISTS(SELECT 1 FROM users WHERE tenant_id=$1 AND id=$2
           AND user_service_state(service_starts_at,service_expires_at,now())='active')",
     )
-    .bind(tenant_id)
-    .bind(user_id)
+    .bind(&user.tenant_id)
+    .bind(&user.user_id)
     .fetch_one(pool)
     .await?;
     if !eligible {
@@ -345,80 +310,54 @@ async fn build_dynamic_clash(
             StoreError::NotFound("用户服务尚未生效或已到期".into())
         });
     }
-    let output = crate::compile_cache::compile_incremental(snapshot);
-    let mut plan = crate::compile_cache::project_user(&output, tenant_id, user_id)
-        .map(|plan| plan.as_ref().clone())
-        .map_err(|blocked| {
-            StoreError::InvalidData(format!(
-                "cannot project user {tenant_id}/{user_id}: {blocked:?}"
+    if !user.has_entries() {
+        return Err(if user.authorized {
+            StoreError::Unavailable(format!(
+                "user {}/{} 暂时无可用入口",
+                user.tenant_id, user.user_id
             ))
-        })?;
-    if plan.entries.is_empty() {
-        let authorized = snapshot.apps.iter().any(|app| {
-            app.grants
-                .iter()
-                .any(|grant| grant.tenant == tenant_id && grant.user == user_id)
-        });
-        return Err(if authorized {
-            StoreError::Unavailable(format!("user {tenant_id}/{user_id} 暂时无可用入口"))
         } else if hide_reason {
             public_not_found()
         } else {
             StoreError::NotFound(format!(
-                "user {tenant_id}/{user_id} has no effective subscription"
+                "user {}/{} has no effective subscription",
+                user.tenant_id, user.user_id
             ))
         });
     }
-    plan.retain_filter(filter);
-
-    // Only apps that actually project at least one subscription entry participate in the
-    // combined quota. A grant whose ingress has no usable public endpoint does not silently make
-    // an otherwise limited subscription appear unlimited.
-    let app_ids = output
-        .unpublishable_view()
-        .apps
-        .iter()
-        .filter_map(|app| {
-            (!project_user(std::slice::from_ref(app), tenant_id, user_id)
-                .entries
-                .is_empty())
-            .then(|| app.app_id.clone())
-            .flatten()
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if app_ids.is_empty() {
+    if user.app_ids.is_empty() {
         return Err(if hide_reason {
             public_not_found()
         } else {
             StoreError::NotFound(format!(
-                "user {tenant_id}/{user_id} has no effective subscription"
+                "user {}/{} has no effective subscription",
+                user.tenant_id, user.user_id
             ))
         });
     }
 
-    let uuid = plan.uuid.clone();
-    let mut artifact = subscription::build(&plan);
-    artifact.mark_self_signed(&crate::cert::self_signed_certificate_pins(pool).await?);
-    let (mut content, format) = render_subscription(&artifact, template);
-    // Koipy and native URI subscriptions retain their independent behavior.
-    if matches!(template, DynamicClashTemplate::Standard) {
-        let (_, preferences) = crate::clash_rules::load(pool, tenant_id, user_id).await?;
-        content = yaml::clash_subscription_with_rules_for_plan(&artifact, &plan, &preferences);
-    }
-    let usage = subscription_usage(pool, tenant_id, user_id, &app_ids).await?;
+    let rendered = user.variant(filter);
+    let (content, format) = match template {
+        DynamicClashTemplate::Standard => (
+            rendered.clash_with_rules.clone(),
+            DynamicSubscriptionFormat::Clash,
+        ),
+        DynamicClashTemplate::Haitun => (rendered.haitun.clone(), DynamicSubscriptionFormat::Clash),
+        DynamicClashTemplate::Shadowrocket => (rendered.native.clone(), rendered.native_format),
+    };
+    let usage = subscription_usage(pool, &user.tenant_id, &user.user_id, &user.app_ids).await?;
     Ok(DynamicClashSubscription {
-        tenant_id: tenant_id.to_owned(),
-        user_id: user_id.to_owned(),
-        uuid,
-        revision: snapshot.revision,
+        tenant_id: user.tenant_id.clone(),
+        user_id: user.user_id.clone(),
+        uuid: user.uuid.clone(),
+        revision: user.revision,
         content,
         format,
         usage,
     })
 }
 
+#[cfg(test)]
 fn render_subscription(
     artifact: &subscription::Subscription,
     template: DynamicClashTemplate,

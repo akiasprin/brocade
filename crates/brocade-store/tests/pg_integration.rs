@@ -4453,11 +4453,27 @@ async fn front_save_updates_subscriptions_without_creating_a_deployment() {
             .unwrap();
     assert_eq!(target_front.as_deref(), Some("front-a1b2"));
 
-    let after_save = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    let first_after_save = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
     assert_eq!(
-        after_save.revision, initial_revision,
+        first_after_save.revision, initial_revision,
         "client-only saves must not move the serving machine topology"
     );
+    assert!(
+        first_after_save.content == before.content
+            || first_after_save.content.contains("name: \"入口组\""),
+        "client-only refresh must return one complete old or new subscription"
+    );
+    let after_save = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let subscription = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+            if subscription.content.contains("name: \"入口组\"") {
+                break subscription;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the saved Front generation must finish rendering");
     assert!(after_save.content.contains("name: \"入口组\""));
     assert!(after_save.content.contains("type: url-test"));
     assert!(after_save
@@ -4569,7 +4585,23 @@ async fn front_save_updates_subscriptions_without_creating_a_deployment() {
             .await
             .unwrap();
     assert_eq!(target_front, None);
-    let after_delete = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    let first_after_delete = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert!(
+        first_after_delete.content == after_save.content
+            || !first_after_delete.content.contains("name: \"入口组\""),
+        "client-only refresh must return one complete old or new subscription"
+    );
+    let after_delete = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let subscription = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+            if !subscription.content.contains("name: \"入口组\"") {
+                break subscription;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the deleted Front generation must finish rendering");
     assert!(!after_delete.content.contains("name: \"入口组\""));
     assert!(!after_delete.content.contains("dialer-proxy"));
 }
@@ -4809,9 +4841,26 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
         renamed_revision,
         "the client snapshot retains its committed source revision"
     );
-    let committed = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    let first_after_commit = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert!(
+        first_after_commit.content.contains("name: \"Main Chain\"")
+            || first_after_commit
+                .content
+                .contains("name: \"Renamed Chain\""),
+        "a pull during refresh must receive one complete generation"
+    );
+    let committed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let subscription = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+            if subscription.content.contains("name: \"Renamed Chain\"") {
+                break subscription;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the committed client generation must finish rendering");
     assert!(!committed.content.contains("name: \"Main Chain\""));
-    assert!(committed.content.contains("name: \"Renamed Chain\""));
     let deployment_count: i64 = sqlx::query_scalar("SELECT count(*) FROM deployments")
         .fetch_one(db.pool())
         .await
@@ -4855,19 +4904,32 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     .execute(db.pool())
     .await
     .unwrap();
-    assert!(matches!(
-        db.store.clash_subscription_by_uuid(uuid).await,
-        Err(StoreError::Unavailable(_))
-    ));
-    assert!(matches!(
-        db.store
-            .shadowrocket_subscription_by_uuid_filtered(
-                uuid,
-                brocade_core::physical::user::SubscriptionFilter::default(),
-            )
-            .await,
-        Err(StoreError::Unavailable(_))
-    ));
+    let during_dirty = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert!(during_dirty.content.contains("name: \"Renamed Chain\""));
+    let native_during_dirty = db
+        .store
+        .shadowrocket_subscription_by_uuid_filtered(
+            uuid,
+            brocade_core::physical::user::SubscriptionFilter::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(native_during_dirty.revision, during_dirty.revision);
+    let nodes_during_dirty = db
+        .store
+        .serving_user_artifact_content(
+            &system_admin(),
+            "platform.acme:alice",
+            "uri",
+            SubscriptionFilter::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(nodes_during_dirty
+        .content
+        .as_deref()
+        .is_some_and(|content| content.contains("vless://")));
     sqlx::query("DELETE FROM node_applied_state WHERE node_id = 'n1'")
         .execute(db.pool())
         .await
@@ -5092,6 +5154,29 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     .execute(db.pool())
     .await
     .unwrap();
+    assert_eq!(
+        db.store
+            .clash_subscription_by_uuid(uuid)
+            .await
+            .unwrap()
+            .uuid,
+        uuid,
+        "the previous credential remains responsive while its replacement renders"
+    );
+    assert!(matches!(
+        db.store.clash_subscription_by_uuid(next_uuid).await,
+        Err(StoreError::NotFound(_))
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if db.store.clash_subscription_by_uuid(next_uuid).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the rotated UUID generation must finish rendering");
     assert!(matches!(
         db.store.clash_subscription_by_uuid(uuid).await,
         Err(StoreError::NotFound(_))
@@ -5132,6 +5217,28 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     .execute(db.pool())
     .await
     .unwrap();
+    assert_eq!(
+        db.store
+            .clash_subscription_by_uuid(next_uuid)
+            .await
+            .unwrap()
+            .uuid,
+        next_uuid,
+        "disable keeps the last complete generation readable while its removal renders"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                db.store.clash_subscription_by_uuid(next_uuid).await,
+                Err(StoreError::NotFound(_))
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the disabled-user generation must finish rendering");
     assert!(matches!(
         db.store.clash_subscription_by_uuid(next_uuid).await,
         Err(StoreError::NotFound(_))

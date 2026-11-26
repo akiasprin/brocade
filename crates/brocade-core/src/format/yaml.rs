@@ -322,7 +322,7 @@ pub fn clash_haitun_subscription(subscription: &Subscription) -> String {
     let subscription = clash_compatible_subscription(subscription);
     let subscription = &subscription;
     let mut lines = vec![
-        "# Brocade · koipy 测速（请求时动态生成）".to_owned(),
+        "# Brocade · koipy 测速（按生效配置生成）".to_owned(),
         "mixed-port: 7897".to_owned(),
         "allow-lan: false".to_owned(),
         "mode: rule".to_owned(),
@@ -390,7 +390,7 @@ pub fn clash_haitun_subscription(subscription: &Subscription) -> String {
 fn push_standard_base(lines: &mut Vec<String>, subscription: &Subscription) {
     lines.extend(
         [
-            "# Brocade · SubBoost 标准版（请求时动态生成）",
+            "# Brocade · SubBoost 标准版（按生效配置生成）",
             "mixed-port: 7897",
             "allow-lan: true",
             "mode: rule",

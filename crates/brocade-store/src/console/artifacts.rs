@@ -211,13 +211,13 @@ pub async fn artifact_content(
     )
 }
 
-/// Render a user subscription from the same converged projection as the public Clash endpoint.
+/// Read a user artifact from the same complete materialized generation as the public endpoint.
 /// This is intentionally separate from `artifact_content`: the artifact inspector is a draft and
 /// historical-revision tool, while the address dialog promises to show what subscribers can use
 /// now. Keeping the call sites explicit prevents a future preview feature from weakening serving
 /// semantics globally.
 pub async fn serving_user_artifact_content(
-    pool: &PgPool,
+    store: &crate::PgStore,
     actor: &AdminContext,
     target_id: &str,
     artifact_kind: &str,
@@ -239,21 +239,27 @@ pub async fn serving_user_artifact_content(
     let (tenant_id, user_id) = split_user_target(&target_id)?;
     actor.require_tenant_access(tenant_id, "serving user artifact")?;
 
-    let serving = crate::serving::load_subscription_serving_projection(pool).await?;
-    ensure_user_visible(&serving.snapshot, tenant_id, user_id)?;
-    serving.ensure_available()?;
-    let self_signed_names = crate::cert::self_signed_certificate_pins(pool).await?;
-    artifact_content_of_with_policy(
-        &serving.snapshot,
+    let serving = store.rendered_subscriptions().await?;
+    let user = serving
+        .user(tenant_id, user_id)
+        .ok_or_else(|| StoreError::NotFound(format!("user {target_id}")))?;
+    let variant = user.variant(filter);
+    let content = if artifact_kind == "uri" {
+        if allow_insecure {
+            variant.insecure_uri.clone()
+        } else {
+            variant.uri.clone()
+        }
+    } else {
+        variant.clash.clone()
+    };
+    artifact_content_from_text(
+        user.revision,
         "user",
         &target_id,
         &artifact_kind,
-        ArtifactRenderPolicy {
-            redact: false,
-            filter,
-            self_signed_names: &self_signed_names,
-            allow_insecure,
-        },
+        content,
+        false,
     )
 }
 
