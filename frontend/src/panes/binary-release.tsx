@@ -16,7 +16,7 @@ import {
   XRAY_HANDOFF_PROTOCOL_VERSION,
   XRAY_HANDOFF_RESTART_FALLBACK_PROTOCOL_VERSION,
 } from '../api';
-import { Confirm, ErrorBox, SegSwitch } from '../ui/bits';
+import { Confirm, ErrorBox } from '../ui/bits';
 import { randomKey } from '../ui/platform';
 import { BinaryReleaseHistory } from './binary-release-history';
 import { BINARY_TARGET_STATUS } from '../ui/binary-release-status';
@@ -93,12 +93,18 @@ function unavailableReason(node: NodeAgentStateItem, component: BinaryComponent,
 }
 
 type BinaryState = 'current' | 'behind' | 'blocked';
+type AgentFlavor = 'base' | 'cvm';
+
+const AGENT_FLAVOR_LABEL: Record<AgentFlavor, string> = { base: '基础版', cvm: '容器版' };
+/** 旧 Agent 不上报变体，按基础版处理（与服务端领取工单的兼容口径一致）。 */
+const runningFlavor = (node: NodeAgentStateItem): AgentFlavor => node.runtime_versions?.agent_flavor ?? 'base';
+/** 在线发布能到达的变体：同变体直接升级，基础版可换成容器版；容器版换回基础版须停机重装。 */
+const flavorReachable = (node: NodeAgentStateItem, target: AgentFlavor) =>
+  runningFlavor(node) === target || target === 'cvm';
 
 /** 二进制发布共用数据、勾选和操作；页头与页签内容读取同一份状态。 */
 export function useBinaryRelease(component: BinaryComponent) {
   const qc = useQueryClient();
-  const [agentFlavor, setAgentFlavor] = useState<'base' | 'cvm'>('base');
-  const [allowFlavorChange, setAllowFlavorChange] = useState(false);
   const releases = useQuery({
     queryKey: ['binary-releases', component],
     queryFn: async () => {
@@ -151,9 +157,14 @@ export function useBinaryRelease(component: BinaryComponent) {
     drainSeconds >= 10 &&
     drainSeconds <= 86_400;
 
-  const effectiveFlavor = releases.data?.current?.active
-    ? (releases.data.current.agent_flavor ?? agentFlavor)
-    : agentFlavor;
+  // Agent 跟随 Console 的产品变体：容器版 Console 同时内嵌两种 Agent，统一下发容器版；基础版 Console 只有基础版。
+  // 进行中的发布单按批准时冻结的变体显示。
+  const consoleFlavor: AgentFlavor = releases.data?.available_variants?.some(item => item.agent_flavor === 'cvm')
+    ? 'cvm'
+    : 'base';
+  const effectiveFlavor: AgentFlavor = releases.data?.current?.active
+    ? (releases.data.current.agent_flavor ?? consoleFlavor)
+    : consoleFlavor;
   const available =
     releases.data?.available_variants?.find(item => item.agent_flavor === effectiveFlavor) ?? releases.data?.available;
   const view = releases.data && available ? { ...releases.data, available } : undefined;
@@ -167,12 +178,7 @@ export function useBinaryRelease(component: BinaryComponent) {
   const stateOf = (node: NodeAgentStateItem): BinaryState =>
     onThisBuild(node)
       ? 'current'
-      : eligible(node, component, xrayStrategy) &&
-          (component !== 'agent' ||
-            (node.runtime_versions?.agent_flavor ?? 'base') === effectiveFlavor ||
-            (allowFlavorChange &&
-              effectiveFlavor === 'cvm' &&
-              (node.runtime_versions?.agent_flavor ?? 'base') === 'base'))
+      : eligible(node, component, xrayStrategy) && (component !== 'agent' || flavorReachable(node, effectiveFlavor))
         ? 'behind'
         : 'blocked';
   const targets = new Map((active?.targets ?? []).map(target => [target.node_id, target]));
@@ -186,6 +192,11 @@ export function useBinaryRelease(component: BinaryComponent) {
   // 勾选只对仍可升级的机器有效：编辑期间机器失联、已被别处升级时，已勾的那台不再计数，也不提交。
   const pickable = new Set(outside.filter(item => item.state === 'behind').map(item => item.node.node_id));
   const selected = picked.filter(id => pickable.has(id));
+  // 本次名单里要换变体的机器（基础版 → 容器版）；批准时据此授权，名单外不受影响。
+  const flavorChanges =
+    component === 'agent'
+      ? fleet.filter(node => selected.includes(node.node_id) && runningFlavor(node) !== effectiveFlavor).length
+      : 0;
 
   const accept = async (view: BinaryReleaseView) => {
     await qc.cancelQueries({ queryKey: ['binary-releases', component] });
@@ -208,7 +219,7 @@ export function useBinaryRelease(component: BinaryComponent) {
               xray_strategy: xrayStrategy,
               ...(xrayStrategy === 'restart' ? {} : { xray_drain_timeout_secs: drainSeconds }),
             }
-          : { agent_flavor: effectiveFlavor, allow_flavor_change: allowFlavorChange }),
+          : { agent_flavor: effectiveFlavor, allow_flavor_change: flavorChanges > 0 }),
       });
     },
     onSuccess: async view => {
@@ -234,9 +245,8 @@ export function useBinaryRelease(component: BinaryComponent) {
   return {
     component,
     agentFlavor: effectiveFlavor,
-    setAgentFlavor,
-    allowFlavorChange,
-    setAllowFlavorChange,
+    followsConsole: effectiveFlavor === consoleFlavor,
+    flavorChanges,
     releases,
     nodes,
     ready: !!view && !!nodes.data && (component !== 'xray' || !!settings.data),
@@ -323,7 +333,7 @@ export function BinaryReleaseTab({
       status: status[state].text,
       current: versionOf(node),
       target: state === 'behind' ? target : null,
-      reason: state === 'blocked' ? unavailableReason(node, release.component, release.xrayStrategy) || null : null,
+      reason: state === 'blocked' ? blockedReason(node) : null,
       pick: {
         checked: selected.includes(node.node_id),
         disabled: !editable || busy || state !== 'behind',
@@ -331,6 +341,11 @@ export function BinaryReleaseTab({
       },
     };
   };
+  const blockedReason = (node: NodeAgentStateItem) =>
+    unavailableReason(node, release.component, release.xrayStrategy) ||
+    (release.component === 'agent' && !flavorReachable(node, release.agentFlavor)
+      ? '容器版 Agent 换回基础版须停机重装'
+      : null);
   const outsideGroup = (key: BinaryState, label: string): MachineGroup => ({
     key,
     label,
@@ -347,6 +362,14 @@ export function BinaryReleaseTab({
 
   const facts: [string, ReactNode][] = [
     [release.component === 'xray' ? '可发 commit' : '可发版本', <span className="cgc-mono">{target}</span>],
+    ...(release.component === 'agent'
+      ? ([
+          [
+            'Agent 类型',
+            `${AGENT_FLAVOR_LABEL[release.agentFlavor]}${release.followsConsole ? ' · 跟随 Console' : ''}`,
+          ],
+        ] as [string, ReactNode][])
+      : []),
     ...(release.component === 'xray' && active
       ? ([['执行策略', xrayStrategyLabel(active.xray_strategy)]] as [string, ReactNode][])
       : []),
@@ -404,7 +427,7 @@ export function BinaryReleaseTab({
         label="已一致"
         value={current}
         unit={`/ ${current + behind} 台`}
-        period={`可发 ${target} · 升级范围：逐台选择`}
+        period={`可发 ${target}`}
         parts={[
           { tone: 'ok', label: '已一致', count: current },
           ...(behind ? [{ tone: 'warn' as const, label: '可升级', count: behind }] : []),
@@ -438,33 +461,6 @@ export function BinaryReleaseTab({
         </section>
       )}
       <section className="cgc-main">
-        {release.component === 'agent' && (view.available_variants?.length ?? 0) > 1 && (
-          <div className="cgc-agent-options" role="group" aria-label="Agent 升级选项">
-            <SegSwitch
-              checked={release.agentFlavor === 'cvm'}
-              disabled={busy || !!active}
-              off="基础版 Agent"
-              on="容器版 Agent"
-              ariaLabel="Agent 产品版本"
-              onChange={cvm => {
-                release.setAgentFlavor(cvm ? 'cvm' : 'base');
-                setSelected([]);
-              }}
-            />
-            <label>
-              <input
-                type="checkbox"
-                checked={release.allowFlavorChange}
-                disabled={busy || !!active}
-                onChange={event => {
-                  release.setAllowFlavorChange(event.target.checked);
-                  setSelected([]);
-                }}
-              />
-              允许基础版机器升级为容器版
-            </label>
-          </div>
-        )}
         {!picking && mutationError && <ErrorBox error={mutationError} />}
         <MachineTable
           label={`逐台 ${label} 升级状态`}
@@ -483,7 +479,11 @@ export function BinaryReleaseTab({
             <ScopeToolbar
               note={
                 release.component === 'agent'
-                  ? '批准时冻结本次机器名单。Agent 下载校验、重启后恢复轮询和运行上报，才确认成功。'
+                  ? `批准时冻结本次机器名单。Agent 下载校验、重启后恢复轮询和运行上报，才确认成功。${
+                      release.flavorChanges
+                        ? `其中 ${release.flavorChanges} 台由基础版换为${AGENT_FLAVOR_LABEL[release.agentFlavor]}。`
+                        : ''
+                    }`
                   : xrayStrategyDescription(release.xrayStrategy)
               }
               error={release.create.error ? <ErrorBox error={release.create.error} /> : undefined}

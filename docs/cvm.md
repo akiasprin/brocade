@@ -234,9 +234,9 @@ Agent 自动收敛自己拥有的命名空间、bridge、路由、nftables 与�
 
 ## 产品变体与数据库
 
-CVM 是默认不安装的扩展能力。先按[安装与升级](install.md#产品变体与扩展切换)切换为 `cvm` Console；普通机器继续使用 `base` Agent。仅提供入口或出口网络的机器安装 `--agent-flavor cvm` 即可，不要求 Cube 或 KVM；计算宿主使用 `--enable-cvm`，同时安装容器 Agent 和经过校验的运行栈。
+CVM 是默认不安装的扩展能力。先按[安装与升级](install.md#产品变体与扩展切换)切换为 `cvm` Console；已装机器的 Agent 不会因此更换，之后在发布页升级时跟随 Console 换为容器 Agent。仅提供入口或出口网络的机器安装 `--agent-flavor cvm` 即可，不要求 Cube 或 KVM；计算宿主使用 `--enable-cvm`，同时安装容器 Agent 和经过校验的运行栈。
 
-Agent 重装省略变体时保留已安装身份。发布更新默认保持变体；基础 Agent 升级为容器 Agent 必须显式批准。退回基础 Agent 需要先排空全部 CVM 资源、等待实际清理回执、停止 Agent，再以 `--agent-flavor base` 运行安装器。在线自更新不承担 CVM 降级；其执行进程持有资源锁，不能替代停机检查。
+Agent 重装省略变体时保留已安装身份。发布页的 Agent 类型跟随 Console，不再提供变体切换：容器版 Console 统一下发容器 Agent，名单中的基础 Agent 在同一次批准中换为容器 Agent，名单工具条写明台数；基础版 Console 只下发基础 Agent。退回基础 Agent 需要先排空全部 CVM 资源、等待实际清理回执、停止 Agent，再以 `--agent-flavor base` 运行安装器。在线自更新不承担 CVM 降级；其执行进程持有资源锁，不能替代停机检查。
 
 两种 Console 共用首发统一 schema。全新安装执行正常迁移；切换产品变体不删表、不改写 SQLx checksum、不重建普通数据。基础版会拒绝仍在使用或待清理的实例、卷、网卡、入口、地址端口与网络状态，以及未发布的容器配置和未结束的混合发布。实验 schema、旧 CVM 执行记录和中间协议不属于首发接管范围，已移除实验转换开关。
 

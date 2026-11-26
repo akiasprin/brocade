@@ -265,7 +265,9 @@ describe('发布页', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'Agent' }));
     expect(screen.getByRole('tab', { name: 'Agent' }).getAttribute('aria-selected')).toBe('true');
     const agentLedger = screen.getByRole('region', { name: '已一致' });
-    expect(within(agentLedger).getByText('可发 v0.2.0 · 升级范围：逐台选择')).toBeTruthy();
+    expect(within(agentLedger).getByText('可发 v0.2.0')).toBeTruthy();
+    expect(within(agentLedger).getByText('基础版 · 跟随 Console')).toBeTruthy();
+    expect(screen.queryByRole('group', { name: 'Agent 产品版本' })).toBeNull();
     expect(screen.getByRole('table', { name: '逐台 Agent 升级状态' })).toBeTruthy();
     expect(screen.queryByRole('group', { name: '升级范围' })).toBeNull();
 
@@ -279,7 +281,8 @@ describe('发布页', () => {
 
     fireEvent.click(screen.getByRole('tab', { name: 'Xray1' }));
     const xrayLedger = screen.getByRole('region', { name: '已一致' });
-    expect(within(xrayLedger).getByText('可发 commit 未知 · 升级范围：逐台选择')).toBeTruthy();
+    expect(within(xrayLedger).getByText('可发 commit 未知')).toBeTruthy();
+    expect(within(xrayLedger).queryByText(/跟随 Console/)).toBeNull();
     expect(screen.getByText('可升级', { selector: '.cgc-st' })).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: '升级 Xray' }));
