@@ -202,7 +202,7 @@ export function CvmOverview({
           <div className="cvm-card-block cvm-card-grow">
             <div className="load-network-cap">
               <b>
-                <Icon of="dns" size={13} className="chart-title-icon" />
+                <Icon of="network" size={13} className="chart-title-icon" />
                 网络概况
               </b>
               {!redacted && (
@@ -318,7 +318,7 @@ export function CvmOverview({
             </button>
           )}
         </header>
-        <RuntimeBand name="SPEC" icon="servers" meta={pending ? '待发布' : '已生效'}>
+        <RuntimeBand name="SPEC" icon="container" meta={pending ? '待发布' : '已生效'}>
           <RuntimeCells
             items={[
               [

@@ -25,7 +25,7 @@ export function HostList({
   const hosts = stackHosts(workspace);
   if (!hosts.length)
     return (
-      <EmptyState icon="nodes" title="尚无宿主">
+      <EmptyState icon="host" title="尚无宿主">
         机器启用执行能力并上报后，会在这里显示。机器原有功能可继续使用。
       </EmptyState>
     );
@@ -135,7 +135,7 @@ function HostRow({
             aria-controls={detailsId}
             onClick={onToggle}
           >
-            <Icon of="servers" size={15} />
+            <Icon of="host" size={15} />
             <strong>{host.name}</strong>
             <Icon of="chevronDown" size={13} />
           </button>

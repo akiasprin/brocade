@@ -325,7 +325,7 @@ function HostHeader({
     !host || host.error || caps?.baremetal ? 'st-halted' : !host.fresh ? 'st-gold' : ready ? 'st-succeeded' : '';
   return (
     <div className="cvm-list-host">
-      <Icon of="servers" size={14} />
+      <Icon of="host" size={14} />
       <b>{host?.name ?? id}</b>
       <span className="cvm-list-muted">
         {caps?.backend ? `${caps.backend} · ` : ''}
@@ -939,7 +939,7 @@ export function InstanceList({
           </table>
         </div>
       ) : (
-        <EmptyState icon="servers" title={instances.length ? '没有匹配的容器' : '暂无可查看的容器'}>
+        <EmptyState icon="container" title={instances.length ? '没有匹配的容器' : '暂无可查看的容器'}>
           {instances.length
             ? `可搜索名称、使用者、宿主${workspace.redacted ? '' : '、地址或端口'}，也可调整筛选条件。`
             : manage

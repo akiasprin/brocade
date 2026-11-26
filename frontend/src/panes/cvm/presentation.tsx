@@ -109,7 +109,7 @@ export function CvmPageHeader({
     <header className={`nd-page-head cvm-page-head${detail ? ' cvm-instance-head' : ''}`} data-tabbed={Boolean(tabs)}>
       <div className="nd-page-identity">
         <span className="cg-plate cvm-plate">
-          <Icon of="servers" size={18} />
+          <Icon of="container" size={18} />
           {lamp && <i className={`node-lamp ${lamp.tone}`} role="img" aria-label={lamp.why} title={lamp.why} />}
         </span>
         <div className="nd-ident-text">

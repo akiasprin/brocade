@@ -25,9 +25,9 @@ import { editCount, useNetworkDraft } from './network-draft';
 import { ManagedNetworking } from './networking';
 
 const tabs = [
-  { key: 'instances', label: '容器', icon: 'nodeLinks' },
-  { key: 'hosts', label: '宿主', icon: 'servers' },
-  { key: 'networks', label: '网络', icon: 'dns' },
+  { key: 'instances', label: '容器', icon: 'container' },
+  { key: 'hosts', label: '宿主', icon: 'host' },
+  { key: 'networks', label: '网络', icon: 'network' },
 ] as const;
 
 export function CvmPane({ win }: { win: Win; bare?: boolean }) {
@@ -108,7 +108,7 @@ export function CvmPane({ win }: { win: Win; bare?: boolean }) {
         </DraftSlot>
         {denied ? (
           <div className="nd-paper-body">
-            <EmptyState icon="servers" title="当前账号无权打开此页面">
+            <EmptyState icon="container" title="当前账号无权打开此页面">
               <button className="btn" onClick={() => navigate('cvm', {})}>
                 查看容器清单
               </button>
@@ -219,7 +219,7 @@ export function CvmPane({ win }: { win: Win; bare?: boolean }) {
               ) : page === 'adopt' ? (
                 <AdoptForm workspace={data} onViewHosts={viewHosts} />
               ) : page === 'instance' ? (
-                <EmptyState icon="servers" title="没有可查看的容器">
+                <EmptyState icon="container" title="没有可查看的容器">
                   实例不存在或不在当前账号的可见范围内。
                 </EmptyState>
               ) : active === 'networks' ? (

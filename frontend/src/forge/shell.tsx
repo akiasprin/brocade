@@ -85,7 +85,7 @@ interface Face {
 const NAV: Face[] = [
   { key: 'nodes', label: '机器', icon: 'nodes' },
   { key: 'chains', label: '线路', icon: 'chains' },
-  { key: 'cvm', label: '容器', icon: 'servers' },
+  { key: 'cvm', label: '容器', icon: 'container' },
   { key: 'users', label: '用户', icon: 'users' },
   { key: 'deploy', label: '发布', icon: 'deploy', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'usage', label: '用量', icon: 'usage' },

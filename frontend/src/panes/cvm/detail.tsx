@@ -196,7 +196,7 @@ export function InstanceDetail({
               {
                 key: 'network',
                 label: '网络',
-                icon: 'dns',
+                icon: 'network',
                 badge: networkBadge,
               },
               { key: 'monitoring', label: '监控与诊断', shortLabel: '监控', icon: 'diag' },
