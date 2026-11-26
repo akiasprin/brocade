@@ -110,7 +110,7 @@ subprocess.run(['sysctl','-qw','net.ipv4.conf.all.rp_filter=1','net.ipv4.conf.de
                 user_id='alice',
                 node_id='compute-a',
                 name='Real Linux baremetal chain acceptance',
-                identity=host['capabilities']['baremetal']['identity'],
+                identity=host['capabilities']['host_system']['identity'],
             ),
             expected=202,
         )
@@ -357,12 +357,11 @@ print('verified')
         self.lab.remote('compute', 'sudo systemctl stop brocade-lab-agent')
         command = (
             'sudo env BROCADE_CVM_HOST_STATE_DIR='
-            + self.prefix
-            + '/native-state '
-            + self.state['candidate_agent_path']
+            + shlex.quote(self.prefix + '/native-state')
+            + ' '
+            + shlex.quote(self.state['candidate_agent_path'])
             + ' cvm-check --empty --host-config '
-            + self.prefix
-            + '/native-host.json'
+            + shlex.quote(self.prefix + '/native-host.json')
         )
         assert self.lab.remote('compute', command).stdout.decode().strip() == 'brocade-cvm-empty-v1'
         assert self.guest('gamma', 'cat ' + self.prefix + '/native-preserved-marker') == 'native-chain-data'

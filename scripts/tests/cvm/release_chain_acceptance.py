@@ -75,6 +75,8 @@ class ChainAcceptance(Acceptance):
         deployment = self.publish()
         for role in ['compute', 'provider']:
             self.lab.remote(role, 'sudo systemctl start brocade-lab-agent')
+        self.state['candidate_agent_path'] = self.prefix + '/agent-chain-76-3'
+        self.save()
         self.complete(deployment, timeout=240)
         item = self.instance_ready('gamma')
         assert item['report']['chain_egress'][0]['configured']
@@ -1050,6 +1052,7 @@ print(json.dumps({'state':value['state'],'vcpus':value['config']['cpus']['boot_v
         self.record(
             'real cross-host WG entries carry L4/whole-IP SSH full-duplex 288KiB, fragmented UDP and whole-IP ICMP; original primary reply isolation preserved'
         )
+        self.withdraw_entries()
 
     def period(self):
         original = self.traffic_view()['policy']

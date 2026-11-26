@@ -17,6 +17,9 @@ try {
     data: { operator_id: credentials.operator_id, password: credentials.password },
   });
   if (!login.ok()) throw new Error(`real login failed: ${login.status()}`);
+  const alphaResponse = await context.request.get(origin + '/cvm/' + state.instances.alpha);
+  if (!alphaResponse.ok()) throw new Error(`alpha lookup failed: ${alphaResponse.status()}`);
+  const alpha = await alphaResponse.json();
   for (const width of [1440, 390, 320]) {
     const page = await context.newPage();
     await page.setViewportSize({ width, height: width === 1440 ? 2000 : 1050 });
@@ -24,57 +27,41 @@ try {
       previews = [];
     page.on('pageerror', e => errors.push(e.message));
     page.on('response', r => {
-      if (new URL(r.url()).pathname.endsWith('/artifacts/preview')) previews.push(r.status());
+      const url = new URL(r.url());
+      if (url.pathname.endsWith('/network-edit') && url.searchParams.get('preview') === 'true')
+        previews.push(r.status());
     });
     await page.goto(origin + '/#/cvm');
     await page.locator('.cvm-page').waitFor();
     const fold = page.getByRole('button', { name: '收起首次上线清单', exact: true });
     if (await fold.isVisible()) await fold.click();
+    const list = page.getByRole('table', { name: '按宿主分组的容器', exact: true });
+    const alphaLink = list.getByRole('button', { name: alpha.desired.spec.name, exact: true });
+    await alphaLink.waitFor();
     if (width === 1440) {
-      await page.locator(`[data-pill="${state.instances.alpha}"]`).click();
-      const exit = page.locator(`[data-exit="chain:${state.chain.id}"]`);
-      await exit.waitFor();
-      await page.getByRole('button', { name: '＋ 出口' }).click();
-      await exit.click();
-      const proposal = page.getByRole('region', { name: '待确认的组合变更' });
-      await proposal.waitFor();
-      if (!(await proposal.innerText()).includes('alice')) throw new Error('proposal has wrong authorization owner');
-      await proposal.getByRole('button', { name: '查看配置差异', exact: true }).click();
-      await proposal.getByText('查看生成文件', { exact: true }).click();
-      await proposal.locator('.cvm-artifact-content').first().waitFor();
-      if (
-        !(await proposal.evaluate(
-          n =>
-            n.scrollWidth <= n.clientWidth + 1 &&
-            n.getBoundingClientRect().right <= n.parentElement.getBoundingClientRect().right + 1,
-        ))
-      )
-        throw new Error('compiled proposal escapes inspector');
-      if (await fold.isVisible()) await fold.click();
-      await page.screenshot({ path: path.join(directory, 'board-proposal.png'), fullPage: true });
-      await proposal.getByRole('button', { name: '取消', exact: true }).click();
+      await alphaLink.click();
+      await page.getByRole('heading', { name: alpha.desired.spec.name, exact: true }).waitFor();
+      await page.goBack();
+      await list.waitFor();
     }
     await page.screenshot({ path: path.join(directory, `board-${width}.png`), fullPage: true });
     const before = await (await context.request.get(origin + '/cvm/' + state.instances.gamma)).json();
     await page.goto(origin + '/#/cvm/instance/' + state.instances.gamma);
     await page.getByRole('tab', { name: '网络', exact: true }).click();
-    await page.getByRole('button', { name: '路由表', exact: true }).click();
-    const dialog = page.getByRole('dialog', { name: '容器路由表' });
-    await dialog
-      .getByRole('option', { name: /KVM split chain/ })
+    const routes = page.getByRole('table', { name: '目标路由', exact: true });
+    await routes.waitFor();
+    await routes
+      .getByRole('button', { name: /^编辑路由 / })
       .first()
-      .waitFor({ state: 'attached' });
-    const save = dialog.getByRole('button', { name: '保存变更', exact: true });
-    if (await save.isDisabled()) throw new Error('save should check configuration automatically');
-    await dialog.getByRole('button', { name: '查看配置差异', exact: true }).click();
-    await save.waitFor();
-    await page.waitForFunction(() => !document.querySelector('.cvm-dialog footer button.btn.primary')?.disabled);
-    await dialog.getByText('查看生成文件', { exact: true }).click();
-    await dialog.locator('.cvm-artifact-content').first().waitFor();
-    if (!(await dialog.locator('.cvm-dialog-body').evaluate(n => n.scrollWidth <= n.clientWidth + 1)))
-      throw new Error('compiled route dialog clips its children');
+      .click();
+    await routes.getByRole('textbox', { name: '目标 IP／网段', exact: true }).fill('198.18.0.0/15');
+    await routes.getByRole('button', { name: '应用修改', exact: true }).click();
+    await page.getByRole('button', { name: '查看配置差异', exact: true }).click();
+    await page.getByRole('status').filter({ hasText: '服务端配置检查通过' }).waitFor();
     await page.screenshot({ path: path.join(directory, `routes-preview-${width}.png`), fullPage: true });
-    await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    const discard = page.getByRole('button', { name: '丢弃当前草稿', exact: true });
+    await discard.click();
+    await discard.waitFor({ state: 'detached' });
     const after = await (await context.request.get(origin + '/cvm/' + state.instances.gamma)).json();
     if (JSON.stringify(before.desired) !== JSON.stringify(after.desired))
       throw new Error('preview changed actual desired generation');

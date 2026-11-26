@@ -73,7 +73,7 @@ Cube 的无主 `Ready` TAP 复用池会保留；验收要求没有活动所有�
 而非强制销毁复用池。
 这些阶段依赖输出目录中明确记录的实验资源，不得对生产服务或未经本轮创建的虚拟机执行。
 
-`release_chain_ui.mjs` 在实际 KVM Console 上检查组合台提案、路由编译预览和输入清单，覆盖桌面及窄屏，
+`release_chain_ui.mjs` 在实际 KVM Console 上检查实例清单与详情跳转、网络草稿的真实编译预览和输入清单，覆盖桌面及窄屏，
 不拦截 API 响应；`release_kvm_ui.mjs` 检查混合发布与原生产物。它们补充前端组件和截图比较，不能替代真实网络流量验收。
 
 `release_baremetal_chain_acceptance.py <私有实验目录> <阶段>` 复用上述独占 KVM、已发布的线路与独立目的端，

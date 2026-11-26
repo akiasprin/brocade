@@ -1125,7 +1125,6 @@ threading.Event().wait()
     def finish_entries(self):
         provider = self.lab.state['roles']['provider']['ipv4']
         whole = '198.51.100.211'
-        entries = self.state['entries']
         deployment = self.state.get('entry_deployment', self.state['last_deployment'])
         self.wait(
             'actual provider entry receipt intercepted',
@@ -1197,7 +1196,18 @@ threading.Event().wait()
         self.record(
             'actual independent client reaches cross-host L4 SSH, fragmented UDP and whole-IP SSH/UDP/ICMP over entry WG'
         )
-        for entry in entries:
+
+    def withdraw_entries(self):
+        instance_id = self.state['instances']['alpha']
+        owned = {entry['id'] for entry in self.state.get('entries', [])}
+        current = {
+            entry['id']: entry for entry in self.call('GET', '/cvm/' + instance_id + '/entries') if entry['id'] in owned
+        }
+        if not current:
+            self.state['entries'] = []
+            self.save()
+            return
+        for entry in current.values():
             self.call(
                 'DELETE',
                 '/cvm/entries/' + entry['id'],
@@ -1207,9 +1217,11 @@ threading.Event().wait()
         self.complete(self.publish(), timeout=240)
         self.wait(
             'actual entry cleanup',
-            lambda: self.call('GET', '/cvm/' + self.state['instances']['alpha'] + '/entries'),
-            lambda x: not x,
+            lambda: self.call('GET', '/cvm/' + instance_id + '/entries'),
+            lambda entries: not any(entry['id'] in current for entry in entries),
         )
+        self.state['entries'] = []
+        self.save()
         self.record('entry withdrawal waits for both hosts and releases actual entry claims')
 
     def used(self):
@@ -1573,6 +1585,8 @@ print(json.dumps({'ready_pool_taps':taps,'runtime_processes':active,'kvm_vm_fds'
         )
 
     def cleanup(self):
+        if self.state.get('entries'):
+            self.withdraw_entries()
         for name in ('beta', 'gamma'):
             self.operation(name, 'delete', delete_data=True)
         deployment = self.publish()
