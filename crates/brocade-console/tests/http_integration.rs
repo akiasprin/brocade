@@ -3265,8 +3265,40 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
             .to_vec(),
     )
     .unwrap();
+    let has_old_name = body.contains("name: \"Main Chain\"");
+    let has_new_name = body.contains("name: \"Live Rename\"");
+    assert_ne!(
+        has_old_name, has_new_name,
+        "a pull during refresh must receive exactly one complete generation"
+    );
+    let body = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = agent
+                .clone()
+                .oneshot(
+                    Request::get(format!("/sub/v1/{uuid}/clash.yaml"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 4 * 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            if body.contains("name: \"Live Rename\"") {
+                break body;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the committed client generation must finish rendering");
     assert!(!body.contains("name: \"Main Chain\""));
-    assert!(body.contains("name: \"Live Rename\""));
 
     let deployment_id: i64 = sqlx::query_scalar(
         "INSERT INTO deployments (revision_id, status, active, kind, note)

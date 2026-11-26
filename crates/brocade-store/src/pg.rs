@@ -1179,6 +1179,17 @@ impl PgStore {
         console::clash_subscription_for_user(self, actor, tenant_id, user_id).await
     }
 
+    /// Maintenance reads wait for the latest complete Serving materialization instead of using
+    /// the stale-while-refresh response path exposed to subscription clients.
+    pub async fn fresh_clash_subscription_for_user(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<DynamicClashSubscription> {
+        console::fresh_clash_subscription_for_user(self, actor, tenant_id, user_id).await
+    }
+
     pub async fn user_grant_probe_plan(
         &self,
         actor: &AdminContext,
