@@ -447,7 +447,15 @@ time.sleep(30)
                     )
                     self.assertEqual(
                         captured.read_text().splitlines(),
-                        ['cc', '-fno-sanitize=undefined', '-target', f'{arch}-linux-musl', '-O0', '-c', 'native.c'],
+                        [
+                            'cc',
+                            '-fno-sanitize=undefined',
+                            '-target',
+                            f'{arch}-linux-musl',
+                            '-O0',
+                            '-c',
+                            'native.c',
+                        ],
                     )
 
             env.pop('BROCADE_ZIG_TARGET')
@@ -491,7 +499,9 @@ time.sleep(30)
                 flags = child_env[f'CARGO_TARGET_{triple.upper().replace("-", "_")}_RUSTFLAGS']
                 self.assertIn(f'--remap-path-prefix={root}=.', flags)
                 self.assertIn('--remap-path-prefix=/tool/rust-src=/rust-src', flags)
-            self.assertIn('-C linker=rust-lld', child_env['CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS'])
+                self.assertIn('-C link-self-contained=no', flags)
+                linker = child_env[f'CARGO_TARGET_{triple.upper().replace("-", "_")}_LINKER']
+                self.assertEqual(linker, child_env[f'CC_{triple.replace("-", "_")}'])
             self.assertTrue(
                 env['BROCADE_AGENT_BIN_X86_64'].endswith('/x86_64-unknown-linux-musl/release/brocade-agent')
             )
@@ -541,7 +551,7 @@ time.sleep(30)
 
 @unittest.skipUnless(os.environ.get('BROCADE_RUN_ZIG_LINK_TESTS') == '1', 'requires Zig and both Rust musl targets')
 class ZigNativeLinkTests(unittest.TestCase):
-    def test_unoptimized_native_archive_links_with_rust_without_a_zig_runtime(self):
+    def test_unoptimized_native_archive_links_with_zig_without_a_sanitizer_runtime(self):
         zig = shutil.which('zig')
         self.assertIsNotNone(zig, 'install the pinned Zig compiler before running this test')
         with tempfile.TemporaryDirectory(prefix='brocade-zig-link-') as directory:
@@ -591,13 +601,15 @@ class ZigNativeLinkTests(unittest.TestCase):
                             env=environment,
                         )
                         binary = output / 'fixture'
-                        subprocess.run(
+                        linked = subprocess.run(
                             [
                                 'rustc',
                                 '--target',
                                 triple,
                                 '-C',
-                                'linker=rust-lld',
+                                f'linker={cc}',
+                                '-C',
+                                'link-self-contained=no',
                                 str(rust),
                                 '-L',
                                 str(output),
@@ -606,9 +618,11 @@ class ZigNativeLinkTests(unittest.TestCase):
                                 '-o',
                                 str(binary),
                             ],
-                            check=True,
                             capture_output=True,
+                            env=environment,
+                            text=True,
                         )
+                        self.assertEqual(linked.returncode, 0, linked.stderr)
                         self.assertEqual(binary.read_bytes()[:4], b'\x7fELF')
                         if arch == 'x86_64':
                             subprocess.run([str(binary)], check=True)

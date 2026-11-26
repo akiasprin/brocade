@@ -8,7 +8,7 @@
 
 - Node.js 22 与 npm，用于构建前端；
 - [`components/xray-core/.go-version`](../components/xray-core/.go-version) 指定的精确 Go 版本，用于构建或校验 Brocade Xray；
-- Zig 0.16，用于交叉编译静态 agent；
+- Zig 0.16，用于交叉编译并最终链接双架构静态 Agent；
 - Docker，用于执行 PostgreSQL 集成测试；
 - 目标平台的交叉链接器，仅在控制面本身需要交叉编译时使用。
 
@@ -49,7 +49,7 @@ python3 scripts/build-release.py
 
 两种入口使用相同的 Agent Rust 参数，把标准库源码根目录映射到 `/rust-src`，避免本机 sysroot 路径进入新编译的标准库源码位置。新增参数也会让 Cargo 重编此前缓存的目标依赖，防止安装组件后继续复用缺少组件时的依赖。首次采用此配方会改变 Agent 摘要，需核对实际嵌入字节；这不表示节点已升级，也不等同于所有构建输入均已实现跨机器复现。
 
-嵌入 Agent 的 Cargo 子进程会清除继承的全局 Rust flags、默认 target 和 target 目录，由固定配方指定目标、路径映射及 ARM 链接器，避免环境变量覆盖这些参数。
+嵌入 Agent 的 Cargo 子进程会清除继承的全局 Rust flags、默认 target 和 target 目录，由固定配方指定目标、路径映射及 `link-self-contained=no`，并为 x86_64 与 aarch64 分别生成固定目标的 Zig 最终链接驱动。Rust 标准库仍来自钉住的工具链，CRT、musl libc 与最终链接由 Zig 提供，避免两套 CRT 重复或环境变量覆盖这些参数。
 
 当前内置 Xray 基线为 `v26.10.31`（`a4a3dff5b20c2faae567b742c172c7b95e75c083`），Go 最低补丁版本为 `1.27.4`，包含标准库安全修复；具体要求见源码中的 `.go-version`。REALITY 依赖通过仓库内相对路径 `third_party/reality` 引入，来源与兼容补丁记录在两级 `BROCADE_UPSTREAM.toml` 中；该依赖的实际编译文件也纳入构建输入指纹。替换成官方 Xray 会失去 Brocade 的协议、计费、交接和指纹兼容能力。
 

@@ -191,8 +191,9 @@ def frontend(root, state, env, timer):
 
 
 def agent_wrappers(state, zig):
-    # Cargo links native objects with rust-lld, without Zig's UBSan runtime.
-    # AWS-LC's entropy sources deliberately use -O0 even in release builds.
+    # Zig compiles native objects and drives the final link for both Agent architectures.
+    # AWS-LC's entropy sources deliberately use -O0 even in release builds; keep those objects
+    # free of an implicit UBSan runtime dependency.
     directory = state.parent / 'brocade-agent-build'
     directory.mkdir(parents=True, exist_ok=True)
     paths = {}
@@ -271,9 +272,9 @@ def agents(root, state, env, timer, jobs, zig, rust_source, flavor='base'):
         cc, ar = wrappers[arch]
         agent_env[f'CC_{triple.replace("-", "_")}'] = str(cc)
         agent_env[f'AR_{triple.replace("-", "_")}'] = str(ar)
-        linker = '-C linker=rust-lld ' if arch == 'aarch64' else ''
+        agent_env[f'CARGO_TARGET_{key}_LINKER'] = str(cc)
         agent_env[f'CARGO_TARGET_{key}_RUSTFLAGS'] = (
-            f'{linker}--remap-path-prefix={root}=. --remap-path-prefix={rust_source}=/rust-src'
+            f'-C link-self-contained=no --remap-path-prefix={root}=. --remap-path-prefix={rust_source}=/rust-src'
         )
     with (state / f'agent-{flavor}.log').open('w') as log:
         run(command, root, agent_env, timer, log)

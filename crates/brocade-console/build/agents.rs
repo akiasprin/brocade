@@ -45,7 +45,7 @@ pub fn flavor_command(workspace: &Path, cache: &Path, triples: &[&str], flavor: 
 
 /// Generated tonic includes carry absolute OUT_DIR spans even when Cargo runs
 /// from the workspace root. Keep those panic locations independent of checkout.
-pub fn rustflags(workspace: &Path, linker: Option<&str>, rust_source: &Path) -> String {
+pub fn rustflags(workspace: &Path, rust_source: &Path) -> String {
     // This also invalidates dependencies cached before rust-src became mandatory: Cargo does
     // not otherwise notice component installation. Keep the sysroot location out of new bytes.
     let remap = format!(
@@ -53,7 +53,7 @@ pub fn rustflags(workspace: &Path, linker: Option<&str>, rust_source: &Path) -> 
         workspace.display(),
         rust_source.display()
     );
-    linker.map_or(remap.clone(), |flags| format!("{flags} {remap}"))
+    format!("-C link-self-contained=no {remap}")
 }
 
 pub fn command(workspace: &Path, cache: &Path, triples: &[&str]) -> Command {
@@ -130,12 +130,8 @@ mod tests {
         assert_eq!(cache, root.join("target/brocade-agent-build"));
         let rust_source = Path::new("/toolchain/lib/rustlib/src/rust");
         assert_eq!(
-            rustflags(root, None, rust_source),
-            "--remap-path-prefix=/workspace=. --remap-path-prefix=/toolchain/lib/rustlib/src/rust=/rust-src"
-        );
-        assert_eq!(
-            rustflags(root, Some("-C linker=rust-lld"), rust_source),
-            "-C linker=rust-lld --remap-path-prefix=/workspace=. --remap-path-prefix=/toolchain/lib/rustlib/src/rust=/rust-src"
+            rustflags(root, rust_source),
+            "-C link-self-contained=no --remap-path-prefix=/workspace=. --remap-path-prefix=/toolchain/lib/rustlib/src/rust=/rust-src"
         );
         for key in [
             "CARGO_TARGET_DIR",
@@ -229,6 +225,8 @@ mod tests {
         command
             .args(["--offline", "--jobs", "4"])
             .env("RUSTUP_TOOLCHAIN", sysroot.file_name().unwrap())
+            // This fixture tests Cargo's dual-target scheduling in isolation. Production Agent
+            // builds set both target linkers to their generated Zig drivers in build.rs.
             .env(
                 "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS",
                 "-C linker=rust-lld",

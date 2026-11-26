@@ -65,15 +65,11 @@
 //! uncertainty onto the nodes is what this whole file does.
 //!
 //! zig rather than a musl cross-gcc: one installation covers both architectures, it ships musl
-//! headers and libc, and it needs no root — unpack and use. It appears only at compile time; the
-//! final link is still `rust-lld` against rustup's `libc.a`, and the artifact is still a static
-//! binary with zero dynamic dependencies, requiring nothing installed on the node side.
-//!
-//! Note that this combination is somewhat non-standard: **the headers come from zig's musl and
-//! `libc.a` from rustup's**. musl's ABI is very stable and ring uses only the most basic headers,
-//! and it measures fine; but should either side changing musl versions produce something strange
-//! one day, this is the first place to look. The fallback if it really breaks is to let zig link as
-//! well (it ships a complete musl), at the cost of overriding that `rust-lld` entry in `TARGETS`.
+//! headers and libc, and it needs no root — unpack and use. The per-target wrapper drives native
+//! compilation, archiving and the final link. Rust's standard-library rlibs still come from the
+//! pinned toolchain, while `link-self-contained=no` leaves the C runtime, CRT and libc to Zig so
+//! they are supplied exactly once. The artifact remains a static binary with zero dynamic
+//! dependencies, requiring nothing installed on the node side.
 //!
 //! # Why release and static musl are fixed, and why a separate target directory
 //!
@@ -141,10 +137,6 @@ struct Target {
     /// error is `UnknownOperatingSystem`), so both spellings must be kept rather than one derived
     /// from the other.
     zig_target: &'static str,
-    /// aarch64's musl target defaults to the host's `cc` as its linker driver, which invokes
-    /// x86_64's `ld` and reports `Relocations in generic ELF (EM: 183)`. Pointing at `rust-lld`
-    /// sidesteps it. x86_64 links by default and needs no such pointer.
-    linker: Option<&'static str>,
 }
 
 const TARGETS: &[Target] = &[
@@ -152,13 +144,11 @@ const TARGETS: &[Target] = &[
         arch: "x86_64",
         triple: "x86_64-unknown-linux-musl",
         zig_target: "x86_64-linux-musl",
-        linker: None,
     },
     Target {
         arch: "aarch64",
         triple: "aarch64-unknown-linux-musl",
         zig_target: "aarch64-linux-musl",
-        linker: Some("-C linker=rust-lld"),
     },
 ];
 
@@ -324,15 +314,13 @@ fn main() {
         // doing (running one rustup command).
         if !target_installed(target.triple) {
             missing_targets.push(target.triple);
-        } else if !env_set(&cc_var(target.triple)) {
-            // A build machine with its own `CC_<triple>` (a musl.cc toolchain, say) is left
-            // alone, in the same spirit as `BROCADE_AGENT_BIN_*`: respect what is already
-            // configured.
-            needs_zig = true;
         }
+        // The final Agent link is deliberately pinned to Zig even when the caller supplies a
+        // custom CC for native dependencies. Only a complete prebuilt Agent override skips Zig.
+        needs_zig = true;
     }
-    // Found lazily: where everything takes an escape hatch, or both architectures bring their own
-    // CC, a machine without zig builds all the same.
+    // Found lazily: when every architecture takes the prebuilt Agent escape hatch, a machine
+    // without Zig still embeds those supplied bytes.
     let zig = if needs_zig { find_zig() } else { None };
     // Prebuilt Xray files must be checked against the current Go input graph too.
     let go = find_go();
@@ -525,7 +513,7 @@ fn missing_prerequisites(
 
     text.push_str(&format!(
         "\n确实只想带部分架构、或者要嵌现成的文件，agent 用 {}，Xray 用 {} 指过去。\n\
-         手上已经有 musl 交叉工具链的，设 {} 就不会再要 zig。\n",
+         手上已有 musl 交叉编译器时可用 {} 编原生依赖；Agent 最终链接仍固定走 Zig。\n",
         TARGETS
             .iter()
             .map(|t| override_var(t.arch))
@@ -557,8 +545,8 @@ fn xray_override_var(arch: &str) -> String {
 }
 
 /// The per-target compiler variable cc-rs recognizes, such as
-/// `CC_aarch64_unknown_linux_musl`. Its presence says the build machine has its own cross
-/// toolchain, and zig is then none of our business.
+/// `CC_aarch64_unknown_linux_musl`. A caller may override native compilation independently; the
+/// final Agent link still uses the generated Zig driver.
 fn cc_var(triple: &str) -> String {
     format!("CC_{}", triple.replace('-', "_"))
 }
@@ -567,6 +555,14 @@ fn cc_var(triple: &str) -> String {
 /// static library in x86_64 format whose symptom appears only at the link step.
 fn ar_var(triple: &str) -> String {
     format!("AR_{}", triple.replace('-', "_"))
+}
+
+/// Cargo's per-target final-link driver variable.
+fn linker_var(triple: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_LINKER",
+        triple.to_uppercase().replace('-', "_")
+    )
 }
 
 /// The environment variable exists and is not an empty string. An empty string always counts as
@@ -650,7 +646,7 @@ fn find_zig() -> Option<PathBuf> {
     Some(path)
 }
 
-/// Write a pair of cc / ar wrapper scripts for a target, returning their paths.
+/// Write a target-specific Zig compiler/linker driver and archiver, returning their paths.
 ///
 /// # Why `zig cc` cannot be used as CC directly
 ///
@@ -687,8 +683,9 @@ fn zig_wrapper(out_dir: &Path, target: &Target, zig: &Path) -> (PathBuf, PathBuf
     // whether the control plane builds. The cost is no arrays, so the filtering below rotates the
     // arguments — take the first each time, append the ones to keep at the end, and after n
     // rotations `$@` holds only what should be kept.
-    // Cargo's rust-lld does not link Zig's UBSan runtime. Native dependencies such
-    // as AWS-LC compile some entropy sources at -O0 even for release builds.
+    // Native dependencies such as AWS-LC compile some entropy sources at -O0 even for release
+    // builds. Keep the objects free of Zig's UBSan instrumentation even though Zig also performs
+    // the final link, so the Agent does not gain an implicit sanitizer runtime dependency.
     let cc = write(
         format!("zig-cc-{}", target.arch),
         format!(
@@ -760,18 +757,20 @@ fn build_agents(workspace: &Path, zig: Option<&Path>, flavor: &str, rust_source:
         .map(|target| target.triple)
         .collect::<Vec<_>>();
     let mut command = agent_build::flavor_command(workspace, &cache, &triples, flavor);
+    let zig = zig.expect("前置检查保证需要构建 Agent 时 Zig 存在");
     for target in targets {
         command.env(
             format!(
                 "CARGO_TARGET_{}_RUSTFLAGS",
                 target.triple.to_uppercase().replace('-', "_")
             ),
-            agent_build::rustflags(workspace, target.linker, rust_source),
+            agent_build::rustflags(workspace, rust_source),
         );
-        if let (Some(zig), false) = (zig, env_set(&cc_var(target.triple))) {
-            let (cc, ar) = zig_wrapper(&cache, target, zig);
+        let (linker, ar) = zig_wrapper(&cache, target, zig);
+        command.env(linker_var(target.triple), &linker);
+        if !env_set(&cc_var(target.triple)) {
             command
-                .env(cc_var(target.triple), cc)
+                .env(cc_var(target.triple), linker)
                 .env(ar_var(target.triple), ar);
         }
     }
