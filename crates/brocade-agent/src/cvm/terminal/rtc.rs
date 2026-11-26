@@ -70,6 +70,8 @@ pub(super) struct Peer {
     local: SocketAddr,
     channel: Option<ChannelId>,
     input: Vec<u8>,
+    ice: Option<wire::IceCandidates>,
+    mdns_reported: bool,
 }
 
 impl Peer {
@@ -77,6 +79,11 @@ impl Peer {
         if !wire::valid_sdp(&offer.sdp) || offer.stun_servers.len() > 2 {
             return Err("invalid terminal WebRTC offer".into());
         }
+        let ice = offer
+            .trickle
+            .then(|| wire::IceCandidates::from_sdp(&offer.sdp))
+            .transpose()
+            .map_err(str::to_owned)?;
         let socket = config.socket().await?;
         let local = socket
             .local_addr()
@@ -107,11 +114,16 @@ impl Peer {
         }
         let sdp = str0m::change::SdpOffer::from_sdp_string(&offer.sdp)
             .map_err(|_| "invalid terminal SDP")?;
-        let answer = rtc
+        let mut answer = rtc
             .sdp_api()
             .accept_offer(sdp)
             .map_err(|_| "terminal SDP negotiation failed")?
             .to_sdp_string();
+        // This single-interface responder finishes discovery before answering.
+        // Browser candidates may still arrive incrementally over authenticated WSS.
+        if offer.trickle && !answer.lines().any(|line| line == "a=end-of-candidates") {
+            answer.push_str("a=end-of-candidates\r\n");
+        }
         if answer.len() > wire::MAX_SDP {
             return Err("terminal SDP answer exceeds limit".into());
         }
@@ -122,9 +134,51 @@ impl Peer {
                 local,
                 channel: None,
                 input: vec![0; 2048],
+                ice,
+                mdns_reported: false,
             },
             answer,
         ))
+    }
+
+    pub fn add_remote_candidate(&mut self, signal: &wire::IceSignal) -> Result<(), String> {
+        let ice = self.ice.as_mut().ok_or("trickle ICE was not negotiated")?;
+        if !ice.accept(signal).map_err(str::to_owned)? {
+            return Ok(());
+        }
+        if let wire::IceSignal::IceCandidate {
+            candidate,
+            username_fragment,
+        } = signal
+        {
+            let fields: Vec<_> = candidate.split_ascii_whitespace().collect();
+            if fields
+                .get(4)
+                .is_some_and(|address| address.ends_with(".local"))
+                && fields.get(6) == Some(&"typ")
+                && fields.get(7) == Some(&"host")
+            {
+                // The ICE library accepts IP candidates, just as its SDP parser does.
+                // Browser mDNS names are not globally resolvable; preserve other
+                // candidates and the browser-initiated peer-reflexive check path.
+                if !self.mdns_reported {
+                    eprintln!("terminal ICE mDNS host candidate skipped; awaiting IP or peer-reflexive checks");
+                    self.mdns_reported = true;
+                }
+                return Ok(());
+            }
+            let mut candidate = Candidate::from_sdp_string(candidate)
+                .map_err(|_| "invalid remote ICE candidate")?;
+            if candidate
+                .ufrag()
+                .is_some_and(|ufrag| ufrag != username_fragment)
+            {
+                return Err("stale candidate ICE generation".into());
+            }
+            candidate.set_ufrag(username_fragment);
+            self.rtc.add_remote_candidate(candidate);
+        }
+        Ok(())
     }
 
     pub fn write(&mut self, binary: bool, data: &[u8]) -> Result<bool, String> {

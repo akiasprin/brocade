@@ -67,6 +67,17 @@
   overflow-x: auto;
   scrollbar-width: none;
 }
+.cvm-terminal-connection {
+  flex: 0 0 auto;
+  padding: 0 7px;
+  font-size: 11px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.cvm-terminal-connection > span {
+  color: var(--ink-4);
+}
 .cvm-terminal-tabs::-webkit-scrollbar {
   display: none;
 }

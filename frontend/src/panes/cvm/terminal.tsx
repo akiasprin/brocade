@@ -182,9 +182,7 @@ export default function CvmTerminal({
   const { who } = useSession();
   const namesKey = `brocade:webshell:names:${who.operator_id}:${id}`;
   const [prefs, setPrefs] = useState(preferences);
-  const [workspace] = useState(
-    () => new TerminalWorkspace(id, prefs, `brocade:webshell:direct:${who.operator_id}:${id}`),
-  );
+  const [workspace] = useState(() => new TerminalWorkspace(id, prefs));
   const state = useSyncExternalStore(workspace.subscribe, workspace.snapshot);
   const current = state.sessions.find(s => s.id === state.active);
   const connected = current?.status === 'connected';
@@ -268,7 +266,7 @@ export default function CvmTerminal({
     }
   };
   const close = () => {
-    if (!draft || window.confirm('命令输入框里有未发送的内容，仍要关闭窗口吗？')) {
+    if (!draft || window.confirm('命令输入框里有未发送的内容，仍要关闭页面吗？')) {
       closeApproved.current = true;
       onClose();
     }
@@ -472,6 +470,10 @@ export default function CvmTerminal({
         }}
       />
       <nav className={`cvm-terminal-capsule${panel || rename || endId ? ' hold' : ''}`} aria-label="终端会话操作">
+        <span className="cvm-terminal-connection" title="浏览器到 Agent 的往返延迟（RTT）">
+          {current?.route === 'webrtc' ? 'WebRTC' : current?.route === 'console' ? 'WebSocket' : '连接中'}
+          <span> · {current?.latencyMs ?? '—'} ms</span>
+        </span>
         <div className="cvm-terminal-tabs" role="tablist" aria-label="终端会话" onKeyDown={tabKeys}>
           {state.sessions.map(session => (
             <div className={`cvm-terminal-tab-wrap${session.id === state.active ? ' selected' : ''}`} key={session.id}>
@@ -822,12 +824,12 @@ export default function CvmTerminal({
                   <dd>{hostName || '未上报'}</dd>
                   <dt>连接路径</dt>
                   <dd>
-                    {current?.route === 'webrtc'
-                      ? 'WebRTC 直连'
-                      : current?.route === 'console'
-                        ? 'Console 转发'
-                        : '正在选择'}
-                    {current?.routeReason && <small>直连暂不可用，已使用 Console 转发</small>}
+                    {current?.route === 'webrtc' ? 'WebRTC' : current?.route === 'console' ? 'WebSocket' : '正在选择'}
+                    {current?.routeReason && <small>WebRTC 暂不可用，已使用 WebSocket</small>}
+                  </dd>
+                  <dt>往返延迟</dt>
+                  <dd>
+                    {current?.latencyMs === null || current?.latencyMs === undefined ? '—' : `${current.latencyMs} ms`}
                   </dd>
                   <dt>名额</dt>
                   <dd>
@@ -861,26 +863,19 @@ export default function CvmTerminal({
                     <TerminalMenuItem
                       phone={phone}
                       onClose={() => setPanel(null)}
-                      label={
-                        state.directSupported === false
-                          ? '直连未启用'
-                          : current?.route === 'webrtc'
-                            ? '重新检测直连'
-                            : '尝试直连'
-                      }
+                      label="WebRTC"
                       shortcut=""
                       disabled={!state.directSupported || current?.status === 'connecting'}
-                      onSelect={() => workspace.tryDirect()}
+                      onSelect={() => workspace.useWebRtc()}
                     />
-                    {current?.route === 'webrtc' && (
-                      <TerminalMenuItem
-                        phone={phone}
-                        onClose={() => setPanel(null)}
-                        label="使用 Console 转发"
-                        shortcut=""
-                        onSelect={() => workspace.useConsole()}
-                      />
-                    )}
+                    <TerminalMenuItem
+                      phone={phone}
+                      onClose={() => setPanel(null)}
+                      label="WebSocket"
+                      shortcut=""
+                      disabled={current?.status === 'connecting'}
+                      onSelect={() => workspace.useWebSocket()}
+                    />
                   </>
                 )}
                 {panel === 'context' && (
@@ -1022,7 +1017,7 @@ export default function CvmTerminal({
                   <TerminalMenuItem
                     phone={phone}
                     onClose={() => setPanel(null)}
-                    label={'关闭窗口，保留会话'}
+                    label={'关闭页面，保留会话'}
                     shortcut={'Ctrl+Shift+Esc'}
                     onSelect={close}
                   />
@@ -1113,7 +1108,7 @@ export default function CvmTerminal({
         >
           <section className="dialog-surface cvm-terminal-panel cvm-terminal-confirm" data-theme={prefs.color}>
             <h3>结束{labelOf(endId)}？</h3>
-            <p>将结束这个 Shell 和运行中的命令。关闭窗口可保留会话。</p>
+            <p>将结束这个 Shell 和运行中的命令。关闭页面可保留会话。</p>
             <footer>
               <DialogClose className="btn small">取消</DialogClose>
               <button

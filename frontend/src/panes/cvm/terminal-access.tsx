@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Icon } from '../../ui/icons';
 
-const windows = new Map<string, Window>();
+const pages = new Map<string, Window>();
 
 export function cvmTerminalUrl(id: string) {
   const url = new URL(location.href);
@@ -10,24 +10,20 @@ export function cvmTerminalUrl(id: string) {
   return url.href;
 }
 
-/** 每个容器的终端只开一个窗口；已打开时聚焦。弹窗被拦截时返回 false，由调用方给出新标签页链接。 */
+/** 每个容器的终端只开一个普通浏览器页面；已打开时聚焦。新页面被拦截时返回 false，由调用方给出链接。 */
 export function openCvmTerminal(id: string) {
-  for (const [instance, child] of windows) {
-    if (child.closed) windows.delete(instance);
+  for (const [instance, page] of pages) {
+    if (page.closed) pages.delete(instance);
   }
-  const previous = windows.get(id);
+  const previous = pages.get(id);
   if (previous && !previous.closed) {
     previous.focus();
     return true;
   }
-  const child = window.open(
-    cvmTerminalUrl(id),
-    `brocade-webshell-${encodeURIComponent(id)}`,
-    'popup,width=1280,height=820,resizable=yes,scrollbars=yes',
-  );
-  if (!child) return false;
-  windows.set(id, child);
-  child.focus();
+  const page = window.open(cvmTerminalUrl(id), '_blank');
+  if (!page) return false;
+  pages.set(id, page);
+  page.focus();
   return true;
 }
 
@@ -52,14 +48,14 @@ export function CvmTerminalAccess({
         aria-label="终端"
         disabled={!enabled}
         onClick={open}
-        title={reason || `打开 ${name} 的终端窗口`}
+        title={reason || `在新页面打开 ${name} 的终端`}
       >
         <Icon of="nodes" size={14} />
         <span className="title-action-label">终端</span>
       </button>
       {blocked && (
         <a className="btn small" href={url.href} target="_blank" rel="noopener">
-          弹窗被拦截，改在新标签页打开
+          新页面未能打开，请手动打开
         </a>
       )}
     </>

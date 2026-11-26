@@ -8,13 +8,18 @@ export type TerminalSocket = Pick<
 type Options = {
   direct: boolean;
   route: (kind: TerminalRoute, reason?: string) => void;
-  directReady: () => void;
   directLost: () => void;
   permissionDenied: () => void;
 };
 const MAX_SDP = 32 * 1024;
 const MAX_DATA = 16 * 1024;
 const MAX_BUFFER = 64 * 1024;
+const MAX_CANDIDATES = 32;
+const MAX_CANDIDATE_BYTES = 1024;
+const CANDIDATE_SECONDS = 15;
+type IceSignal =
+  | { type: 'ice_candidate'; candidate: string; username_fragment: string }
+  | { type: 'ice_complete'; username_fragment: string };
 
 /** The Console socket remains the authorization channel for the lifetime of RTC.
  * A selected channel never changes underneath an input/paste target. Recovery
@@ -52,6 +57,12 @@ class ShortcutSocket implements TerminalSocket {
   private leaseConfirmed = false;
   private leaseSequence = 0;
   private probes = new Map<number, number>();
+  private iceQueue: IceSignal[] = [];
+  private iceSeen = new Set<string>();
+  private iceComplete = false;
+  private iceFragment = '';
+  private offerSent = false;
+  private iceTimer?: number;
 
   constructor(
     url: URL,
@@ -105,6 +116,8 @@ class ShortcutSocket implements TerminalSocket {
     this.socket.close(code, reason);
   }
   private cleanup() {
+    window.clearTimeout(this.iceTimer);
+    this.iceQueue = [];
     this.gatherCancel?.();
     this.gatherCancel = undefined;
     if (this.channel) {
@@ -115,10 +128,44 @@ class ShortcutSocket implements TerminalSocket {
       this.channel = null;
     }
     if (this.peer) {
+      this.peer.onicecandidate = null;
       this.peer.onconnectionstatechange = null;
       this.peer.close();
       this.peer = null;
     }
+  }
+  private flushIce() {
+    if (!this.offerSent || this.stopped || this.closing || this.socket.readyState !== WebSocket.OPEN) return;
+    for (const signal of this.iceQueue.splice(0)) this.socket.send(JSON.stringify(signal));
+  }
+  private finishIce() {
+    if (this.iceComplete || this.stopped || this.closing) return;
+    this.iceComplete = true;
+    window.clearTimeout(this.iceTimer);
+    if (this.peer) this.peer.onicecandidate = null;
+    this.iceQueue.push({ type: 'ice_complete', username_fragment: this.iceFragment });
+    this.flushIce();
+  }
+  private candidate(candidate: RTCIceCandidate | null) {
+    if (this.iceComplete || this.stopped || this.closing) return;
+    if (!candidate?.candidate) {
+      this.finishIce();
+      return;
+    }
+    if (candidate.usernameFragment && candidate.usernameFragment !== this.iceFragment) return;
+    const value = candidate.candidate;
+    if (this.iceSeen.has(value)) return;
+    if (
+      this.iceSeen.size >= MAX_CANDIDATES ||
+      value.length > MAX_CANDIDATE_BYTES ||
+      !/^candidate:[\x20-\x7e]+$/.test(value)
+    ) {
+      this.finishIce();
+      return;
+    }
+    this.iceSeen.add(value);
+    this.iceQueue.push({ type: 'ice_candidate', candidate: value, username_fragment: this.iceFragment });
+    this.flushIce();
   }
   private lost() {
     if (this.selected !== 'webrtc' || this.stopped) return;
@@ -159,28 +206,60 @@ class ShortcutSocket implements TerminalSocket {
       peer.onconnectionstatechange = () => {
         if (peer.connectionState === 'failed' || peer.connectionState === 'closed') this.lost();
       };
-      await peer.setLocalDescription(await peer.createOffer());
-      await new Promise<void>(resolve => {
-        const done = () => {
-          window.clearTimeout(timer);
-          peer.removeEventListener('icegatheringstatechange', changed);
-          this.gatherCancel = undefined;
-          resolve();
-        };
-        const changed = () => {
-          if (peer.iceGatheringState === 'complete') done();
-        };
-        const timer = window.setTimeout(done, 2200);
-        this.gatherCancel = done;
-        peer.addEventListener('icegatheringstatechange', changed);
-        changed();
-      });
+      const offer = await peer.createOffer();
+      const trickle = !!this.credentials.webrtc?.trickle;
+      if (trickle) {
+        this.iceFragment =
+          offer.sdp
+            ?.split(/\r?\n/)
+            .filter(line => line.startsWith('a=ice-ufrag:'))
+            .at(-1)
+            ?.slice(12) ?? '';
+        if (!/^[A-Za-z0-9+/]{4,256}$/.test(this.iceFragment)) throw new Error('ICE generation missing');
+        peer.onicecandidate = event => this.candidate(event.candidate);
+      }
+      await peer.setLocalDescription(offer);
+      if (!trickle)
+        await new Promise<void>(resolve => {
+          const done = () => {
+            window.clearTimeout(timer);
+            peer.removeEventListener('icegatheringstatechange', changed);
+            this.gatherCancel = undefined;
+            resolve();
+          };
+          const changed = () => {
+            if (peer.iceGatheringState === 'complete') done();
+          };
+          const timer = window.setTimeout(done, 2200);
+          this.gatherCancel = done;
+          peer.addEventListener('icegatheringstatechange', changed);
+          changed();
+        });
       if (this.stopped || this.socket.readyState !== WebSocket.OPEN || peer !== this.peer) return;
-      const sdp = peer.localDescription?.sdp;
+      if (!trickle && peer.iceGatheringState !== 'complete') {
+        this.cleanup();
+        this.selected = 'console';
+        this.options.route('console', 'ice_gather_timeout');
+        this.socket.send(JSON.stringify({ ticket: this.credentials.ticket }));
+        return;
+      }
+      let sdp = peer.localDescription?.sdp;
+      if (trickle && sdp)
+        sdp = sdp
+          .split(/\r?\n/)
+          .filter(line => !line.startsWith('a=candidate:') && line !== 'a=end-of-candidates')
+          .join('\r\n');
       if (!sdp || sdp.length > MAX_SDP || sdp.split('\n').filter(line => line.startsWith('a=candidate:')).length > 32)
         throw new Error('sdp');
-      this.socket.send(JSON.stringify({ ticket: this.credentials.ticket, rtc_offer: sdp }));
+      this.socket.send(
+        JSON.stringify({ ticket: this.credentials.ticket, rtc_offer: sdp, ...(trickle ? { trickle: true } : {}) }),
+      );
+      this.offerSent = true;
       this.startLease();
+      if (trickle) {
+        this.flushIce();
+        if (!this.iceComplete) this.iceTimer = window.setTimeout(() => this.finishIce(), CANDIDATE_SECONDS * 1000);
+      }
     } catch (cause) {
       if (cause instanceof DOMException && cause.name === 'NotAllowedError') this.options.permissionDenied();
       this.cleanup();
@@ -225,8 +304,7 @@ class ShortcutSocket implements TerminalSocket {
       if (message.type === 'transport' && !this.selected && message.kind === source) {
         this.selected = source;
         this.options.route(source, message.reason);
-        if (source === 'webrtc') this.options.directReady();
-        else this.cleanup();
+        if (source !== 'webrtc') this.cleanup();
         return;
       }
       // Authorization/backend failures still arrive through Console while RTC

@@ -1,6 +1,6 @@
 //! Authenticated WebSocket boundaries for the independent terminal transport.
 use super::*;
-use crate::cvm::terminal::{Link, Packet, SessionGuard};
+use crate::cvm::terminal::{Attach, Link, Packet, SessionGuard};
 use brocade_deployment::cvm::terminal as wire;
 use futures_util::SinkExt;
 use yawc::{Frame, IncomingUpgrade, OpCode, Options, WebSocket};
@@ -122,7 +122,8 @@ pub(in crate::http) async fn create(
     Ok(no_store_json(
         json!({"session_id":session,"ticket":ticket,"expires_in_seconds":30,
             "max_sessions_per_node":wire::MAX_PER_NODE,"history_bytes":wire::HISTORY_BYTES,
-            "webrtc":state.terminals.rtc_settings(&node)}),
+            "webrtc":state.terminals.rtc_settings(&node),
+            "latency_supported":state.terminals.latency_supported(&node)}),
     ))
 }
 
@@ -156,13 +157,6 @@ pub(in crate::http) async fn policy(
     Ok(no_store_json(state.store.cvm_workspace(&actor).await?))
 }
 
-#[derive(Deserialize)]
-struct Attach {
-    ticket: String,
-    #[serde(default)]
-    rtc_offer: Option<String>,
-}
-
 pub(in crate::http) async fn browser(
     State(state): State<AppState>,
     Path((id, session)): Path<(String, String)>,
@@ -193,14 +187,10 @@ pub(in crate::http) async fn browser(
         let Ok(attach) = serde_json::from_slice::<Attach>(frame.payload()) else {
             return;
         };
-        let Ok(link) = state.terminals.browser_with_rtc(
-            &session,
-            &attach.ticket,
-            &operator,
-            &node,
-            &target,
-            attach.rtc_offer.clone(),
-        ) else {
+        let Ok(link) = state
+            .terminals
+            .browser_with_rtc(&session, &operator, &node, &target, &attach)
+        else {
             return;
         };
         let _guard = SessionGuard {
@@ -348,9 +338,21 @@ async fn relay<S>(
                         }
                         continue;
                     },
+                    OpCode::Text if browser && frame.payload().len()<=wire::MAX_CONTROL && serde_json::from_slice::<wire::IceSignal>(frame.payload()).is_ok()=>{
+                        let Ok(signal)=serde_json::from_slice::<wire::IceSignal>(frame.payload()) else {break};
+                        let Some((service,id))=lease.as_ref() else {break};
+                        match service.accept_ice_signal(id,&signal) {
+                            Ok(true)=>{},
+                            Ok(false)=>continue,
+                            Err(_)=>break,
+                        }
+                        let Ok(text)=String::from_utf8(frame.payload().to_vec()) else {break};
+                        Packet::Control(text)
+                    },
                     OpCode::Text if frame.payload().len()<=wire::MAX_SIGNAL=>{
-                        let valid=if browser {serde_json::from_slice::<wire::Input>(frame.payload()).is_ok_and(|i|i.valid())}
-                            else {serde_json::from_slice::<wire::Output>(frame.payload()).is_ok_and(|value| match value {wire::Output::RtcAnswer{sdp}=>wire::valid_sdp(&sdp),_=>frame.payload().len()<=wire::MAX_CONTROL})};
+                        let probe=serde_json::from_slice::<wire::Probe>(frame.payload());
+                        let valid=if browser {serde_json::from_slice::<wire::Input>(frame.payload()).is_ok_and(|i|i.valid()) || matches!(probe,Ok(wire::Probe::Ping{..}))}
+                            else {serde_json::from_slice::<wire::Output>(frame.payload()).is_ok_and(|value| match value {wire::Output::RtcAnswer{sdp}=>wire::valid_sdp(&sdp),_=>frame.payload().len()<=wire::MAX_CONTROL}) || matches!(probe,Ok(wire::Probe::Pong{..}))};
                         if browser && frame.payload().len()>wire::MAX_CONTROL {break}
                         if !valid{break}
                         let Ok(text)=String::from_utf8(frame.payload().to_vec()) else{break};Packet::Control(text)
@@ -390,8 +392,21 @@ pub(in crate::http) async fn control(
         let rtc = headers
             .get(wire::RTC_HEADER)
             .is_some_and(|v| v == wire::RTC_VERSION);
-        let Ok((registration, mut offers)) = state.terminals.register_with_rtc(&node.node_id, rtc)
-        else {
+        let latency = headers
+            .get(wire::LATENCY_HEADER)
+            .is_some_and(|v| v == wire::LATENCY_VERSION);
+        let trickle = rtc
+            && headers
+                .get(wire::TRICKLE_HEADER)
+                .is_some_and(|v| v == wire::TRICKLE_VERSION);
+        let Ok((registration, mut offers)) = state.terminals.register_with_features(
+            &node.node_id,
+            crate::cvm::terminal::AgentFeatures {
+                rtc,
+                latency,
+                trickle,
+            },
+        ) else {
             return;
         };
         let mut tick = tokio::time::interval(Duration::from_secs(15));
@@ -428,6 +443,68 @@ pub(in crate::http) async fn control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn trickled_candidates_cross_only_the_negotiated_browser_signaling_lane() {
+        let service = crate::cvm::terminal::Service::default();
+        let (_, mut offers) = service
+            .register_with_features(
+                "node",
+                crate::cvm::terminal::AgentFeatures {
+                    rtc: true,
+                    trickle: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let target = wire::Target {
+            instance_id: "cvm-one".into(),
+            runtime_id: "runtime-one".into(),
+            restart_epoch: 0,
+            reinstall_epoch: 0,
+        };
+        let (id, ticket) = service
+            .create_attachment("owner", "node", target.clone(), None, false, 0)
+            .unwrap();
+        let browser=service.browser_with_rtc(&id, "owner", "node", &target, &Attach { ticket: ticket.clone(), rtc_offer: Some("v=0\r\na=ice-ufrag:abcd\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n".into()), trickle: true }).unwrap();
+        assert!(offers.try_recv().unwrap().rtc.unwrap().trickle);
+        let mut agent = service.agent(&id, "node").unwrap();
+        let (a, b) = tokio::io::duplex(128 * 1024);
+        let mut client = WebSocket::from_stream(a, yawc::Role::Client, options()).unwrap();
+        let mut server = WebSocket::from_stream(b, yawc::Role::Server, options()).unwrap();
+        let task =
+            tokio::spawn(
+                async move { relay(&mut server, browser, true, Some((service, id))).await },
+            );
+        let signal = r#"{"type":"ice_candidate","candidate":"candidate:1 1 udp 2113929471 192.0.2.1 30000 typ host","username_fragment":"abcd"}"#;
+        client.send(Frame::text(signal)).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(2), agent.receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(frame,Packet::Control(ref text) if text==signal));
+        client.send(Frame::text(signal)).await.unwrap();
+        client
+            .send(Frame::text(
+                r#"{"type":"ice_complete","username_fragment":"abcd"}"#,
+            ))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(2), agent.receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(frame,Packet::Control(ref text) if text.contains("ice_complete")));
+        client
+            .send(Frame::text(
+                r#"{"type":"ice_complete","username_fragment":"old1"}"#,
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
     #[test]
     fn browser_origin_must_match_authority() {
         let mut headers = HeaderMap::new();
@@ -453,7 +530,9 @@ mod tests {
     #[tokio::test]
     async fn rtc_lease_frames_stay_on_their_authenticated_control_lanes() {
         let service = crate::cvm::terminal::Service::default();
-        let (_, mut offers) = service.register_with_rtc("node", true).unwrap();
+        let (_, mut offers) = service
+            .register_with_capabilities("node", true, true)
+            .unwrap();
         let target = wire::Target {
             instance_id: "cvm-one".into(),
             runtime_id: "runtime-one".into(),
@@ -466,11 +545,16 @@ mod tests {
         let mut browser = service
             .browser_with_rtc(
                 &id,
-                &ticket,
                 "owner",
                 "node",
                 &target,
-                Some("v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n".into()),
+                &Attach {
+                    ticket: ticket.clone(),
+                    rtc_offer: Some(
+                        "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n".into(),
+                    ),
+                    trickle: false,
+                },
             )
             .unwrap();
         let node = service.agent(&id, "node").unwrap();

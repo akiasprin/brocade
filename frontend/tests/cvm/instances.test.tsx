@@ -640,14 +640,14 @@ it('waits for independent health instead of treating a lifecycle receipt as a sh
   expect(within(monitoring).queryByText('已关机')).toBeNull();
 });
 
-it('updates terminal launcher availability without reopening an independent window', async () => {
+it('updates terminal launcher availability without reopening an independent page', async () => {
   const child = { closed: true, focus: vi.fn() } as unknown as Window;
   const open = vi.spyOn(window, 'open').mockReturnValue(child);
   const data = cvmWorkspace('detail');
   const { client } = mount(data, { p: 'instance', id: data.instances[0].desired.id });
   fireEvent.click(await screen.findByRole('button', { name: '终端' }));
   expect(open).toHaveBeenCalledTimes(1);
-  expect(open.mock.calls[0][0]).toContain('webshell=cvm-alice');
+  expect(open.mock.calls[0]).toEqual([expect.stringContaining('webshell=cvm-alice'), '_blank']);
   const stopped = structuredClone(data);
   stopped.instances[0].desired.power = 'stopped';
   stopped.instances[0].report!.power = 'stopped';
@@ -659,7 +659,7 @@ it('updates terminal launcher availability without reopening an independent wind
   expect(screen.queryByRole('dialog', { name: '实例终端会话' })).toBeNull();
 });
 
-it('the independent terminal window tears down when host policy or instance power changes', async () => {
+it('the independent terminal page tears down when host policy or instance power changes', async () => {
   const data = cvmWorkspace('detail');
   const { client } = mount(data, { p: 'instance', id: data.instances[0].desired.id });
   render(

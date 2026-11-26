@@ -14,6 +14,14 @@ pub const MAX_SECONDS: u64 = 7200;
 /// Negotiated independently; legacy v2 peers never receive shortcut messages.
 pub const RTC_VERSION: &str = "1";
 pub const RTC_HEADER: &str = "x-brocade-terminal-webrtc";
+pub const TRICKLE_VERSION: &str = "1";
+pub const TRICKLE_HEADER: &str = "x-brocade-terminal-trickle";
+pub const MAX_ICE_CANDIDATES: usize = 32;
+pub const MAX_ICE_CANDIDATE_BYTES: usize = 1024;
+pub const TRICKLE_CONNECT_SECONDS: u64 = 15;
+/// Independently negotiated so old Agents never receive application probes.
+pub const LATENCY_VERSION: &str = "1";
+pub const LATENCY_HEADER: &str = "x-brocade-terminal-latency";
 pub const MAX_SDP: usize = 32 * 1024;
 pub const MAX_SIGNAL: usize = 64 * 1024;
 pub const RTC_CONNECT_SECONDS: u64 = 8;
@@ -28,12 +36,108 @@ pub const DATA_CHANNEL_LABEL: &str = "brocade-terminal-v1";
 pub struct RtcSettings {
     pub supported: bool,
     pub stun_servers: Vec<String>,
+    #[serde(default)]
+    pub trickle: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RtcOffer {
     pub sdp: String,
     pub stun_servers: Vec<String>,
+    #[serde(default)]
+    pub trickle: bool,
+}
+
+/// Signaling is scoped to one authenticated attachment and one ICE generation.
+/// These frames never enter a terminal's Input stream.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IceSignal {
+    IceCandidate {
+        candidate: String,
+        username_fragment: String,
+    },
+    IceComplete {
+        username_fragment: String,
+    },
+}
+
+pub fn ice_username_fragment(sdp: &str) -> Option<&str> {
+    sdp.lines()
+        .filter_map(|line| line.strip_prefix("a=ice-ufrag:"))
+        .next_back()
+        .filter(|s| {
+            (4..=256).contains(&s.len())
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"+/".contains(&b))
+        })
+}
+
+pub struct IceCandidates {
+    username_fragment: String,
+    seen: std::collections::BTreeSet<String>,
+    complete: bool,
+}
+
+impl IceCandidates {
+    pub fn from_sdp(sdp: &str) -> Result<Self, &'static str> {
+        let username_fragment = ice_username_fragment(sdp)
+            .ok_or("ICE generation is missing or invalid")?
+            .to_owned();
+        let seen: std::collections::BTreeSet<_> = sdp
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("a=")
+                    .filter(|s| s.starts_with("candidate:"))
+            })
+            .map(str::to_owned)
+            .collect();
+        if seen.len() > MAX_ICE_CANDIDATES {
+            return Err("too many ICE candidates");
+        }
+        Ok(Self {
+            username_fragment,
+            seen,
+            complete: sdp.lines().any(|line| line == "a=end-of-candidates"),
+        })
+    }
+
+    /// False is a duplicate. New candidates after completion and stale generations fail closed.
+    pub fn accept(&mut self, signal: &IceSignal) -> Result<bool, &'static str> {
+        let (username_fragment, candidate) = match signal {
+            IceSignal::IceCandidate {
+                candidate,
+                username_fragment,
+            } => (username_fragment, Some(candidate)),
+            IceSignal::IceComplete { username_fragment } => (username_fragment, None),
+        };
+        if username_fragment != &self.username_fragment {
+            return Err("stale ICE generation");
+        }
+        if let Some(candidate) = candidate {
+            if !candidate.starts_with("candidate:")
+                || candidate.len() > MAX_ICE_CANDIDATE_BYTES
+                || !candidate.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+            {
+                return Err("invalid ICE candidate");
+            }
+            if self.seen.contains(candidate) {
+                return Ok(false);
+            }
+            if self.complete {
+                return Err("ICE candidates are complete");
+            }
+            if self.seen.len() >= MAX_ICE_CANDIDATES {
+                return Err("too many ICE candidates");
+            }
+            self.seen.insert(candidate.clone());
+            Ok(true)
+        } else {
+            let changed = !self.complete;
+            self.complete = true;
+            Ok(changed)
+        }
+    }
 }
 
 /// The original Offer remains intact for existing execution backends and v2 clients.
@@ -68,6 +172,14 @@ pub enum AgentControl {
 pub enum BrowserControl {
     ControlProbe { nonce: u64 },
     ControlGrant { nonce: u64 },
+}
+
+/// Echoed by the Agent over the selected data transport, never sent to the Shell.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Probe {
+    Ping { nonce: u32 },
+    Pong { nonce: u32 },
 }
 
 /// Restrict configuration to UDP STUN discovery; no TURN credentials or arbitrary URLs.
@@ -128,7 +240,7 @@ pub fn valid_sdp(value: &str) -> bool {
             .lines()
             .filter(|line| line.starts_with("a=candidate:"))
             .count()
-            <= 32
+            <= MAX_ICE_CANDIDATES
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +332,46 @@ pub fn valid_session(id: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn trickled_candidates_are_bounded_and_scoped_to_one_generation() {
+        let mut ice = IceCandidates::from_sdp(
+            "v=0\r\na=ice-ufrag:abcd\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+        )
+        .unwrap();
+        let signal = |port| IceSignal::IceCandidate {
+            candidate: format!("candidate:1 1 udp 2113929471 192.0.2.1 {port} typ host"),
+            username_fragment: "abcd".into(),
+        };
+        assert!(ice
+            .accept(&IceSignal::IceComplete {
+                username_fragment: "old1".into()
+            })
+            .is_err());
+        for candidate in [
+            "candidate:1\r\na=ice-ufrag:evil".to_owned(),
+            "candidate:".to_owned() + &"x".repeat(MAX_ICE_CANDIDATE_BYTES),
+        ] {
+            assert!(ice
+                .accept(&IceSignal::IceCandidate {
+                    candidate,
+                    username_fragment: "abcd".into(),
+                })
+                .is_err());
+        }
+        for port in 30000..30032 {
+            assert!(ice.accept(&signal(port)).unwrap());
+        }
+        assert!(!ice.accept(&signal(30000)).unwrap());
+        assert!(ice.accept(&signal(30032)).is_err());
+        let end = IceSignal::IceComplete {
+            username_fragment: "abcd".into(),
+        };
+        assert!(ice.accept(&end).unwrap());
+        assert!(!ice.accept(&end).unwrap());
+        assert!(ice.accept(&signal(30033)).is_err());
+        assert!(serde_json::from_value::<Input>(serde_json::to_value(end).unwrap()).is_err());
+        assert!(IceCandidates::from_sdp("v=0\r\n").is_err());
+    }
+    #[test]
     fn terminal_bounds_reject_invalid_frames() {
         assert!(!Input::Resize { cols: 0, rows: 24 }.valid());
         assert!(!Input::Ack {
@@ -229,6 +381,13 @@ mod tests {
         assert!(Input::Resize { cols: 80, rows: 24 }.valid());
         assert!(!valid_session("../runtime"));
         assert!(valid_session(&"a".repeat(64)));
+        assert!(serde_json::from_str::<Input>(r#"{"type":"ping","nonce":1}"#).is_err());
+        for nonce in ["-1", "4294967296", "1.5", "null"] {
+            assert!(serde_json::from_str::<Probe>(&format!(
+                r#"{{"type":"ping","nonce":{nonce}}}"#
+            ))
+            .is_err());
+        }
     }
     #[test]
     fn only_bounded_udp_stun_configuration_is_accepted() {

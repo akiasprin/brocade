@@ -33,13 +33,29 @@ struct Session {
     new_session: bool,
     policy_revision: u64,
     rtc: bool,
+    ice: Option<wire::IceCandidates>,
     validated_at: Instant,
     browser_seen_at: Option<Instant>,
 }
 struct Agent {
     id: String,
     offers: mpsc::Sender<ConnectionOffer>,
-    rtc: bool,
+    features: AgentFeatures,
+}
+#[derive(serde::Deserialize)]
+pub struct Attach {
+    pub ticket: String,
+    #[serde(default)]
+    pub rtc_offer: Option<String>,
+    #[serde(default)]
+    pub trickle: bool,
+}
+
+#[derive(Default)]
+pub struct AgentFeatures {
+    pub rtc: bool,
+    pub latency: bool,
+    pub trickle: bool,
 }
 #[derive(Default)]
 struct Inner {
@@ -125,9 +141,35 @@ impl Service {
             supported: inner
                 .agents
                 .get(node)
-                .is_some_and(|a| a.rtc && !a.offers.is_closed()),
+                .is_some_and(|a| a.features.rtc && !a.offers.is_closed()),
             stun_servers: inner.stun_servers.clone(),
+            trickle: inner
+                .agents
+                .get(node)
+                .is_some_and(|a| a.features.trickle && !a.offers.is_closed()),
         }
+    }
+    pub fn latency_supported(&self, node: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .agents
+            .get(node)
+            .is_some_and(|a| a.features.latency && !a.offers.is_closed())
+    }
+    pub fn accept_ice_signal(
+        &self,
+        id: &str,
+        signal: &wire::IceSignal,
+    ) -> Result<bool, &'static str> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .get_mut(id)
+            .and_then(|s| s.ice.as_mut())
+            .ok_or("terminal trickle ICE was not negotiated")?
+            .accept(signal)
     }
     pub fn validated(&self, id: &str) {
         if let Some(s) = self
@@ -177,13 +219,32 @@ impl Service {
         &self,
         node: &str,
     ) -> Result<(String, mpsc::Receiver<ConnectionOffer>), &'static str> {
-        self.register_with_rtc(node, false)
+        self.register_with_capabilities(node, false, false)
     }
-    pub fn register_with_rtc(
+    #[cfg(test)]
+    pub fn register_with_capabilities(
         &self,
         node: &str,
         rtc: bool,
+        latency: bool,
     ) -> Result<(String, mpsc::Receiver<ConnectionOffer>), &'static str> {
+        self.register_with_features(
+            node,
+            AgentFeatures {
+                rtc,
+                latency,
+                trickle: false,
+            },
+        )
+    }
+    pub fn register_with_features(
+        &self,
+        node: &str,
+        features: AgentFeatures,
+    ) -> Result<(String, mpsc::Receiver<ConnectionOffer>), &'static str> {
+        if features.trickle && !features.rtc {
+            return Err("trickle ICE requires RTC");
+        }
         let mut inner = self
             .0
             .lock()
@@ -208,7 +269,7 @@ impl Service {
             Agent {
                 id: id.clone(),
                 offers: tx,
-                rtc,
+                features,
             },
         );
         Ok((id, rx))
@@ -282,6 +343,7 @@ impl Service {
                 new_session,
                 policy_revision,
                 rtc: false,
+                ice: None,
                 validated_at: Instant::now(),
                 browser_seen_at: None,
             },
@@ -297,33 +359,62 @@ impl Service {
         node: &str,
         target: &Target,
     ) -> Result<Link, &'static str> {
-        self.browser_with_rtc(id, ticket, operator, node, target, None)
+        self.browser_with_rtc(
+            id,
+            operator,
+            node,
+            target,
+            &Attach {
+                ticket: ticket.to_owned(),
+                rtc_offer: None,
+                trickle: false,
+            },
+        )
     }
     pub fn browser_with_rtc(
         &self,
         id: &str,
-        ticket: &str,
         operator: &str,
         node: &str,
         target: &Target,
-        sdp: Option<String>,
+        attachment: &Attach,
     ) -> Result<Link, &'static str> {
+        let Attach {
+            ticket,
+            rtc_offer: sdp,
+            trickle,
+        } = attachment;
+        let trickle = *trickle;
         let mut inner = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.expire();
         let rtc = if let Some(sdp) = sdp {
-            if !wire::valid_sdp(&sdp) || !inner.agents.get(node).is_some_and(|a| a.rtc) {
+            if !wire::valid_sdp(sdp)
+                || !inner
+                    .agents
+                    .get(node)
+                    .is_some_and(|a| a.features.rtc && (!trickle || a.features.trickle))
+            {
                 return Err("terminal WebRTC offer is unsupported or invalid");
             }
             Some(wire::RtcOffer {
-                sdp,
+                sdp: sdp.clone(),
                 stun_servers: inner.stun_servers.clone(),
+                trickle,
             })
         } else {
+            if trickle {
+                return Err("trickle ICE requires an offer");
+            }
             None
         };
+        let ice = rtc
+            .as_ref()
+            .filter(|r| r.trickle)
+            .map(|r| wire::IceCandidates::from_sdp(&r.sdp))
+            .transpose()?;
         let s = inner
             .sessions
             .get_mut(id)
@@ -340,6 +431,7 @@ impl Service {
         }
         s.ticket = None;
         s.rtc = rtc.is_some();
+        s.ice = ice;
         s.validated_at = Instant::now();
         let link = s.browser.take().ok_or("terminal is already attached")?;
         let offer = Offer {
@@ -533,21 +625,51 @@ mod tests {
         let s = Service::default();
         s.configure_stun(vec!["stun:controlled.example:3478".into()])
             .unwrap();
-        let (_, mut offers) = s.register_with_rtc("node", true).unwrap();
+        let (_, mut offers) = s.register_with_capabilities("node", true, true).unwrap();
         assert!(s.rtc_settings("node").supported);
         let (id, ticket) = s.create("owner", "node", target()).unwrap();
         let sdp = "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n".to_owned();
         assert!(!s.rtc_lease_allowed(&id));
         assert!(s
-            .browser_with_rtc(&id, &ticket, "other", "node", &target(), Some(sdp.clone()))
+            .browser_with_rtc(
+                &id,
+                "other",
+                "node",
+                &target(),
+                &Attach {
+                    ticket: ticket.clone(),
+                    rtc_offer: Some(sdp.clone()),
+                    trickle: false
+                }
+            )
             .is_err());
         let mut changed = target();
         changed.reinstall_epoch = 1;
         assert!(s
-            .browser_with_rtc(&id, &ticket, "owner", "node", &changed, Some(sdp.clone()))
+            .browser_with_rtc(
+                &id,
+                "owner",
+                "node",
+                &changed,
+                &Attach {
+                    ticket: ticket.clone(),
+                    rtc_offer: Some(sdp.clone()),
+                    trickle: false
+                }
+            )
             .is_err());
         let browser = s
-            .browser_with_rtc(&id, &ticket, "owner", "node", &target(), Some(sdp))
+            .browser_with_rtc(
+                &id,
+                "owner",
+                "node",
+                &target(),
+                &Attach {
+                    ticket: ticket.clone(),
+                    rtc_offer: Some(sdp),
+                    trickle: false,
+                },
+            )
             .unwrap();
         let offer = offers.try_recv().unwrap();
         assert_eq!(
@@ -578,13 +700,152 @@ mod tests {
         assert!(!s.rtc_lease_allowed(&id));
     }
     #[test]
+    fn latency_capability_requires_a_live_registration_and_is_independent_of_rtc() {
+        let s = Service::default();
+        let (_, legacy) = s.register("node").unwrap();
+        assert!(!s.latency_supported("node"));
+        let (_, current) = s.register_with_capabilities("node", false, true).unwrap();
+        assert!(s.latency_supported("node"));
+        assert!(!s.rtc_settings("node").supported);
+        drop(legacy);
+        assert!(s.latency_supported("node"));
+        drop(current);
+        assert!(!s.latency_supported("node"));
+    }
+    #[test]
+    fn trickle_negotiation_keeps_candidates_scoped_to_the_authorized_attachment() {
+        let s = Service::default();
+        let (_, mut offers) = s
+            .register_with_features(
+                "node",
+                AgentFeatures {
+                    rtc: true,
+                    trickle: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(s.rtc_settings("node").trickle);
+        let (id, ticket) = s.create("owner", "node", target()).unwrap();
+        let sdp = "v=0\r\na=ice-ufrag:abcd\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            .to_owned();
+        assert!(s
+            .browser_with_rtc(
+                &id,
+                "other",
+                "node",
+                &target(),
+                &Attach {
+                    ticket: ticket.clone(),
+                    rtc_offer: Some(sdp.clone()),
+                    trickle: true
+                }
+            )
+            .is_err());
+        let _browser = s
+            .browser_with_rtc(
+                &id,
+                "owner",
+                "node",
+                &target(),
+                &Attach {
+                    ticket: ticket.clone(),
+                    rtc_offer: Some(sdp),
+                    trickle: true,
+                },
+            )
+            .unwrap();
+        assert!(offers.try_recv().unwrap().rtc.unwrap().trickle);
+        let candidate = wire::IceSignal::IceCandidate {
+            candidate: "candidate:1 1 udp 2113929471 192.0.2.1 30000 typ host".into(),
+            username_fragment: "abcd".into(),
+        };
+        assert!(s
+            .accept_ice_signal("another-attachment", &candidate)
+            .is_err());
+        assert!(s.accept_ice_signal(&id, &candidate).unwrap());
+        assert!(!s.accept_ice_signal(&id, &candidate).unwrap());
+        assert!(s
+            .accept_ice_signal(
+                &id,
+                &wire::IceSignal::IceComplete {
+                    username_fragment: "old1".into()
+                }
+            )
+            .is_err());
+        assert!(s
+            .accept_ice_signal(
+                &id,
+                &wire::IceSignal::IceComplete {
+                    username_fragment: "abcd".into()
+                }
+            )
+            .unwrap());
+        s.close_instance_sessions("cvm-one");
+        assert!(s.accept_ice_signal(&id, &candidate).is_err());
+    }
+    #[test]
+    fn legacy_agents_reject_trickle_without_consuming_the_ticket() {
+        let s = Service::default();
+        let (_, mut offers) = s.register_with_capabilities("node", true, true).unwrap();
+        assert!(!s.rtc_settings("node").trickle);
+        let (id, ticket) = s.create("owner", "node", target()).unwrap();
+        let sdp = "v=0\r\na=ice-ufrag:abcd\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+            .to_owned();
+        assert!(s
+            .browser_with_rtc(
+                &id,
+                "owner",
+                "node",
+                &target(),
+                &Attach {
+                    ticket: ticket.clone(),
+                    rtc_offer: Some(sdp.clone()),
+                    trickle: true
+                }
+            )
+            .is_err());
+        let _browser = s
+            .browser_with_rtc(
+                &id,
+                "owner",
+                "node",
+                &target(),
+                &Attach {
+                    ticket: ticket.clone(),
+                    rtc_offer: Some(sdp),
+                    trickle: false,
+                },
+            )
+            .unwrap();
+        assert!(!offers.try_recv().unwrap().rtc.unwrap().trickle);
+        assert!(s
+            .accept_ice_signal(
+                &id,
+                &wire::IceSignal::IceComplete {
+                    username_fragment: "abcd".into()
+                }
+            )
+            .is_err());
+    }
+    #[test]
     fn unsupported_or_invalid_rtc_does_not_consume_the_relay_ticket() {
         let s = Service::default();
         let (_, mut offers) = s.register("node").unwrap();
         let (id, ticket) = s.create("owner", "node", target()).unwrap();
         assert!(!s.rtc_settings("node").supported);
         assert!(s
-            .browser_with_rtc(&id, &ticket, "owner", "node", &target(), Some("bad".into()))
+            .browser_with_rtc(
+                &id,
+                "owner",
+                "node",
+                &target(),
+                &Attach {
+                    ticket: ticket.clone(),
+                    rtc_offer: Some("bad".into()),
+                    trickle: false
+                }
+            )
             .is_err());
         s.browser(&id, &ticket, "owner", "node", &target()).unwrap();
         assert!(offers.try_recv().unwrap().rtc.is_none());

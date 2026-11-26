@@ -83,12 +83,14 @@ async fn connect(
     let mut request = yawc::HttpRequest::builder()
         .header("authorization", format!("Bearer {}", options.token))
         .header(wire::VERSION_HEADER, wire::VERSION)
+        .header(wire::LATENCY_HEADER, wire::LATENCY_VERSION)
         .header(
             "x-brocade-protocol-version",
             AGENT_PROTOCOL_VERSION.to_string(),
         );
     if rtc {
         request = request.header(wire::RTC_HEADER, wire::RTC_VERSION);
+        request = request.header(wire::TRICKLE_HEADER, wire::TRICKLE_VERSION);
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     let stream = HttpClient::new(&options.server)?
@@ -270,6 +272,10 @@ where
                 let command=match frame.opcode(){
                     OpCode::Binary if frame.payload().len()<=wire::MAX_DATA=>Some(TerminalCommand::Data(frame.payload().to_vec())),
                     OpCode::Text if frame.payload().len()<=wire::MAX_CONTROL=>{
+                        if let Some(reply)=probe_reply(frame.payload())? {
+                            send(socket,Frame::text(reply)).await?;
+                            continue;
+                        }
                         let control:wire::Input=serde_json::from_slice(frame.payload()).map_err(|_|"invalid terminal input")?;
                         if !control.valid(){return Err("invalid terminal input".into())}
                         Some(TerminalCommand::Control(control))
@@ -288,6 +294,15 @@ where
             }
         }
     }
+}
+
+fn probe_reply(data: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let Ok(wire::Probe::Ping { nonce }) = serde_json::from_slice(data) else {
+        return Ok(None);
+    };
+    serde_json::to_vec(&wire::Probe::Pong { nonce })
+        .map(Some)
+        .map_err(|_| "invalid terminal probe response".into())
 }
 
 #[cfg(test)]
@@ -318,6 +333,29 @@ mod tests {
             }
         };
         assert_eq!(frame.payload(), "你好 Guest".as_bytes());
+        peer.send(Frame::text(r#"{"type":"ping","nonce":42}"#))
+            .await
+            .unwrap();
+        let frame = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), peer.next_frame())
+                .await
+                .unwrap()
+                .unwrap();
+            match frame.opcode() {
+                OpCode::Ping => flush(&mut peer).await.unwrap(),
+                OpCode::Pong => {}
+                _ => break frame,
+            }
+        };
+        assert_eq!(frame.opcode(), OpCode::Text);
+        assert!(matches!(
+            serde_json::from_slice::<wire::Probe>(frame.payload()).unwrap(),
+            wire::Probe::Pong { nonce: 42 }
+        ));
+        assert!(
+            commands.try_recv().is_err(),
+            "probes must never reach the Shell"
+        );
         peer.send(Frame::binary(vec![3])).await.unwrap();
         assert!(
             matches!(commands.recv().await.unwrap(),brocade_cube::TerminalCommand::Data(v) if v==vec![3])

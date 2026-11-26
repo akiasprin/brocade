@@ -207,7 +207,7 @@ function InstanceActions({
               className="btn icon cvm-row-btn"
               type="button"
               aria-label="终端"
-              title={`打开 ${name} 的终端窗口`}
+              title={`在新页面打开 ${name} 的终端`}
               onClick={openTerminal}
             >
               <Icon of="nodes" size={14} />
@@ -236,7 +236,7 @@ function InstanceActions({
           target="_blank"
           rel="noopener"
         >
-          弹窗被拦截，改在新标签页打开
+          新页面未能打开，请手动打开
         </a>
       )}
       {open && (
@@ -255,7 +255,7 @@ function InstanceActions({
               ),
             )}
             {recovery && item(recoveryLabel, '沿用原任务身份核查或重试', button => action('retry', button))}
-            {terminal.enabled && !deleted && item('终端', '在新窗口打开容器终端', openTerminal)}
+            {terminal.enabled && !deleted && item('终端', '在新页面打开容器终端', openTerminal)}
             {copy && (
               <CopyButton role="menuitem" text={copy} label="复制 SSH 命令" successLabel="已复制 SSH 命令">
                 {(_, label) => (

@@ -59,11 +59,14 @@ class Channel {
 class Peer extends EventTarget {
   static instances: Peer[] = [];
   static deny = false;
+  static gathering = false;
+  static early = false;
   channel = new Channel();
   connectionState = 'connected';
-  iceGatheringState = 'complete';
-  localDescription = { sdp: 'v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n' };
+  iceGatheringState = Peer.gathering ? 'gathering' : 'complete';
+  localDescription = { sdp: 'v=0\r\na=ice-ufrag:abcd\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n' };
   onconnectionstatechange: (() => void) | null = null;
+  onicecandidate: ((event: { candidate: RTCIceCandidate | null }) => void) | null = null;
   remote = vi.fn();
   closed = false;
   constructor(readonly config: RTCConfiguration) {
@@ -75,7 +78,17 @@ class Peer extends EventTarget {
     if (Peer.deny) throw new DOMException('blocked', 'NotAllowedError');
     return this.localDescription;
   }
-  async setLocalDescription() {}
+  async setLocalDescription() {
+    if (Peer.early) {
+      this.candidate('candidate:1 1 udp 2113929471 192.0.2.1 30000 typ host');
+      this.candidate(null);
+    }
+  }
+  candidate(value: string | null, usernameFragment = 'abcd') {
+    this.onicecandidate?.({
+      candidate: value === null ? null : ({ candidate: value, usernameFragment } as RTCIceCandidate),
+    });
+  }
   async setRemoteDescription(value: unknown) {
     this.remote(value);
   }
@@ -94,9 +107,13 @@ const credentials = {
 const tick = async () => {
   for (let i = 0; i < 8; i++) await Promise.resolve();
 };
-function connect(direct = true) {
-  const options = { direct, route: vi.fn(), directReady: vi.fn(), directLost: vi.fn(), permissionDenied: vi.fn() };
-  const socket = terminalTransport(new URL('wss://console.example/terminal'), credentials, options);
+function connect(direct = true, trickle = false) {
+  const options = { direct, route: vi.fn(), directLost: vi.fn(), permissionDenied: vi.fn() };
+  const socket = terminalTransport(
+    new URL('wss://console.example/terminal'),
+    { ...credentials, webrtc: { ...credentials.webrtc, trickle } },
+    options,
+  );
   socket.onopen = () => socket.send(JSON.stringify({ ticket: 'ticket' }));
   const control = Socket.instances.at(-1)!;
   control.open();
@@ -107,6 +124,8 @@ beforeEach(() => {
   Socket.grants = true;
   Peer.instances = [];
   Peer.deny = false;
+  Peer.gathering = false;
+  Peer.early = false;
   vi.stubGlobal('WebSocket', Socket);
   vi.stubGlobal('RTCPeerConnection', Peer);
   vi.stubGlobal('isSecureContext', true);
@@ -116,7 +135,77 @@ afterEach(() => {
   vi.useRealTimers();
 });
 describe('terminal path selection', () => {
-  it('does not gather candidates before the user opts in', () => {
+  it('sends the authenticated offer before candidates gathered during setLocalDescription', async () => {
+    Peer.early = true;
+    const { socket, control } = connect(true, true);
+    await tick();
+    const sent = control.sent.map(value => JSON.parse(String(value)));
+    expect(sent[0]).toMatchObject({ ticket: 'ticket', trickle: true });
+    expect(sent[0].rtc_offer).not.toContain('a=candidate:');
+    expect(sent[1].type).toBe('control_probe');
+    expect(sent[2]).toMatchObject({ type: 'ice_candidate', username_fragment: 'abcd' });
+    expect(sent[3]).toEqual({ type: 'ice_complete', username_fragment: 'abcd' });
+    socket.close();
+  });
+  it('forwards a public candidate arriving after 2.2 seconds without replacing the attachment', async () => {
+    vi.useFakeTimers();
+    Peer.gathering = true;
+    const { socket, control } = connect(true, true);
+    await tick();
+    expect(JSON.parse(String(control.sent[0]))).toHaveProperty('rtc_offer');
+    await vi.advanceTimersByTimeAsync(3100);
+    const peer = Peer.instances[0];
+    peer.candidate('candidate:2 1 udp 1686052607 203.0.113.9 41000 typ srflx raddr 192.168.1.2 rport 30000');
+    expect(
+      control.sent.map(value => JSON.parse(String(value))).filter(value => value.type === 'ice_candidate'),
+    ).toEqual([
+      expect.objectContaining({ candidate: expect.stringContaining('203.0.113.9'), username_fragment: 'abcd' }),
+    ]);
+    control.receive(JSON.stringify({ type: 'rtc_answer', sdp: 'answer' }));
+    await tick();
+    peer.channel.receive(JSON.stringify({ type: 'transport', kind: 'webrtc' }));
+    socket.send(new Uint8Array([7]));
+    expect(peer.channel.sent).toEqual([new Uint8Array([7])]);
+    expect(Socket.instances).toHaveLength(1);
+    socket.close();
+  });
+  it('deduplicates candidates, ignores stale generations and bounds the candidate exchange', async () => {
+    const { socket, control } = connect(true, true);
+    await tick();
+    const peer = Peer.instances[0];
+    const value = 'candidate:1 1 udp 2113929471 192.0.2.1 30000 typ host';
+    peer.candidate(value, 'old1');
+    peer.candidate(value);
+    peer.candidate(value);
+    for (let i = 1; i < 40; i++) peer.candidate(`candidate:${i + 1} 1 udp 2113929471 192.0.2.1 ${30000 + i} typ host`);
+    const sent = control.sent.map(value => JSON.parse(String(value)));
+    expect(sent.filter(value => value.type === 'ice_candidate')).toHaveLength(32);
+    expect(sent.filter(value => value.type === 'ice_complete')).toHaveLength(1);
+    expect(peer.onicecandidate).toBeNull();
+    socket.close();
+  });
+  it('falls back explicitly instead of sending an incomplete legacy offer', async () => {
+    vi.useFakeTimers();
+    Peer.gathering = true;
+    const { socket, control, options } = connect();
+    await tick();
+    await vi.advanceTimersByTimeAsync(2200);
+    expect(control.sent).toEqual([JSON.stringify({ ticket: 'ticket' })]);
+    expect(options.route).toHaveBeenCalledWith('console', 'ice_gather_timeout');
+    socket.close();
+  });
+  it('stops trickling after relay selection without mixing candidates into terminal input', async () => {
+    const { socket, control } = connect(true, true);
+    await tick();
+    control.receive(JSON.stringify({ type: 'transport', kind: 'console' }));
+    const before = control.sent.length;
+    Peer.instances[0].candidate('candidate:1 1 udp 2113929471 192.0.2.1 30000 typ host');
+    expect(control.sent).toHaveLength(before);
+    socket.send(new Uint8Array([3]));
+    expect(control.sent.at(-1)).toEqual(new Uint8Array([3]));
+    socket.close();
+  });
+  it('uses WebSocket without gathering candidates when explicitly selected', () => {
     const { socket, control, options } = connect(false);
     expect(Peer.instances).toHaveLength(0);
     expect(control.sent).toEqual([JSON.stringify({ ticket: 'ticket' })]);
@@ -139,10 +228,12 @@ describe('terminal path selection', () => {
     const bytes = new Uint8Array([1, 2, 3]);
     socket.send(bytes);
     peer.channel.receive(bytes.buffer);
-    expect(peer.channel.sent).toEqual([bytes]);
+    const probe = JSON.stringify({ type: 'ping', nonce: 42 });
+    socket.send(probe);
+    peer.channel.receive(JSON.stringify({ type: 'pong', nonce: 42 }));
+    expect(peer.channel.sent).toEqual([bytes, probe]);
     expect(control.sent).toHaveLength(2);
-    expect(received).toHaveBeenCalledTimes(1);
-    expect(options.directReady).toHaveBeenCalledOnce();
+    expect(received).toHaveBeenCalledTimes(2);
     socket.close();
     expect(options.directLost).not.toHaveBeenCalled();
   });
@@ -181,13 +272,12 @@ describe('terminal path selection', () => {
     expect(options.directLost).toHaveBeenCalledOnce();
     expect(channel.readyState).toBe('closed');
   });
-  it('clears denied consent and sends one legacy ticket for setup failure', async () => {
+  it('handles a denied browser permission and sends one legacy ticket for setup failure', async () => {
     Peer.deny = true;
     const { socket, control, options } = connect();
     await tick();
     expect(options.permissionDenied).toHaveBeenCalledOnce();
     expect(control.sent).toEqual([JSON.stringify({ ticket: 'ticket' })]);
-    expect(options.directReady).not.toHaveBeenCalled();
     socket.close();
   });
   it('surfaces authorization errors on the selected direct path without retrying them', async () => {

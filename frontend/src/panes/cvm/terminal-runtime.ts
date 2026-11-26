@@ -36,6 +36,7 @@ export type TerminalSessionView = CvmTerminalSession & {
   connectedAt: number | null;
   route: TerminalRoute | null;
   routeReason: string;
+  latencyMs: number | null;
 };
 export type PasteTarget = { term: Terminal; socket: TerminalSocket; id: string };
 type ConnectionRequest = { terminal_id?: string; new_session?: boolean };
@@ -54,6 +55,9 @@ type Runtime = {
   retries: number;
   retryTimer?: number;
   stableTimer?: number;
+  latencyTimer?: number;
+  latencyDeadline?: number;
+  probe?: { nonce: number; sent: number };
   deadline?: number;
   endRequested: boolean;
   subscriptions: { dispose: () => void }[];
@@ -88,6 +92,7 @@ const placeholder = (id: string, ordinal: number): TerminalSessionView => ({
   connectedAt: null,
   route: null,
   routeReason: '',
+  latencyMs: null,
 });
 const bytes = (text: string) => new TextEncoder().encode(text);
 export const cleanSelection = (text: string) => text.replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '');
@@ -115,20 +120,15 @@ export class TerminalWorkspace {
   private typingTimer?: number;
   private feedbackTimer?: number;
   private nextOrdinal = 1;
-  private directAllowed = false;
+  private directAllowed = true;
+  private probeSequence = 0;
   preferences: TerminalPreferences;
 
   constructor(
     readonly instance: string,
     preferences: TerminalPreferences,
-    private readonly directPreferenceKey?: string,
   ) {
     this.preferences = preferences;
-    try {
-      this.directAllowed = !!directPreferenceKey && localStorage.getItem(directPreferenceKey) === 'allowed';
-    } catch {
-      // Storage restrictions leave the first direct attempt manual.
-    }
   }
   snapshot = () => this.state;
   subscribe = (listener: () => void) => {
@@ -182,6 +182,7 @@ export class TerminalWorkspace {
     window.clearTimeout(runtime.retryTimer);
     window.clearTimeout(runtime.stableTimer);
     window.clearTimeout(runtime.deadline);
+    this.stopLatency(runtime);
     if (runtime.socket) {
       runtime.socket.onclose = null;
       runtime.socket.onmessage = null;
@@ -240,13 +241,13 @@ export class TerminalWorkspace {
     const id = this.state.active;
     this.connect(id && id !== 'initial' ? { terminal_id: id } : {}, true, 0, old);
   }
-  tryDirect() {
+  useWebRtc() {
     this.directAllowed = true;
     const runtime = this.active();
     if (runtime) runtime.relayOnly = false;
     this.reconnect();
   }
-  useConsole() {
+  useWebSocket() {
     const runtime = this.active();
     if (runtime) runtime.relayOnly = true;
     this.reconnect();
@@ -272,6 +273,34 @@ export class TerminalWorkspace {
     }
     ws.send(payload);
     return true;
+  }
+  private stopLatency(runtime: Runtime) {
+    window.clearInterval(runtime.latencyTimer);
+    window.clearTimeout(runtime.latencyDeadline);
+    runtime.latencyTimer = undefined;
+    runtime.probe = undefined;
+    this.patch(runtime.key, { latencyMs: null });
+  }
+  private startLatency(runtime: Runtime) {
+    if (runtime.latencyTimer !== undefined) return;
+    const probe = () => {
+      if (runtime.disposed || !runtime.ready || runtime.replaying) return;
+      window.clearTimeout(runtime.latencyDeadline);
+      if (runtime.probe) this.patch(runtime.key, { latencyMs: null });
+      const nonce = (this.probeSequence = (this.probeSequence + 1) >>> 0);
+      runtime.probe = { nonce, sent: performance.now() };
+      if (!this.send(runtime, JSON.stringify({ type: 'ping', nonce }))) {
+        runtime.probe = undefined;
+        this.patch(runtime.key, { latencyMs: null });
+        return;
+      }
+      runtime.latencyDeadline = window.setTimeout(() => {
+        runtime.probe = undefined;
+        this.patch(runtime.key, { latencyMs: null });
+      }, 5000);
+    };
+    probe();
+    runtime.latencyTimer = window.setInterval(probe, 5000);
   }
   sendKey(text: string) {
     const runtime = this.active();
@@ -451,7 +480,7 @@ export class TerminalWorkspace {
     this.runtimes.set(key, runtime);
     if (!this.state.sessions.some(s => s.id === key))
       this.publish({ sessions: [...this.state.sessions, placeholder(key, this.nextOrdinal++)] });
-    this.patch(key, { status: 'connecting', error: '', retryAt: null, route: null, routeReason: '' });
+    this.patch(key, { status: 'connecting', error: '', retryAt: null, route: null, routeReason: '', latencyMs: null });
     if (activate) {
       this.publish({ active: key, selection: '', pendingPaste: null });
       for (const r of this.runtimes.values()) r.element.hidden = r !== runtime;
@@ -513,24 +542,11 @@ export class TerminalWorkspace {
         const ws = terminalTransport(url, credentials, {
           direct: this.directAllowed && !runtime.relayOnly,
           route: (route, reason) => this.patch(runtime.key, { route, routeReason: reason ?? '' }),
-          directReady: () => {
-            if (!this.directPreferenceKey) return;
-            try {
-              localStorage.setItem(this.directPreferenceKey, 'allowed');
-            } catch {
-              // A working connection does not depend on persistent preferences.
-            }
-          },
           directLost: () => {
             runtime.relayOnly = true;
           },
           permissionDenied: () => {
             this.directAllowed = false;
-            try {
-              if (this.directPreferenceKey) localStorage.removeItem(this.directPreferenceKey);
-            } catch {
-              // The in-memory permission is already cleared.
-            }
           },
         });
         runtime.socket = ws;
@@ -597,12 +613,21 @@ export class TerminalWorkspace {
                     runtime.retries = 0;
                   }, 30_000);
                   this.patch(runtime.key, { status: 'connected', connectedAt: Date.now(), retryAt: null, error: '' });
+                  if (credentials.latency_supported) this.startLatency(runtime);
                   if (runtime.key === this.state.active) {
                     this.fit();
                     this.focus();
                   }
                   if (runtime.endRequested) this.send(runtime, JSON.stringify({ type: 'close' }));
                 });
+            } else if (message.type === 'pong') {
+              const pending = runtime.probe;
+              const elapsed = pending ? performance.now() - pending.sent : Infinity;
+              if (pending && message.nonce === pending.nonce && elapsed >= 0 && elapsed < 5000) {
+                window.clearTimeout(runtime.latencyDeadline);
+                runtime.probe = undefined;
+                this.patch(runtime.key, { latencyMs: Math.round(elapsed) });
+              }
             } else if (message.type === 'exit') {
               runtime.ready = false;
               this.patch(runtime.key, { status: 'ended', running: false, retryAt: null });
@@ -633,6 +658,7 @@ export class TerminalWorkspace {
         };
         ws.onclose = () => {
           runtime.ready = false;
+          this.stopLatency(runtime);
           window.clearTimeout(runtime.stableTimer);
           window.clearTimeout(runtime.deadline);
           if (runtime.disposed) return;

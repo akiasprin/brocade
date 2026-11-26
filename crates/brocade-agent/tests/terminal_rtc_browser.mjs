@@ -15,7 +15,13 @@ const timer = setTimeout(() => {
   console.error('browser RTC proof timed out');
   process.exit(1);
 }, 30000);
-const browser = await chromium.launch({ headless: true, executablePath: process.env.BROCADE_TEST_CHROMIUM });
+const browser = await chromium.launch({
+  headless: true,
+  executablePath: process.env.BROCADE_TEST_CHROMIUM,
+  // Exercise native IP candidate parsing, rather than passing only through
+  // browser-initiated peer-reflexive checks for an ignored mDNS hostname.
+  args: ['--disable-features=WebRtcHideLocalIpsWithMdns'],
+});
 try {
   const page = await browser.newPage();
   const errors = [];
@@ -30,6 +36,8 @@ try {
         bufferedAmount = 0;
         binaryType = 'arraybuffer';
         sent = [];
+        pending = Promise.resolve();
+        started = 0;
         constructor() {
           super();
           globalThis.testControl = this;
@@ -47,12 +55,21 @@ try {
                 new MessageEvent('message', { data: JSON.stringify({ type: 'control_grant', nonce: value.nonce }) }),
               ),
             );
-          if (value.rtc_offer)
-            void fetch(`${origin}/offer`, { method: 'POST', body: value.rtc_offer })
+          if (value.rtc_offer) {
+            this.started = performance.now();
+            this.pending = fetch(`${origin}/offer`, { method: 'POST', body: value.rtc_offer })
               .then(r => r.text())
               .then(sdp =>
                 this.onmessage?.(new MessageEvent('message', { data: JSON.stringify({ type: 'rtc_answer', sdp }) })),
               );
+          }
+          if (value.type === 'ice_candidate' || value.type === 'ice_complete') {
+            this.pending = this.pending.then(async () => {
+              await new Promise(resolve => setTimeout(resolve, Math.max(0, 3100 - (performance.now() - this.started))));
+              const response = await fetch(`${origin}/candidate`, { method: 'POST', body: text });
+              if (!response.ok) throw new Error('candidate rejected');
+            });
+          }
         }
         close() {
           if (this.readyState === 3) return;
@@ -63,12 +80,10 @@ try {
       globalThis.WebSocket = Control;
       const { terminalTransport } = await import(`data:text/javascript;base64,${btoa(code)}`);
       const routes = [];
-      let ready = 0;
-      const credentials = { ticket: 'synthetic-ticket', webrtc: { supported: true, stun_servers: [] } };
+      const credentials = { ticket: 'synthetic-ticket', webrtc: { supported: true, stun_servers: [], trickle: true } };
       const socket = terminalTransport(new URL(`${origin.replace('http', 'ws')}/control`), credentials, {
         direct: true,
         route: kind => routes.push(kind),
-        directReady: () => ready++,
         directLost: () => {},
         permissionDenied: () => {
           throw new Error('permission denied');
@@ -95,19 +110,26 @@ try {
         };
         socket.onclose = () => reject(new Error('unexpected close'));
       });
+      await globalThis.testControl.pending;
       const controls = globalThis.testControl.sent.map(value => JSON.parse(value));
       socket.onclose = null;
       socket.close();
-      return { routes, ready, received, controls };
+      return { routes, received, controls };
     },
     { origin, code },
   );
   assert.deepEqual(errors, []);
   assert.deepEqual(result.routes, ['webrtc']);
-  assert.equal(result.ready, 1);
   assert.equal(result.controls.filter(value => value.ticket).length, 1);
-  assert.ok(result.controls.every(value => value.ticket || value.type === 'control_probe'));
+  assert.ok(
+    result.controls.every(
+      value => value.ticket || ['control_probe', 'ice_candidate', 'ice_complete'].includes(value.type),
+    ),
+  );
   assert.ok(result.controls[0].rtc_offer);
+  assert.equal(result.controls[0].trickle, true);
+  assert.ok(result.controls.some(value => value.type === 'ice_candidate' && !value.candidate.includes('.local')));
+  assert.ok(result.controls.some(value => value.type === 'ice_complete'));
   assert.deepEqual(
     result.received[0],
     Array.from({ length: 16384 }, (_, i) => i % 251),
@@ -123,6 +145,7 @@ try {
       ordered_control: true,
       console_frames: result.controls.length,
       terminal_frames_over_console: 0,
+      delayed_candidates_ms: 3100,
     }),
   );
 } finally {

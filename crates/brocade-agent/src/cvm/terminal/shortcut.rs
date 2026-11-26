@@ -67,6 +67,7 @@ pub(super) async fn session(
     rtc_offer: wire::RtcOffer,
     config: &Config,
 ) {
+    let trickle = rtc_offer.trickle;
     let path = format!("/agent/v1/cvm/terminal/{}/stream", offer.session_id);
     let Ok(mut socket) = connect(options, &path, false).await else {
         return;
@@ -91,7 +92,12 @@ pub(super) async fn session(
     let mut lease = Lease::new(Instant::now());
     let mut renew = tokio::time::interval(Duration::from_secs(1));
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let negotiation = Instant::now() + Duration::from_secs(wire::RTC_CONNECT_SECONDS);
+    let negotiation = Instant::now()
+        + Duration::from_secs(if trickle {
+            wire::TRICKLE_CONNECT_SECONDS
+        } else {
+            wire::RTC_CONNECT_SECONDS
+        });
     let lifetime = Instant::now() + Duration::from_secs(wire::MAX_SECONDS);
     let mut open = false;
     let mut selected: Option<bool> = None;
@@ -193,8 +199,19 @@ pub(super) async fn session(
                     OpCode::Text if frame.payload().len()<=wire::MAX_CONTROL=>{
                         if let Ok(control)=serde_json::from_slice::<wire::AgentControl>(frame.payload()) {
                             match control {wire::AgentControl::LeaseGrant{nonce}=>{lease.grant(nonce,Instant::now());},_=>break}
+                        } else if trickle && serde_json::from_slice::<wire::IceSignal>(frame.payload()).is_ok() {
+                            let Ok(signal)=serde_json::from_slice::<wire::IceSignal>(frame.payload()) else {break};
+                            // Valid in-flight signals can arrive after relay selection. They
+                            // cannot migrate a selected route or become Shell input.
+                            if let Some(peer)=peer.as_mut() {
+                                if peer.add_remote_candidate(&signal).is_err(){break}
+                            }
                         } else if selected==Some(false) && lease.confirmed {
-                            if forward(&terminal,false,frame.payload(),lease.expires).await.is_err(){break}
+                            match forward(&terminal,false,frame.payload(),lease.expires).await {
+                                Ok(Some(reply))=>if lease_send(&mut socket,Frame::text(reply),lease.expires).await.is_err(){break},
+                                Ok(None)=>{},
+                                Err(_)=>break,
+                            }
                         } else {break}
                     },
                     OpCode::Binary if selected==Some(false) && lease.confirmed=>{
@@ -207,7 +224,11 @@ pub(super) async fn session(
                 match event {
                     Ok(PeerEvent::Open)=>open=true,
                     Ok(PeerEvent::Data{binary,data}) if selected==Some(true) && lease.confirmed=>{
-                        if forward(&terminal,binary,&data,lease.expires).await.is_err(){break}
+                        match forward(&terminal,binary,&data,lease.expires).await {
+                            Ok(Some(reply)) if pending.is_none()=>pending=Some((false,reply)),
+                            Ok(_)=>{},
+                            Err(_)=>break,
+                        }
                     },
                     Ok(PeerEvent::Data{..})=>break,
                     Ok(PeerEvent::Closed)|Err(_) if selected.is_none()=>{peer=None;open=false;},
@@ -257,15 +278,19 @@ async fn forward(
     binary: bool,
     data: &[u8],
     expires: Instant,
-) -> Result<(), String> {
+) -> Result<Option<Vec<u8>>, String> {
     if data.is_empty() || data.len() > wire::MAX_DATA || Instant::now() >= expires {
         return Err("invalid or expired terminal input".into());
     }
+    let terminal = terminal.as_ref().ok_or("terminal not attached")?;
     let command = if binary {
         TerminalCommand::Data(data.to_vec())
     } else {
         if data.len() > wire::MAX_CONTROL {
             return Err("terminal control exceeds limit".into());
+        }
+        if let Some(reply) = super::probe_reply(data)? {
+            return Ok(Some(reply));
         }
         let value: wire::Input =
             serde_json::from_slice(data).map_err(|_| "invalid terminal control")?;
@@ -274,17 +299,11 @@ async fn forward(
         }
         TerminalCommand::Control(value)
     };
-    tokio::time::timeout_at(
-        expires.into(),
-        terminal
-            .as_ref()
-            .ok_or("terminal not attached")?
-            .input
-            .send(command),
-    )
-    .await
-    .map_err(|_| "terminal lease expired during backpressure")?
-    .map_err(|_| "terminal closed".into())
+    tokio::time::timeout_at(expires.into(), terminal.input.send(command))
+        .await
+        .map_err(|_| "terminal lease expired during backpressure")?
+        .map_err(|_| "terminal closed".to_owned())?;
+    Ok(None)
 }
 
 #[cfg(test)]

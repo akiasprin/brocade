@@ -380,7 +380,8 @@ export interface CvmTerminalCredentials {
   expires_in_seconds: number;
   max_sessions_per_node: number;
   history_bytes: number;
-  webrtc?: { supported: boolean; stun_servers: string[] };
+  webrtc?: { supported: boolean; stun_servers: string[]; trickle?: boolean };
+  latency_supported?: boolean;
 }
 export interface CvmTerminalSession {
   id: string;
