@@ -24,7 +24,6 @@ import {
 import { syncFavicon } from './ui/branding';
 import { initialNodeDetailFromHash, initialPaneFromHash, preloadPaneForHash } from './panes/preload';
 import { draft } from './draft';
-import { clearRetiredMachineOrder } from './retired-machine-order';
 
 const WebShellWindow = __BROCADE_CVM__ ? lazy(() => import('./panes/cvm/terminal-window')) : null;
 
@@ -70,7 +69,6 @@ function prefetchInitialRouteData(queryClient: QueryClient, hash: string, sessio
 export type { Session } from './session';
 
 export function App() {
-  useEffect(clearRetiredMachineOrder, []);
   const queryClient = useQueryClient();
   const brandingQuery = useQuery({
     queryKey: ['branding'],

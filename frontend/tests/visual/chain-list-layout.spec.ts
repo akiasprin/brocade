@@ -88,7 +88,7 @@ test('390px touch viewport preserves the production card width', async ({ browse
   }
 });
 
-test('page tabs support keyboard navigation, association and stored choice', async ({ page }) => {
+test('page tabs support keyboard navigation and reload from cards', async ({ page }) => {
   const errors = await openCards(page, 1440);
   const tabs = page.getByRole('tablist', { name: '线路视图' });
   const cards = tabs.getByRole('tab', { name: '卡片', exact: true });
@@ -107,8 +107,11 @@ test('page tabs support keyboard navigation, association and stored choice', asy
     await expect(panel).toHaveAttribute('aria-labelledby', (await selected.getAttribute('id'))!);
   }
   await unlock.click();
-  expect(await page.evaluate(() => localStorage.getItem('brocade-console:chain-view'))).toBe('unlock');
   await expect(page.getByRole('table', { name: /线路服务解锁/ })).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem('brocade-console:chain-view'))).toBeNull();
+  await page.reload();
+  await expect(page.getByRole('tab', { name: '卡片', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('.chain-card')).toHaveCount(16);
   await cards.click();
   await page.locator('.chain-card[data-order-id="hk-direct"]').click();
   await expect(page.getByRole('heading', { level: 1, name: '香港 直出' })).toBeVisible();

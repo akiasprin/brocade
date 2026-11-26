@@ -4234,21 +4234,10 @@ type ChainListView = (typeof CHAIN_LIST_VIEWS)[number]['key'];
 
 function ChainList({ go }: { go: (d: Drill) => void }) {
   const pressCard = useCardPressFeedback();
-  const [view, setView] = useState<'cards' | 'unlock'>(() => {
-    try {
-      return localStorage.getItem('brocade-console:chain-view') === 'unlock' ? 'unlock' : 'cards';
-    } catch {
-      return 'cards';
-    }
-  });
-  const changeView = (next: 'cards' | 'unlock') => {
-    setView(next);
-    try {
-      localStorage.setItem('brocade-console:chain-view', next);
-    } catch {
-      /* Preference storage may be unavailable; the current view still works. */
-    }
-  };
+  // Unlock is a diagnostic detour rather than the operator's default workspace. A new page load
+  // always starts from cards so an old diagnostic choice cannot unexpectedly replace the route's
+  // primary content.
+  const [view, changeView] = useState<'cards' | 'unlock'>('cards');
   const tabIdBase = useId();
   const tabId = (key: ChainListView) => `${tabIdBase}-${key}-tab`;
   const panelId = `${tabIdBase}-panel`;

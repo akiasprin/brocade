@@ -402,12 +402,25 @@ class SilentEventSource extends EventTarget {
 Object.defineProperty(window, 'EventSource', { value: SilentEventSource, configurable: true });
 
 if (!location.hash) history.replaceState(null, '', `${location.search}#/chains`);
-if (params.get('view') !== 'cards') localStorage.setItem('brocade-console:chain-view', 'unlock');
-else localStorage.setItem('brocade-console:chain-view', 'cards');
 // Compile the requested production pane before mounting the synthetic Console.
 // A cold Vite transform is fixture setup, not the interaction under test.
 await preloadPaneForHash(location.hash);
-createRoot(document.getElementById('root')!).render(
+const root = document.getElementById('root')!;
+if (params.get('view') !== 'cards') {
+  const selectUnlock = () => {
+    const tab = [...root.querySelectorAll<HTMLElement>('[role="tab"]')].find(
+      item => item.textContent?.trim() === '解锁',
+    );
+    if (!tab) return false;
+    tab.click();
+    return true;
+  };
+  const observer = new MutationObserver(() => {
+    if (selectUnlock()) observer.disconnect();
+  });
+  observer.observe(root, { childList: true, subtree: true });
+}
+createRoot(root).render(
   <QueryClientProvider client={client}>
     <App />
   </QueryClientProvider>,
