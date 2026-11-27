@@ -26,7 +26,7 @@ test('发布页面使用页签与驾驶舱结构，不保留旧 dp 命名体系'
   assert.match(deploy, /className="nd-sheet nd-page cgc-page"/);
   assert.match(deploy, /<div className="nd-tabs" role="tablist" aria-label="发布页签">/);
   assert.match(deploy, /className="usage-cockpit cgc-cockpit" role="tabpanel"/);
-  assert.match(cockpit, /className="usage-ledger cgc-ledger"/);
+  assert.match(cockpit, /className=\{`usage-ledger cgc-ledger\$\{className \? ` \$\{className\}` : ''\}`\}/);
   assert.match(styles, /\.cgc-tr\.ok \.cgc-st\s*\{\s*color:\s*var\(--ok\);/);
   assert.match(
     styles,
