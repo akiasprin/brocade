@@ -26,7 +26,11 @@ class CubeBuildTests(unittest.TestCase):
             inputs = [
                 libraries / 'libcap-ng.so',
                 libraries / 'libseccomp.so',
+                include / 'bpf/bpf_core_read.h',
+                include / 'bpf/bpf_endian.h',
+                include / 'bpf/bpf_helper_defs.h',
                 include / 'bpf/bpf_helpers.h',
+                include / 'bpf/bpf_tracing.h',
                 clang,
                 objcopy,
                 go,
@@ -35,6 +39,7 @@ class CubeBuildTests(unittest.TestCase):
             for path in inputs:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.touch()
+            (include / 'bpf/bpf_helper_defs.h').write_text('static long (* const bpf_loop)(void);\n')
             (root / 'components/cube/.go-version').write_text('1.27.4\n')
             (root / 'components/cube/Cubelet/third_party').mkdir(parents=True)
             output = root / 'target/cube/artifacts/x86_64'
@@ -91,6 +96,29 @@ class CubeBuildTests(unittest.TestCase):
             )
             for stage in {*generated, 'cow-cgo-archive'}:
                 self.assertNotIn('CPATH', environments[stage], stage)
+
+    def test_bpf_headers_require_loop_helper_and_record_digests(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent / '.tools') as directory:
+            include = Path(directory) / 'include'
+            bpf = include / 'bpf'
+            bpf.mkdir(parents=True)
+            for name in ['bpf_core_read.h', 'bpf_endian.h', 'bpf_helper_defs.h', 'bpf_helpers.h', 'bpf_tracing.h']:
+                (bpf / name).touch()
+            with self.assertRaisesRegex(ValueError, 'does not declare required bpf_loop'):
+                BUILD.bpf_header_inputs(include)
+            (bpf / 'bpf_helper_defs.h').write_text('static long (* const bpf_loop)(void);\n')
+            inputs = BUILD.bpf_header_inputs(include)
+            self.assertEqual(
+                set(inputs),
+                {
+                    'bpf/bpf_core_read.h',
+                    'bpf/bpf_endian.h',
+                    'bpf/bpf_helper_defs.h',
+                    'bpf/bpf_helpers.h',
+                    'bpf/bpf_tracing.h',
+                },
+            )
+            self.assertTrue(all(len(value) == 64 for value in inputs.values()))
 
 
 if __name__ == '__main__':

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import shutil
 import subprocess
@@ -32,6 +33,26 @@ def digest(path):
         while chunk := stream.read(1024 * 1024):
             h.update(chunk)
     return h.hexdigest()
+
+
+def bpf_header_inputs(include):
+    include = Path(include).resolve()
+    directory = include / 'bpf'
+    required = [
+        directory / name
+        for name in ['bpf_core_read.h', 'bpf_endian.h', 'bpf_helper_defs.h', 'bpf_helpers.h', 'bpf_tracing.h']
+    ]
+    for path in required:
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f'required BPF build input is missing or not a regular file: {path}')
+    helper_definitions = directory / 'bpf_helper_defs.h'
+    if not re.search(rb'\(\*\s*(?:const\s+)?bpf_loop\)\s*\(', helper_definitions.read_bytes()):
+        raise ValueError(f'BPF build input does not declare required bpf_loop helper: {helper_definitions}')
+    headers = sorted(directory.glob('*.h'))
+    for path in headers:
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f'BPF build input is not a regular file: {path}')
+    return {str(path.relative_to(include)): digest(path) for path in headers}
 
 
 def source_digest(root):
@@ -152,9 +173,13 @@ def main():
     objcopy = args.clang.with_name('llvm-objcopy')
     libraries = args.sysroot_libs.resolve()
     dependencies = [libraries / 'libcap-ng.so', libraries / 'libseccomp.so']
-    for path in [*dependencies, args.clang, objcopy, args.bpf_include / 'bpf/bpf_helpers.h']:
+    for path in [*dependencies, args.clang, objcopy]:
         if not path.is_file():
             parser.error(f'required build input is missing: {path}')
+    try:
+        bpf_headers = bpf_header_inputs(args.bpf_include)
+    except ValueError as error:
+        parser.error(str(error))
     try:
         requirements = {path.name: validate_elf(path, args.arch, args.glibc) for path in dependencies}
     except ValueError as error:
@@ -193,6 +218,7 @@ def main():
             'protocols': ['protected-root-v1', 'cubevs-attachments-v2', 'guest-pty-v1'],
             'tools': {'go': version, 'rust': '1.96.0', 'clang': str(args.clang), 'gnuLibcBaseline': args.glibc},
             'nativeLibraryInputs': {str(p): digest(p) for p in dependencies},
+            'bpfHeaderInputs': bpf_headers,
             'elfRequirements': {'nativeLibraries': requirements, 'artifacts': {}},
         }
         atomic_json(manifest, record)
