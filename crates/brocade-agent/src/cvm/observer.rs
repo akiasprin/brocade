@@ -12,6 +12,8 @@ pub(super) fn spawn(options: Options) -> Result<(), String> {
     thread::Builder::new()
         .name("cvm-observer".into())
         .spawn(move || {
+            let mut wake =
+                crate::wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Desired);
             let mut previous_error = String::new();
             loop {
                 let started = Instant::now();
@@ -19,9 +21,12 @@ pub(super) fn spawn(options: Options) -> Result<(), String> {
                     Ok(active) => {
                         previous_error.clear();
                         if active {
-                            15
+                            (Duration::from_secs(15), Duration::from_secs(15))
                         } else {
-                            60
+                            (
+                                Duration::from_secs(15),
+                                super::idle_poll_interval(&options, "observer"),
+                            )
                         }
                     }
                     Err(error) => {
@@ -29,10 +34,13 @@ pub(super) fn spawn(options: Options) -> Result<(), String> {
                             eprintln!("cvm observation: {error}");
                             previous_error = error;
                         }
-                        30
+                        (Duration::from_secs(30), Duration::from_secs(30))
                     }
                 };
-                thread::sleep(Duration::from_secs(wait).saturating_sub(started.elapsed()));
+                wake.wait_connected(
+                    wait.0.saturating_sub(started.elapsed()),
+                    wait.1.saturating_sub(started.elapsed()),
+                );
             }
         })
         .map_err(|e| format!("cannot spawn CVM observer: {e}"))?;

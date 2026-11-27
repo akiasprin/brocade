@@ -383,6 +383,76 @@ fn progress(stream: &mut TcpStream, last: &mut Instant) -> Result<(), String> {
     }
     Ok(())
 }
+const POLICY_SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const CONNECTED_POLICY_SYNC_MIN_SECS: u64 = 4;
+const CONNECTED_POLICY_SYNC_JITTER_SECS: u64 = 2;
+const SUPPORT_SYNC_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const CONNECTED_SUPPORT_SYNC_MIN_SECS: u64 = 45;
+const CONNECTED_SUPPORT_SYNC_JITTER_SECS: u64 = 10;
+
+fn policy_sync_intervals(options: &Options, synchronized: bool) -> (Duration, Duration) {
+    if !synchronized {
+        return (POLICY_SYNC_RETRY_INTERVAL, POLICY_SYNC_RETRY_INTERVAL);
+    }
+    (
+        POLICY_SYNC_RETRY_INTERVAL,
+        crate::wake::stable_poll_interval(
+            &options.token,
+            "user-traffic-policies",
+            CONNECTED_POLICY_SYNC_MIN_SECS,
+            CONNECTED_POLICY_SYNC_JITTER_SECS,
+        ),
+    )
+}
+
+fn support_sync_intervals(options: &Options, synchronized: bool) -> (Duration, Duration) {
+    if !synchronized {
+        return (SUPPORT_SYNC_RETRY_INTERVAL, SUPPORT_SYNC_RETRY_INTERVAL);
+    }
+    (
+        SUPPORT_SYNC_RETRY_INTERVAL,
+        crate::wake::stable_poll_interval(
+            &options.token,
+            "user-traffic-support",
+            CONNECTED_SUPPORT_SYNC_MIN_SECS,
+            CONNECTED_SUPPORT_SYNC_JITTER_SECS,
+        ),
+    )
+}
+
+fn synchronize_support(options: &Options) -> Result<(), String> {
+    initialize(options)?;
+    if options.state_dir.join("xray.disabled").exists() {
+        return Ok(());
+    }
+    let report = if supported(&options.state_dir)? {
+        "true"
+    } else {
+        "false"
+    };
+    let client = HttpClient::new(&options.server)?;
+    let response = client.request_timeout(
+        "POST",
+        "/agent/v1/user-traffic/support",
+        &options.token,
+        Some(report),
+        Duration::from_secs(2),
+    )?;
+    if response.status != 200 {
+        return Err(format!(
+            "user traffic support request failed: HTTP {}",
+            response.status
+        ));
+    }
+    let required = serde_json::from_str::<bool>(&response.body)
+        .map_err(|_| "invalid user traffic support response".to_owned())?;
+    crate::fsutil::atomic_write_private(
+        &required_path(&options.state_dir),
+        if required { b"true" } else { b"false" },
+    )
+    .map_err(|error| format!("user traffic requirement checkpoint: {error}"))
+}
+
 pub(crate) fn spawn(options: Options) -> Result<(), String> {
     if let Err(error) = initialize(&options) {
         eprintln!("user traffic initialization: {error}");
@@ -395,51 +465,46 @@ pub(crate) fn spawn(options: Options) -> Result<(), String> {
                 brocade_deployment::agent_channel::WakeDomain::UserTraffic,
             );
             loop {
-                if let Some(service) = SERVICE.get() {
-                    if let Err(error) = synchronize(service) {
-                        eprintln!("user traffic policies: {error}");
+                let synchronized = if let Some(service) = SERVICE.get() {
+                    match synchronize(service) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            eprintln!("user traffic policies: {error}");
+                            false
+                        }
                     }
                 } else {
-                    let _ = initialize(&policy_options);
-                }
-                // Refresh policy changes independently; forwarding keeps the last durable policy.
-                wake.wait(Duration::from_secs(1));
+                    if let Err(error) = initialize(&policy_options) {
+                        eprintln!("user traffic policies: {error}");
+                    }
+                    false
+                };
+                // Realtime changes apply immediately. A short connected fallback preserves the
+                // ten-second policy lease, while disconnects and failed rounds keep the original
+                // one-second retry instead of turning a transient error into a stale policy.
+                let (disconnected, connected) =
+                    policy_sync_intervals(&policy_options, synchronized);
+                wake.wait_connected(disconnected, connected);
             }
         })
         .map_err(|_| "user traffic policy worker")?;
     thread::Builder::new()
         .name("user-traffic-support".into())
-        .spawn(move || loop {
-            if let Err(error) = initialize(&options) {
-                eprintln!("user traffic initialization: {error}");
-            }
-            if options.state_dir.join("xray.disabled").exists() {
-                thread::sleep(Duration::from_secs(15));
-                continue;
-            }
-            let ready = supported(&options.state_dir).unwrap_or(false);
-            let report = if ready { "true" } else { "false" };
-            if let Ok(client) = HttpClient::new(&options.server) {
-                if let Ok(response) = client.request_timeout(
-                    "POST",
-                    "/agent/v1/user-traffic/support",
-                    &options.token,
-                    Some(report),
-                    Duration::from_secs(2),
-                ) {
-                    if response.status == 200 {
-                        if let Ok(required) = serde_json::from_str::<bool>(&response.body) {
-                            if let Err(error) = crate::fsutil::atomic_write_private(
-                                &required_path(&options.state_dir),
-                                if required { b"true" } else { b"false" },
-                            ) {
-                                eprintln!("user traffic requirement checkpoint: {error}");
-                            }
-                        }
+        .spawn(move || {
+            let mut wake = crate::wake::Cursor::new(
+                brocade_deployment::agent_channel::WakeDomain::UserTraffic,
+            );
+            loop {
+                let synchronized = match synchronize_support(&options) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        eprintln!("user traffic support: {error}");
+                        false
                     }
-                }
+                };
+                let (disconnected, connected) = support_sync_intervals(&options, synchronized);
+                wake.wait_connected(disconnected, connected);
             }
-            thread::sleep(Duration::from_secs(15));
         })
         .map_err(|_| "user traffic support worker")?;
     Ok(())

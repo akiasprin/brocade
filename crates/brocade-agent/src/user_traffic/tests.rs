@@ -23,6 +23,55 @@ fn free_port() -> u16 {
         .unwrap()
         .port()
 }
+
+#[test]
+fn policy_sync_only_backs_off_after_a_successful_connected_round() {
+    let options = Options {
+        command: "run".into(),
+        server: "http://127.0.0.1".into(),
+        token: "fixture-token".into(),
+        state_dir: PathBuf::new(),
+        apply_mode: crate::ApplyMode::StateDir,
+        vpngate_stats_window: Duration::from_secs(900),
+    };
+    assert_eq!(
+        policy_sync_intervals(&options, false),
+        (POLICY_SYNC_RETRY_INTERVAL, POLICY_SYNC_RETRY_INTERVAL)
+    );
+    let successful = policy_sync_intervals(&options, true);
+    assert_eq!(successful.0, POLICY_SYNC_RETRY_INTERVAL);
+    assert!((Duration::from_secs(CONNECTED_POLICY_SYNC_MIN_SECS)
+        ..=Duration::from_secs(
+            CONNECTED_POLICY_SYNC_MIN_SECS + CONNECTED_POLICY_SYNC_JITTER_SECS,
+        ))
+        .contains(&successful.1));
+    assert_eq!(successful, policy_sync_intervals(&options, true));
+}
+
+#[test]
+fn support_sync_only_backs_off_after_a_successful_connected_round() {
+    let options = Options {
+        command: "run".into(),
+        server: "http://127.0.0.1".into(),
+        token: "fixture-token".into(),
+        state_dir: PathBuf::new(),
+        apply_mode: crate::ApplyMode::StateDir,
+        vpngate_stats_window: Duration::from_secs(900),
+    };
+    assert_eq!(
+        support_sync_intervals(&options, false),
+        (SUPPORT_SYNC_RETRY_INTERVAL, SUPPORT_SYNC_RETRY_INTERVAL)
+    );
+    let successful = support_sync_intervals(&options, true);
+    assert_eq!(successful.0, SUPPORT_SYNC_RETRY_INTERVAL);
+    assert!((Duration::from_secs(CONNECTED_SUPPORT_SYNC_MIN_SECS)
+        ..=Duration::from_secs(
+            CONNECTED_SUPPORT_SYNC_MIN_SECS + CONNECTED_SUPPORT_SYNC_JITTER_SECS,
+        ))
+        .contains(&successful.1));
+    assert_eq!(successful, support_sync_intervals(&options, true));
+}
+
 fn console(mode: Arc<AtomicU8>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

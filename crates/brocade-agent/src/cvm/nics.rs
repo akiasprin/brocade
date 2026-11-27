@@ -52,6 +52,9 @@ pub(super) fn private_dir(path: &Path) -> Result<()> {
 fn desired_path(root: &Path) -> PathBuf {
     root.join("cvm-nics-desired.json")
 }
+fn carries_authority(desired: &NicDesired) -> bool {
+    !desired.bindings.is_empty() || !desired.fences.is_empty()
+}
 fn snapshot(root: &Path) -> Result<NicDesired> {
     let Some(bytes) = read_bounded(&desired_path(root), 16 * 1024 * 1024)? else {
         return Ok(NicDesired::default());
@@ -440,8 +443,11 @@ pub(super) fn spawn(options: Options) -> Result<()> {
                 crate::wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Desired);
             let mut previous = String::new();
             loop {
-                match round(&options) {
-                    Ok(()) => previous.clear(),
+                let idle = match round(&options) {
+                    Ok(active) => {
+                        previous.clear();
+                        !active
+                    }
                     Err(error) => {
                         if let Err(restore) = restore_saved(&options) {
                             if restore != previous {
@@ -452,9 +458,17 @@ pub(super) fn spawn(options: Options) -> Result<()> {
                             eprintln!("cvm-nics: {error}");
                             previous = error;
                         }
+                        false
                     }
+                };
+                if idle {
+                    wake.wait_connected(
+                        Duration::from_secs(15),
+                        super::idle_poll_interval(&options, "nics"),
+                    );
+                } else {
+                    wake.wait(Duration::from_secs(15));
                 }
-                wake.wait(Duration::from_secs(15));
             }
         })
         .map_err(|_| "cannot start allocated NIC worker".to_owned())?;
@@ -480,7 +494,7 @@ fn revoke_cached(root: &Path) -> Result<()> {
         &serde_json::to_vec(&revoked).map_err(|_| "cannot persist withdrawn NIC authority")?,
     )
 }
-fn round(options: &Options) -> Result<()> {
+fn round(options: &Options) -> Result<bool> {
     private_dir(&options.state_dir.join("cvm-nics"))?;
     if read_bounded(&authority_path(&options.state_dir), 128)?.as_deref()
         != Some(authority(options).as_bytes())
@@ -493,7 +507,7 @@ fn round(options: &Options) -> Result<()> {
     // A failed inventory upload must not prevent reading revocation or restoring data.
 
     if options.apply_mode == ApplyMode::Linux && super::maintenance()? {
-        return Ok(());
+        return Ok(false);
     }
     let response = client.request("GET", "/agent/v1/cvm/nics/desired", &options.token, None)?;
     if matches!(response.status, 401 | 403) {
@@ -513,7 +527,10 @@ fn round(options: &Options) -> Result<()> {
         authority(options).as_bytes(),
     )?;
     let previous = snapshot(&options.state_dir)?;
-    if desired.node_id == previous.node_id && desired.generation < previous.generation {
+    if desired.node_id == previous.node_id
+        && desired.generation < previous.generation
+        && carries_authority(&desired)
+    {
         return Err("stale NIC desired generation rejected".into());
     }
     if desired.bindings.is_empty()
@@ -541,7 +558,7 @@ fn round(options: &Options) -> Result<()> {
         } else {
             Ok(())
         };
-        return inventory_result.and(reported);
+        return inventory_result.and(reported).map(|()| false);
     }
     local_management_networks(&mut desired)?;
 
@@ -631,7 +648,7 @@ fn round(options: &Options) -> Result<()> {
             )
         },
     );
-    inventory_result.and(reported)
+    inventory_result.and(reported).map(|()| true)
 }
 
 /// Finish the bounded sweep even when one endpoint fails. Reporting and offline

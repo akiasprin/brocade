@@ -278,6 +278,38 @@ impl SubscriptionRenderRuntime {
         Ok(candidate)
     }
 
+    /// Wait for and return the exact generation currently named by durable Serving state.
+    /// Public pulls deliberately use [`Self::current`] so they never block behind a replacement
+    /// render; maintenance workflows use this stronger boundary before accepting evidence as
+    /// current.
+    pub(crate) async fn current_fresh(
+        self: &Arc<Self>,
+        pool: &PgPool,
+    ) -> Result<Arc<RenderedSubscriptionServing>> {
+        let _guard = self.build_lock.lock().await;
+        for _ in 0..BACKGROUND_REFRESH_ATTEMPTS {
+            let desired_epoch = self.desired_epoch.load(Ordering::Acquire);
+            let desired_generation = crate::serving::subscription_generation(pool).await?;
+            if let Some(ready) = self.ready() {
+                if ready.generation == desired_generation && ready.runtime_epoch == desired_epoch {
+                    return Ok(ready);
+                }
+            }
+
+            let candidate = Arc::new(build_serving(pool, desired_epoch).await?);
+            let latest_generation = crate::serving::subscription_generation(pool).await?;
+            let latest_epoch = self.desired_epoch.load(Ordering::Acquire);
+            if candidate.generation == latest_generation && candidate.runtime_epoch == latest_epoch
+            {
+                self.install(Arc::clone(&candidate));
+                return Ok(candidate);
+            }
+        }
+        Err(StoreError::Unavailable(
+            "订阅产物在核验期间持续更新，请稍后重试".to_owned(),
+        ))
+    }
+
     pub(crate) fn invalidate_and_schedule(self: &Arc<Self>, pool: PgPool) {
         self.desired_epoch.fetch_add(1, Ordering::AcqRel);
         self.schedule(pool);
@@ -428,6 +460,12 @@ fn build_serving_sync(
 impl PgStore {
     pub(crate) async fn rendered_subscriptions(&self) -> Result<Arc<RenderedSubscriptionServing>> {
         self.subscription_render.current(&self.pool).await
+    }
+
+    pub(crate) async fn freshly_rendered_subscriptions(
+        &self,
+    ) -> Result<Arc<RenderedSubscriptionServing>> {
+        self.subscription_render.current_fresh(&self.pool).await
     }
 
     pub(crate) fn refresh_rendered_subscriptions(&self) {

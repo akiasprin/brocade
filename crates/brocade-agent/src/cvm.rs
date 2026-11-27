@@ -12,6 +12,20 @@ mod reconcile;
 pub(crate) mod stack;
 mod terminal;
 
+const IDLE_POLL_MIN_SECS: u64 = 45;
+const IDLE_POLL_JITTER_SECS: u64 = 30;
+
+/// Spread idle fallback polls across the fleet. The realtime desired-state wake remains the
+/// primary path; this interval only bounds recovery when a wake is missed while connected.
+fn idle_poll_interval(options: &crate::options::Options, domain: &str) -> std::time::Duration {
+    crate::wake::stable_poll_interval(
+        &options.token,
+        &format!("cvm-{domain}"),
+        IDLE_POLL_MIN_SECS,
+        IDLE_POLL_JITTER_SECS,
+    )
+}
+
 pub(crate) fn check(args: &[String]) -> Result<(), String> {
     if args == ["--baremetal-chain-contract"] {
         println!("brocade-host-chain-egress-v1");
@@ -144,6 +158,31 @@ pub(crate) fn native_chain_configured() -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::options::{ApplyMode, Options};
+    use std::time::Duration;
+
+    fn options(token: &str) -> Options {
+        Options {
+            command: "run".into(),
+            server: "http://127.0.0.1".into(),
+            token: token.into(),
+            state_dir: std::env::temp_dir(),
+            apply_mode: ApplyMode::StateDir,
+            vpngate_stats_window: Duration::from_secs(900),
+        }
+    }
+
+    #[test]
+    fn idle_fallback_is_stable_and_bounded_per_worker() {
+        let options = options("fixture-token");
+        for domain in ["nics", "entries", "reconcile", "observer"] {
+            let interval = super::idle_poll_interval(&options, domain);
+            assert_eq!(interval, super::idle_poll_interval(&options, domain));
+            assert!(interval >= Duration::from_secs(45));
+            assert!(interval <= Duration::from_secs(75));
+        }
+    }
+
     #[test]
     fn host_transition_fences_cvm_until_commit_and_rejects_corrupt_state() {
         let root =

@@ -163,6 +163,32 @@ pub async fn clash_subscription_for_user(
     .await
 }
 
+/// Resolve the latest complete Serving materialization for maintenance evidence. Unlike public
+/// pulls, this waits for a replacement generation instead of returning the previous complete one.
+pub async fn fresh_clash_subscription_for_user(
+    store: &PgStore,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<DynamicClashSubscription> {
+    let tenant_id = required_text(tenant_id, "tenant_id")?;
+    let user_id = required_text(user_id, "user id")?;
+    actor.require_tenant_access(&tenant_id, "Clash subscription")?;
+    let user = store
+        .freshly_rendered_subscriptions()
+        .await?
+        .user(&tenant_id, &user_id)
+        .ok_or_else(|| StoreError::NotFound(format!("user {tenant_id}/{user_id}")))?;
+    build_rendered_clash(
+        store.pool(),
+        &user,
+        SubscriptionFilter::default(),
+        DynamicClashTemplate::Standard,
+        false,
+    )
+    .await
+}
+
 /// Read the durable link separately from the generated subscription. A missing row means the
 /// operator has never generated a Haitun URL; a row with `revoked_at` preserves that useful UI
 /// distinction without leaving the old token live.

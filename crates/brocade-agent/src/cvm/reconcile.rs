@@ -21,9 +21,12 @@ pub(super) fn spawn(options: Options) -> Result<(), String> {
                         failures = 0;
                         previous_error.clear();
                         if active {
-                            Duration::from_secs(15)
+                            (Duration::from_secs(15), Duration::from_secs(15))
                         } else {
-                            Duration::from_secs(60)
+                            (
+                                Duration::from_secs(15),
+                                super::idle_poll_interval(&options, "reconcile"),
+                            )
                         }
                     }
                     Err(error) => {
@@ -32,10 +35,13 @@ pub(super) fn spawn(options: Options) -> Result<(), String> {
                             previous_error = error;
                         }
                         failures = failures.saturating_add(1);
-                        Duration::from_secs((5u64.saturating_mul(1u64 << failures.min(5))).min(120))
+                        let retry = Duration::from_secs(
+                            (5u64.saturating_mul(1u64 << failures.min(5))).min(120),
+                        );
+                        (retry, retry)
                     }
                 };
-                wake.wait(interval);
+                wake.wait_connected(interval.0, interval.1);
             }
         })
         .map_err(|e| format!("cannot spawn CVM worker: {e}"))?;

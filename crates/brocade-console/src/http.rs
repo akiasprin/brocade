@@ -6451,15 +6451,21 @@ async fn with_source_locations<T: Serialize>(
     }))
 }
 
+#[derive(Default, Deserialize)]
+struct UserOnlineSourceHistoryQuery {
+    before: Option<String>,
+}
+
 async fn user_online_source_history(
     State(state): State<AppState>,
     Path((tenant_id, user_id)): Path<(String, String)>,
+    Query(query): Query<UserOnlineSourceHistoryQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     let result = state
         .store
-        .user_online_source_history(&admin, &tenant_id, &user_id)
+        .user_online_source_history_page(&admin, &tenant_id, &user_id, query.before.as_deref())
         .await?;
     let addresses = result
         .sources
@@ -10328,7 +10334,7 @@ mod tests {
         });
         for data in [
             serde_json::json!({"freshness_secs": 120, "users": [{"sources": [source.clone()]}]}),
-            serde_json::json!({"retention_days": 30, "truncated": false, "sources": [source]}),
+            serde_json::json!({"retention_days": 30, "truncated": true, "next_cursor": "1760000000123456:42", "sources": [source]}),
             serde_json::json!({
                 "revision": 7,
                 "ips": ["2001:db8::1"],

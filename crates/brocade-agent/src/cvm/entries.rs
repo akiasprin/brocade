@@ -36,6 +36,9 @@ static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 fn desired_path(root: &Path) -> PathBuf {
     root.join("cvm-entries-desired.json")
 }
+fn carries_authority(desired: &EntryDesired) -> bool {
+    !desired.rules.is_empty() || !desired.deliveries.is_empty() || !desired.tunnels.is_empty()
+}
 fn snapshot(root: &Path) -> Result<EntryDesired> {
     let Some(bytes) = read_bounded(&desired_path(root), 16 * 1024 * 1024)? else {
         return Ok(EntryDesired::default());
@@ -100,34 +103,46 @@ pub(super) fn spawn(options: Options) -> Result<()> {
                 crate::wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Desired);
             let mut previous = String::new();
             loop {
-                if let Err(error) = round(&options) {
-                    // The Console may be unreachable: keep the last proven state applied.
-                    if linux(&options) {
-                        if let Ok(saved) = snapshot(&options.state_dir) {
-                            if !saved.node_id.is_empty()
-                                || flows::has_checkpoint(&options.state_dir)
-                            {
-                                converge(&options.state_dir, &saved);
+                let idle = match round(&options) {
+                    Ok(active) => {
+                        previous.clear();
+                        !active
+                    }
+                    Err(error) => {
+                        // The Console may be unreachable: keep the last proven state applied.
+                        if linux(&options) {
+                            if let Ok(saved) = snapshot(&options.state_dir) {
+                                if !saved.node_id.is_empty()
+                                    || flows::has_checkpoint(&options.state_dir)
+                                {
+                                    converge(&options.state_dir, &saved);
+                                }
                             }
                         }
+                        if error != previous {
+                            eprintln!("cvm-entries: {error}");
+                            previous = error;
+                        }
+                        false
                     }
-                    if error != previous {
-                        eprintln!("cvm-entries: {error}");
-                        previous = error;
-                    }
+                };
+                if idle {
+                    wake.wait_connected(
+                        Duration::from_secs(15),
+                        super::idle_poll_interval(&options, "entries"),
+                    );
                 } else {
-                    previous.clear();
+                    wake.wait(Duration::from_secs(15));
                 }
-                wake.wait(Duration::from_secs(15));
             }
         })
         .map_err(|_| "cannot start entry worker".to_owned())?;
     Ok(())
 }
 
-pub(super) fn round(options: &Options) -> Result<()> {
+pub(super) fn round(options: &Options) -> Result<bool> {
     if options.apply_mode == ApplyMode::Linux && super::maintenance()? {
-        return Ok(());
+        return Ok(false);
     }
     let client = HttpClient::new(&options.server)?;
     let response = client.request("GET", "/agent/v1/cvm/entries/desired", &options.token, None)?;
@@ -155,12 +170,17 @@ pub(super) fn round(options: &Options) -> Result<()> {
     desired.validate()?;
     let previous = snapshot(&options.state_dir)?;
     flows::seed(&options.state_dir, &previous)?;
-    if desired.node_id == previous.node_id && desired.generation < previous.generation {
+    if desired.node_id == previous.node_id
+        && desired.generation < previous.generation
+        && carries_authority(&desired)
+    {
         return Err("stale entry desired generation rejected".into());
     }
     if desired.generation == 0 && previous.node_id.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
+    let active =
+        !desired.rules.is_empty() || !desired.deliveries.is_empty() || !desired.tunnels.is_empty();
     persist(&options.state_dir, &desired)?;
     let report = if linux(options) {
         converge(&options.state_dir, &desired)
@@ -183,7 +203,7 @@ pub(super) fn round(options: &Options) -> Result<()> {
     }
     match &report.error {
         Some(error) => Err(error.clone()),
-        None => Ok(()),
+        None => Ok(active),
     }
 }
 

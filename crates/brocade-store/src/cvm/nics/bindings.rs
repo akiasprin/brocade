@@ -508,8 +508,24 @@ impl PgStore {
         if report.bindings.len() > MAX_NETWORK_BINDINGS * 2 {
             return Err(invalid("网卡回报超出数量上限"));
         }
+        let report_value = serde_json::to_value(&report)?;
         let mut tx = self.pool.begin().await?;
         crate::cvm::releases::lock(&mut tx).await?;
+        // The dispatch barrier is written under the same release lock. Check for an idle
+        // duplicate only after acquiring it, otherwise an uncommitted dispatch can be missed and
+        // the new deployment waits until the next periodic report for its first receipt.
+        if report.bindings.is_empty()
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT report IS NOT DISTINCT FROM $2 AND report_received_at IS NOT NULL AND report_received_at>=coalesce((SELECT max(dispatched_at) FROM deployment_target_state WHERE node_id=$1),'-infinity'::timestamptz) FROM cvm_nic_nodes WHERE node_id=$1",
+            )
+            .bind(node)
+            .bind(&report_value)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
         let published = crate::cvm::releases::serving_tx(&mut tx, node).await?;
         if published
             .as_ref()
@@ -657,7 +673,7 @@ impl PgStore {
         }
         sqlx::query("UPDATE cvm_nic_nodes SET report=$2,report_received_at=now() WHERE node_id=$1")
             .bind(node)
-            .bind(serde_json::to_value(&report)?)
+            .bind(report_value)
             .execute(&mut *tx)
             .await?;
         let participants:Vec<String>=sqlx::query_scalar("SELECT provider_node FROM cvm_nic_bindings WHERE provider_node=$1 OR consumer_node=$1 UNION SELECT consumer_node FROM cvm_nic_bindings WHERE provider_node=$1 OR consumer_node=$1 UNION SELECT $1::text").bind(node).fetch_all(&mut *tx).await?;

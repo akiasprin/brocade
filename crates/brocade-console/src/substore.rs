@@ -561,7 +561,7 @@ async fn perform(
     r.output_count = Some(array.len());
     // A newer serving generation makes the receipt historical evidence, never current success.
     let current = store
-        .clash_subscription_for_user(&admin, tenant, user)
+        .fresh_clash_subscription_for_user(&admin, tenant, user)
         .await
         .map_err(|_| Failure::new("无法读取当前生效订阅"))?;
     if current.revision != subscription.revision

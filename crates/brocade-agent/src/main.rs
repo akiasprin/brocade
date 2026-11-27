@@ -1623,6 +1623,8 @@ fn health(state_dir: &Path) -> Result<(), String> {
 // unexpected restart can lose. They therefore run on two threads rather than one loop
 // alternating between two tasks.
 const APPLY_INTERVAL: Duration = Duration::from_secs(15);
+const CONNECTED_APPLY_POLL_MIN_SECS: u64 = 45;
+const CONNECTED_APPLY_POLL_JITTER_SECS: u64 = 30;
 const XRAY_GUARD_INTERVAL: Duration = Duration::from_secs(1);
 const XRAY_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 const USAGE_INTERVAL: Duration = Duration::from_secs(30);
@@ -1648,6 +1650,18 @@ const E2E_TARGETS_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 /// interval learns a policy change promptly, without putting a GET in front of every observation.
 const PING_PROBE_SETTINGS_INTERVAL: Duration = Duration::from_secs(15);
 const SPOOL_IDLE_POLL: Duration = Duration::from_secs(1);
+
+fn connected_apply_poll_interval(options: &Options, successful: bool) -> Duration {
+    if !successful {
+        return APPLY_INTERVAL;
+    }
+    wake::stable_poll_interval(
+        &options.token,
+        "desired",
+        CONNECTED_APPLY_POLL_MIN_SECS,
+        CONNECTED_APPLY_POLL_JITTER_SECS,
+    )
+}
 const SPOOL_MAX_RETRY: Duration = Duration::from_secs(60);
 const LATEST_REPORT_RETRY_MIN: Duration = Duration::from_secs(1);
 const LATEST_REPORT_RETRY_MAX: Duration = Duration::from_secs(15);
@@ -2338,6 +2352,7 @@ fn run_forever(options: Options) -> Result<(), String> {
     let maintenance_worker = ip_maintenance::spawn(options.clone())?;
     let mut apply_wake = wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Desired);
     let mut apply_tick = Instant::now();
+    let mut connected_apply_tick = apply_tick;
     loop {
         if TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
             maintenance_worker.request_stop();
@@ -2350,9 +2365,13 @@ fn run_forever(options: Options) -> Result<(), String> {
             println!("收到退出信号，最终流量样本已落盘");
             return Ok(());
         }
-        if let Err(error) = apply_once_locked(&options, &meter) {
-            eprintln!("apply: {error}");
-        }
+        let apply_succeeded = match apply_once_locked(&options, &meter) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("apply: {error}");
+                false
+            }
+        };
         // Checked after the round rather than before the sleep, so that the wait for the service
         // supervisor to restart does not also include a full apply interval.
         //
@@ -2363,8 +2382,9 @@ fn run_forever(options: Options) -> Result<(), String> {
         // Four properties keep this from interrupting traffic: the service definitions stop only
         // the supervised Agent process (`KillMode=process` on systemd and no `stopgroup` on
         // OpenRC), so nohup'd Xray/Phantun children are not killed alongside; wg0 is a kernel
-        // interface and is unaffected; convergence is idempotent and re-runs every 15 seconds; and
-        // anything owed to the control plane is already on disk in the spool.
+        // interface and is unaffected; convergence is idempotent, wakes immediately from the
+        // realtime channel and keeps a 15-second disconnected fallback; and anything owed to the
+        // control plane is already on disk in the spool.
         if TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
             maintenance_worker.request_stop();
             let traffic_result = traffic_worker.finish();
@@ -2396,8 +2416,13 @@ fn run_forever(options: Options) -> Result<(), String> {
         }
         let now = Instant::now();
         apply_tick = next_periodic_tick(apply_tick, APPLY_INTERVAL, now);
-        if apply_wake.wait(apply_tick.saturating_duration_since(now)) {
+        let disconnected_wait = apply_tick.saturating_duration_since(now);
+        let connected_interval = connected_apply_poll_interval(&options, apply_succeeded);
+        connected_apply_tick = next_periodic_tick(connected_apply_tick, connected_interval, now);
+        let connected_wait = connected_apply_tick.saturating_duration_since(now);
+        if apply_wake.wait_connected(disconnected_wait, connected_wait) {
             apply_tick = Instant::now();
+            connected_apply_tick = apply_tick;
         }
     }
 }
@@ -5621,6 +5646,34 @@ fn unknown_state() -> ReportedNodeState {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn desired_poll_only_backs_off_after_a_successful_round() {
+        let options = super::Options {
+            command: "run".into(),
+            server: "http://127.0.0.1".into(),
+            token: "fixture-token".into(),
+            state_dir: std::path::PathBuf::new(),
+            apply_mode: super::ApplyMode::StateDir,
+            vpngate_stats_window: std::time::Duration::from_secs(900),
+        };
+        assert_eq!(
+            super::connected_apply_poll_interval(&options, false),
+            super::APPLY_INTERVAL
+        );
+        let successful = super::connected_apply_poll_interval(&options, true);
+        assert!(
+            (std::time::Duration::from_secs(super::CONNECTED_APPLY_POLL_MIN_SECS)
+                ..=std::time::Duration::from_secs(
+                    super::CONNECTED_APPLY_POLL_MIN_SECS + super::CONNECTED_APPLY_POLL_JITTER_SECS,
+                ))
+                .contains(&successful)
+        );
+        assert_eq!(
+            successful,
+            super::connected_apply_poll_interval(&options, true)
+        );
+    }
 
     pub(crate) fn thread_io_counter(name: &str) -> u64 {
         fs::read_to_string("/proc/thread-self/io")

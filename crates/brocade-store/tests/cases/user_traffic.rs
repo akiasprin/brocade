@@ -34,6 +34,128 @@ fn request(source: &str, id: u8) -> UserBudgetRequest {
         bytes: 16 * 1024 * 1024,
     }
 }
+async fn support_row(db: &TestPg) -> (String, bool, String) {
+    sqlx::query_as(
+        "SELECT xmin::text,user_traffic_supported,user_traffic_support_at::text
+         FROM nodes WHERE id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+async fn policy_ack_row(db: &TestPg) -> (String, Option<String>, Option<String>) {
+    sqlx::query_as(
+        "SELECT xmin::text,user_traffic_applied_hash,user_traffic_policy_seen_at::text
+         FROM nodes WHERE id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn support_heartbeat_skips_duplicates_but_refreshes_changes_and_old_rows() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+
+    let initial = support_row(&db).await;
+    db.store
+        .report_user_traffic_support("n1", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        support_row(&db).await,
+        initial,
+        "a duplicate heartbeat must not rewrite"
+    );
+
+    db.store
+        .report_user_traffic_support("n1", false)
+        .await
+        .unwrap();
+    let changed = support_row(&db).await;
+    assert!(!changed.1);
+    assert_ne!(changed.0, initial.0, "a capability change must be durable");
+
+    sqlx::query(
+        "UPDATE nodes SET user_traffic_support_at=now()-interval '31 seconds' WHERE id='n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let old = support_row(&db).await;
+    db.store
+        .report_user_traffic_support("n1", false)
+        .await
+        .unwrap();
+    let refreshed = support_row(&db).await;
+    assert_eq!(refreshed.1, old.1);
+    assert_ne!(refreshed.0, old.0, "an old heartbeat must refresh");
+    assert_ne!(refreshed.2, old.2);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn policy_ack_skips_fresh_duplicates_but_refreshes_changes_and_old_rows() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let snapshot = db.store.user_traffic_assignments("n1").await.unwrap();
+
+    db.store
+        .acknowledge_user_traffic("n1", &snapshot.sha256)
+        .await
+        .unwrap();
+    let initial = policy_ack_row(&db).await;
+    db.store
+        .acknowledge_user_traffic("n1", &snapshot.sha256)
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_ack_row(&db).await,
+        initial,
+        "a fresh duplicate acknowledgment must not rewrite"
+    );
+
+    sqlx::query(
+        "UPDATE nodes SET user_traffic_policy_seen_at=now()-interval '5 seconds' WHERE id='n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let old = policy_ack_row(&db).await;
+    db.store
+        .acknowledge_user_traffic("n1", &snapshot.sha256)
+        .await
+        .unwrap();
+    let refreshed = policy_ack_row(&db).await;
+    assert_eq!(refreshed.1, old.1);
+    assert_ne!(refreshed.0, old.0, "an old acknowledgment must refresh");
+    assert_ne!(refreshed.2, old.2);
+
+    sqlx::query(
+        "UPDATE nodes SET user_traffic_applied_hash=repeat('0',64),user_traffic_policy_seen_at=now() WHERE id='n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let changed = policy_ack_row(&db).await;
+    db.store
+        .acknowledge_user_traffic("n1", &snapshot.sha256)
+        .await
+        .unwrap();
+    let applied = policy_ack_row(&db).await;
+    assert_eq!(applied.1.as_deref(), Some(snapshot.sha256.as_str()));
+    assert_ne!(
+        applied.0, changed.0,
+        "a changed hash must apply immediately"
+    );
+}
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]

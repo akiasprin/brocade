@@ -26,6 +26,10 @@ pub(crate) struct Record {
     pub(crate) transition: String,
     pub(crate) host_boot_id: String,
     pub(crate) attempted: bool,
+    /// First complete absence proof after an uncertain create. A later proof must be separated
+    /// by the full Cube create deadline before the same deterministic identity may be retried.
+    #[serde(default)]
+    pub(crate) unallocated_absence_since_unix_secs: u64,
     pub(crate) initialized: bool,
     pub(crate) login_revision: u64,
     pub(crate) deleted: bool,

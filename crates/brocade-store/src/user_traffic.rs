@@ -359,7 +359,10 @@ pub async fn enforce(pool: &PgPool) -> Result<usize> {
 
 pub async fn support(pool: &PgPool, node: &str, supported: bool) -> Result<bool> {
     sqlx::query(
-        "UPDATE nodes SET user_traffic_supported=$2,user_traffic_support_at=now() WHERE id=$1",
+        "UPDATE nodes SET user_traffic_supported=$2,user_traffic_support_at=now()
+         WHERE id=$1 AND (user_traffic_supported IS DISTINCT FROM $2
+           OR user_traffic_support_at IS NULL
+           OR user_traffic_support_at<=now()-interval '30 seconds')",
     )
     .bind(node)
     .bind(supported)
@@ -663,6 +666,15 @@ pub async fn acknowledge(pool: &PgPool, node: &str, hash: &str) -> Result<()> {
             "stale user policy acknowledgment".into(),
         ));
     }
-    sqlx::query("UPDATE nodes SET user_traffic_applied_hash=$2,user_traffic_policy_seen_at=now() WHERE id=$1").bind(node).bind(hash).execute(pool).await?;
+    sqlx::query(
+        "UPDATE nodes SET user_traffic_applied_hash=$2,user_traffic_policy_seen_at=now()
+         WHERE id=$1 AND (user_traffic_applied_hash IS DISTINCT FROM $2
+           OR user_traffic_policy_seen_at IS NULL
+           OR user_traffic_policy_seen_at<=now()-interval '4 seconds')",
+    )
+    .bind(node)
+    .bind(hash)
+    .execute(pool)
+    .await?;
     Ok(())
 }

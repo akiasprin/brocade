@@ -41,6 +41,111 @@ async fn setup(db: &TestPg) {
             .unwrap();
     }
 }
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn unchanged_idle_nic_observations_do_not_rewrite_the_node_row() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let capabilities: NicNodeCapabilities = serde_json::from_value(
+        sqlx::query_scalar("SELECT capabilities FROM cvm_nic_nodes WHERE node_id='n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let before: (String, String) =
+        sqlx::query_as("SELECT observed_at::text,xmin::text FROM cvm_nic_nodes WHERE node_id='n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    db.store
+        .cvm_record_nic_capabilities("n1", capabilities)
+        .await
+        .unwrap();
+    let after: (String, String) =
+        sqlx::query_as("SELECT observed_at::text,xmin::text FROM cvm_nic_nodes WHERE node_id='n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(after, before);
+
+    let report = NicNodeReport {
+        generation: 1,
+        bindings: Vec::new(),
+        diagnostics: None,
+    };
+    db.store
+        .cvm_record_nic_report("n1", report.clone())
+        .await
+        .unwrap();
+    let before: (String, String) = sqlx::query_as(
+        "SELECT report_received_at::text,xmin::text FROM cvm_nic_nodes WHERE node_id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(!db
+        .store
+        .cvm_record_nic_report("n1", report.clone())
+        .await
+        .unwrap());
+    let after: (String, String) = sqlx::query_as(
+        "SELECT report_received_at::text,xmin::text FROM cvm_nic_nodes WHERE node_id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+
+    let revision: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id=TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let deployment: i64 = sqlx::query_scalar("INSERT INTO deployments(revision_id,status,active,kind) VALUES($1,'canceled',false,'config') RETURNING id")
+        .bind(revision)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO deployment_targets(deployment_id,node_id,status) VALUES($1,'n1','canceled')",
+    )
+    .bind(deployment)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let mut dispatch = db.pool().begin().await.unwrap();
+    // Match the production deployment-isolation lock. The report must wait for this transaction
+    // before deciding that the empty observation is a duplicate; otherwise it can miss the
+    // uncommitted dispatch and leave the target waiting for the next periodic report.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(0x6272_6f63_6973_6f6c_i64)
+        .execute(&mut *dispatch)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO deployment_target_state(deployment_id,node_id,wave,disruptive,desired_structure,desired_grants,dispatched_at) VALUES($1,'n1',1,false,'{}','{}',now())")
+        .bind(deployment)
+        .execute(&mut *dispatch)
+        .await
+        .unwrap();
+    let store = db.store.clone();
+    let reporter = tokio::spawn(async move { store.cvm_record_nic_report("n1", report).await });
+    wait_for_advisory_waiters(db.pool(), 1).await;
+    dispatch.commit().await.unwrap();
+    reporter.await.unwrap().unwrap();
+    let after_dispatch: (String, String, bool) = sqlx::query_as(
+        "SELECT report_received_at::text,xmin::text,report_received_at>=(SELECT max(dispatched_at) FROM deployment_target_state WHERE node_id='n1') FROM cvm_nic_nodes WHERE node_id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_ne!(after_dispatch.1, after.1);
+    assert!(after_dispatch.2);
+}
+
 fn publication_spec() -> NicPublicationSpec {
     NicPublicationSpec {
         name: "Reusable network".into(),

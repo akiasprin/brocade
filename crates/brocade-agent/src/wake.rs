@@ -37,6 +37,34 @@ pub(crate) fn set_connected(connected: bool) {
         .connected = connected;
     hub.changed.notify_all();
 }
+pub(crate) fn connected() -> bool {
+    hub()
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .connected
+}
+
+/// Derive a stable per-node delay without retaining or exposing the enrollment identity.
+///
+/// A deterministic delay avoids rebuilding a synchronized fleet after every Agent restart while
+/// keeping the fallback recovery bound reviewable.
+pub(crate) fn stable_poll_interval(
+    identity: &str,
+    domain: &str,
+    minimum_secs: u64,
+    jitter_secs: u64,
+) -> Duration {
+    if jitter_secs == 0 {
+        return Duration::from_secs(minimum_secs);
+    }
+    let digest = brocade_core::hash::sha256_hex(format!("{domain}\0{identity}").as_bytes());
+    let bucket = digest
+        .bytes()
+        .take(8)
+        .fold(0u64, |value, byte| value.wrapping_mul(33) + u64::from(byte));
+    Duration::from_secs(minimum_secs + bucket % (jitter_secs + 1))
+}
 pub(crate) struct Cursor {
     domain: WakeDomain,
     seen: u64,
@@ -93,5 +121,21 @@ mod tests {
         agent.wait(Duration::from_secs(3));
         xray.wait(Duration::from_secs(3));
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn stable_poll_delay_is_repeatable_and_bounded() {
+        for domain in ["desired", "forwarding", "cvm-nics"] {
+            let interval = stable_poll_interval("fixture-node", domain, 45, 30);
+            assert_eq!(
+                interval,
+                stable_poll_interval("fixture-node", domain, 45, 30)
+            );
+            assert!((Duration::from_secs(45)..=Duration::from_secs(75)).contains(&interval));
+        }
+        assert_eq!(
+            stable_poll_interval("fixture-node", "fixed", 15, 0),
+            Duration::from_secs(15)
+        );
     }
 }
