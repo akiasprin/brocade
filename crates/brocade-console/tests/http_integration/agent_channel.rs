@@ -111,6 +111,49 @@ async fn agent_channel_rpc_reuses_authentication_and_commit_notifications_and_re
         serde_json::from_str::<Value>(result["body"].as_str().unwrap()).unwrap()["revision"],
         0
     );
+    let policies = rpc(
+        &mut socket,
+        20,
+        "GET",
+        "/agent/v1/user-traffic/policies",
+        Value::Null,
+        vec![],
+    )
+    .await;
+    assert_eq!(policies["status"], 200);
+    let etag = policies["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|header| header[0] == "etag")
+        .unwrap()[1]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let unchanged = rpc(
+        &mut socket,
+        21,
+        "GET",
+        "/agent/v1/user-traffic/policies",
+        Value::Null,
+        vec![("if-none-match".into(), etag.clone())],
+    )
+    .await;
+    assert_eq!(unchanged["status"], 304);
+    assert_eq!(unchanged["body"], "");
+    assert!(unchanged["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|header| header[0] == "etag" && header[1] == etag));
+    let applied: (Option<String>, bool) = sqlx::query_as(
+        "SELECT user_traffic_applied_hash,user_traffic_policy_seen_at IS NOT NULL FROM nodes WHERE id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(applied.0.as_deref(), Some(etag.trim_matches('"')));
+    assert!(applied.1);
     for (id, path) in [
         (2, "/agent/v1/agent-release"),
         (3, "/agent/v1/xray-release"),

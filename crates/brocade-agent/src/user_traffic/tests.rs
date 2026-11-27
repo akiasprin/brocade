@@ -734,14 +734,19 @@ fn user_global_policy_sync_switches_existing_sources_and_acknowledges_each_snaps
                 reader.read_line(&mut line).unwrap();
                 assert!(line.starts_with(if acknowledgment { "POST " } else { "GET " }));
                 let mut length = 0;
+                let mut if_none_match = None;
                 loop {
                     line.clear();
                     reader.read_line(&mut line).unwrap();
                     if line == "\r\n" {
                         break;
                     }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    let lowercase = line.to_ascii_lowercase();
+                    if let Some(value) = lowercase.strip_prefix("content-length:") {
                         length = value.trim().parse::<usize>().unwrap();
+                    }
+                    if let Some(value) = lowercase.strip_prefix("if-none-match:") {
+                        if_none_match = Some(value.trim().to_owned());
                     }
                 }
                 let mut body = vec![0; length];
@@ -750,6 +755,11 @@ fn user_global_policy_sync_switches_existing_sources_and_acknowledges_each_snaps
                     assert_eq!(serde_json::from_slice::<String>(&body).unwrap(), hash);
                     stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                 } else {
+                    assert_eq!(
+                        if_none_match,
+                        (index > 0).then(|| format!("\"{:064x}\"", index - 1)),
+                        "a confirmed checkpoint must be offered conditionally to old and new Consoles"
+                    );
                     let body = serde_json::to_vec(&snapshot).unwrap();
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
                     stream.write_all(&body).unwrap();
@@ -778,6 +788,63 @@ fn user_global_policy_sync_switches_existing_sources_and_acknowledges_each_snaps
     ));
     assert!(!required_at_start(&dir));
     assert_eq!(service.generation.load(Ordering::Acquire), 4);
+    worker.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn unchanged_policy_checkpoint_uses_304_without_an_acknowledgment() {
+    crate::identity::self_identity();
+    let dir = std::env::temp_dir().join(format!("brocade-user-304-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = "alice@platform#entry";
+    let snapshot = UserTrafficSnapshot {
+        sources: vec![UserTrafficAssignment {
+            source: source.into(),
+            budget_key: None,
+            effect: UserTrafficEffect::Limited { rate_bps: 8000 },
+            revision: 1,
+        }],
+        sha256: "a".repeat(64),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let worker = thread::spawn(move || {
+        for step in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, body) = crate::http::tests::read_request(&mut stream);
+            match step {
+                0 => {
+                    assert!(headers.starts_with("get "));
+                    assert!(!headers.contains("if-none-match:"));
+                    let body = serde_json::to_vec(&snapshot).unwrap();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+                1 => {
+                    assert!(headers.starts_with("post "));
+                    assert_eq!(
+                        serde_json::from_slice::<String>(&body).unwrap(),
+                        "a".repeat(64)
+                    );
+                    stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+                2 => {
+                    assert!(headers.starts_with("get "));
+                    assert!(headers.contains(&format!("if-none-match: \"{}\"", "a".repeat(64))));
+                    stream.write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+                _ => unreachable!(),
+            }
+        }
+    });
+    let service = test_service(&dir, &format!("http://{address}"), 0, address);
+    synchronize(&service).unwrap();
+    assert!(assigned(&service, source).unwrap().is_none());
+    assert_eq!(service.generation.load(Ordering::Acquire), 1);
+    synchronize(&service).unwrap();
+    assert!(assigned(&service, source).unwrap().is_none());
+    assert_eq!(service.generation.load(Ordering::Acquire), 1);
     worker.join().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }

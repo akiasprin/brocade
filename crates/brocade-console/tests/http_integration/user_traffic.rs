@@ -128,6 +128,44 @@ async fn user_app_policy_http_checks_scope_protocol_permissions_and_exhaustion()
         snapshot.1["sources"][0]["source"],
         "alice@platform.acme#ing-b2c3"
     );
+    let hash = snapshot.1["sha256"].as_str().unwrap();
+    let conditional = |validator: String| {
+        Request::get("/agent/v1/user-traffic/policies")
+            .header("authorization", format!("Bearer {}", node.token))
+            .header("x-brocade-protocol-version", "44")
+            .header("if-none-match", validator)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = agent
+        .clone()
+        .oneshot(conditional(format!("W/\"{hash}\", \"other\"")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(response.headers()["etag"], format!("\"{hash}\""));
+    assert_eq!(response.headers()["cache-control"], "private, no-cache");
+    assert!(to_bytes(response.into_body(), 1).await.unwrap().is_empty());
+    let applied: (Option<String>, bool) = sqlx::query_as(
+        "SELECT user_traffic_applied_hash,user_traffic_policy_seen_at IS NOT NULL FROM nodes WHERE id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(applied, (Some(hash.to_owned()), true));
+
+    let response = agent
+        .clone()
+        .oneshot(conditional("\"different\"".into()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["etag"], format!("\"{hash}\""));
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(body["sha256"], hash);
+
     let acknowledged = agent_json(
         &agent,
         &node.token,
