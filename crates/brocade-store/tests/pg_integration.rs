@@ -9392,6 +9392,48 @@ async fn probe_targets_use_public_ipv4_and_the_peers_transport() {
         "假 TCP 的开销比直连多 12 字节，减错了建议值就偏大"
     );
 
+    // The first read filled CurrentSnapshotCache. A newly published revision must replace it.
+    db.store
+        .update_node(
+            &system_admin(),
+            "phantun-01",
+            UpdateNodeRequest {
+                public_ipv4: Some("203.0.113.42".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let revised = db.store.probe_targets("direct-01").await.unwrap();
+    assert_eq!(revised.targets[0].host, "203.0.113.42");
+
+    // Compatibility maintenance can rewrite the current immutable row without advancing its
+    // revision. The xmin half of the cache key must invalidate that cached projection too.
+    let mut rewritten: serde_json::Value = sqlx::query_scalar(
+        "SELECT snapshot FROM model_snapshots
+         WHERE revision_id=(SELECT current_revision FROM control_state WHERE id=TRUE)",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let peer = rewritten["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|node| node["id"] == "phantun-01")
+        .unwrap();
+    peer["public_ipv4"] = serde_json::json!("203.0.113.43");
+    sqlx::query(
+        "UPDATE model_snapshots SET snapshot=$1
+         WHERE revision_id=(SELECT current_revision FROM control_state WHERE id=TRUE)",
+    )
+    .bind(rewritten)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let rewritten = db.store.probe_targets("direct-01").await.unwrap();
+    assert_eq!(rewritten.targets[0].host, "203.0.113.43");
+
     // Conversely: the NAT'd machine can probe every reachable peer, and its coverage does not
     // shrink because it is itself behind NAT
     let from_nat = db.store.probe_targets("nat-01").await.unwrap();
@@ -26860,25 +26902,94 @@ async fn forwarding_authorization_reconcile_and_usage_are_durable() {
         .await
         .unwrap();
     assert_eq!(baseline.inserted_samples, 1);
+    let mut delta_report = report(2, 140, 260);
+    delta_report.counters.push(ForwardingUsageCounter {
+        rule_id: udp_rule_id,
+        uplink_bytes: 200,
+        downlink_bytes: 400,
+    });
     let delta = db
         .store
-        .record_forwarding_usage("n1", report(2, 140, 260))
+        .record_forwarding_usage("n1", delta_report)
         .await
         .unwrap();
-    assert_eq!(delta.inserted_samples, 1);
+    assert_eq!(delta.accepted_counters, 2);
+    assert_eq!(delta.inserted_samples, 2);
+
+    // Both rules share the next window. This exercises UNNEST alignment and the grouped
+    // window/rollup writes rather than only the former one-counter-per-request path.
+    let mut continued_report = report(3, 160, 300);
+    continued_report.counters.push(ForwardingUsageCounter {
+        rule_id: udp_rule_id,
+        uplink_bytes: 240,
+        downlink_bytes: 500,
+    });
+    let continued = db
+        .store
+        .record_forwarding_usage("n1", continued_report.clone())
+        .await
+        .unwrap();
+    assert_eq!(continued.accepted_counters, 2);
+    assert_eq!(continued.inserted_samples, 2);
     let duplicate = db
         .store
-        .record_forwarding_usage("n1", report(2, 140, 260))
+        .record_forwarding_usage("n1", continued_report)
         .await
         .unwrap();
     assert!(duplicate.duplicate);
+    assert_eq!(duplicate.accepted_counters, 2);
+    assert_eq!(duplicate.inserted_samples, 2);
+
+    let heads: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT rule_id,uplink_bytes,downlink_bytes FROM forwarding_usage_counter_heads
+         WHERE node_id='n1' ORDER BY rule_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(heads, vec![(rule_id, 160, 300), (udp_rule_id, 240, 500)]);
+    let rollups: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT rule_id,uplink_bytes,downlink_bytes FROM forwarding_usage_rollups
+         WHERE node_id='n1' ORDER BY rule_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rollups, heads);
+    let shared_window: (i64, i64, bool) = sqlx::query_as(
+        "SELECT uplink_bytes,downlink_bytes,has_gap FROM forwarding_usage_windows
+         WHERE node_id='n1' AND tenant_id='platform.acme'
+           AND window_start=to_timestamp($1) AND window_end=to_timestamp($2)",
+    )
+    .bind(now)
+    .bind(now + 15)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(shared_window, (60, 140, false));
+    let samples: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT rule_id,uplink_bytes,downlink_bytes FROM forwarding_usage_samples
+         WHERE node_id='n1' AND read_at=to_timestamp($1) ORDER BY rule_id",
+    )
+    .bind(now + 15)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(samples, vec![(rule_id, 20, 40), (udp_rule_id, 40, 100)]);
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM forwarding_usage_report_receipts WHERE node_id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipt_count, 3);
     let overview = db
         .store
         .forwarding_overview(&admin, "platform.acme", "alice")
         .await
         .unwrap();
-    assert_eq!(overview.rules[0].uplink_bytes, 140);
-    assert_eq!(overview.rules[0].downlink_bytes, 260);
+    assert_eq!(overview.rules[0].uplink_bytes, 160);
+    assert_eq!(overview.rules[0].downlink_bytes, 300);
 
     assert!(matches!(
         db.store
@@ -26999,7 +27110,7 @@ async fn forwarding_authorization_reconcile_and_usage_are_durable() {
         .fetch_one(db.pool())
         .await
         .unwrap(),
-        2
+        3
     );
 }
 
