@@ -28,31 +28,62 @@ use crate::{
 
 const FORWARDING_INTERVAL: Duration = Duration::from_secs(15);
 const FORWARDING_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const FORWARDING_IDLE_MIN_SECS: u64 = 45;
+const FORWARDING_IDLE_JITTER_SECS: u64 = 30;
 const FORWARDING_STATE_FILE: &str = "forwarding-applied.json";
 const FORWARDING_DESIRED_FILE: &str = "forwarding-desired.json";
 const FORWARDING_TAG_PREFIX: &str = "fwd:";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RoundOutcome {
+    Active,
+    Idle,
+    Retry,
+}
+
 pub(crate) fn run_forever(options: Options, meter: Arc<Mutex<()>>) {
     let mut wake = crate::wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Desired);
-    let mut tick = Instant::now();
+    let mut disconnected_tick = Instant::now();
+    let mut connected_tick = Instant::now();
     loop {
-        let interval = match run_round(&options, &meter) {
-            Ok(true) => FORWARDING_INTERVAL,
-            Ok(false) => FORWARDING_RETRY_INTERVAL,
+        let outcome = match run_round(&options, &meter) {
+            Ok(outcome) => outcome,
             Err(error) => {
                 eprintln!("forwarding: {error}");
-                FORWARDING_RETRY_INTERVAL
+                RoundOutcome::Retry
             }
         };
+        let (disconnected_interval, connected_interval) = poll_intervals(&options, outcome);
         let now = Instant::now();
-        tick = next_periodic_tick(tick, interval, now);
-        if wake.wait(tick.saturating_duration_since(now)) {
-            tick = Instant::now();
+        disconnected_tick = next_periodic_tick(disconnected_tick, disconnected_interval, now);
+        connected_tick = next_periodic_tick(connected_tick, connected_interval, now);
+        if wake.wait_connected(
+            disconnected_tick.saturating_duration_since(now),
+            connected_tick.saturating_duration_since(now),
+        ) {
+            disconnected_tick = Instant::now();
+            connected_tick = disconnected_tick;
         }
     }
 }
 
-fn run_round(options: &Options, meter: &Mutex<()>) -> Result<bool, String> {
+fn poll_intervals(options: &Options, outcome: RoundOutcome) -> (Duration, Duration) {
+    match outcome {
+        RoundOutcome::Retry => (FORWARDING_RETRY_INTERVAL, FORWARDING_RETRY_INTERVAL),
+        RoundOutcome::Active => (FORWARDING_INTERVAL, FORWARDING_INTERVAL),
+        RoundOutcome::Idle => (
+            FORWARDING_INTERVAL,
+            crate::wake::stable_poll_interval(
+                &options.token,
+                "forwarding-idle",
+                FORWARDING_IDLE_MIN_SECS,
+                FORWARDING_IDLE_JITTER_SECS,
+            ),
+        ),
+    }
+}
+
+fn run_round(options: &Options, meter: &Mutex<()>) -> Result<RoundOutcome, String> {
     let client = HttpClient::new(&options.server)?;
     let desired = fetch_desired(&client, options)?;
     // Persist the complete control-plane answer before changing the runtime. The applied
@@ -67,7 +98,7 @@ fn run_round(options: &Options, meter: &Mutex<()>) -> Result<bool, String> {
         // Console will send an empty effective set after acknowledging the disable receipt.
         // Do not report stale non-empty work as a failure in that short transition.
         if options.state_dir.join("xray.disabled").exists() && !desired.rules.is_empty() {
-            return Ok(true);
+            return Ok(RoundOutcome::Active);
         }
         let _deadline = crate::xray_grpc::deadline_after(
             options
@@ -84,14 +115,21 @@ fn run_round(options: &Options, meter: &Mutex<()>) -> Result<bool, String> {
         };
         (report, usage)
     };
-    if let Some(Ok(usage_report)) = usage {
+    if let Some(Ok(Some(usage_report))) = usage {
         spool_push(FORWARDING_USAGE_SPOOL, &options.state_dir, &usage_report)?;
     } else if let Some(Err(error)) = usage {
         eprintln!("forwarding usage: {error}");
     }
     let complete = report.error.is_none();
+    let idle = desired.rules.is_empty() && report.applied_rule_ids.is_empty();
     send_reconcile(&client, options, &report)?;
-    Ok(complete)
+    Ok(if !complete {
+        RoundOutcome::Retry
+    } else if idle {
+        RoundOutcome::Idle
+    } else {
+        RoundOutcome::Active
+    })
 }
 
 /// Restore the last complete desired set without contacting the control plane.
@@ -731,17 +769,20 @@ fn current_forwarding_rule_ids(state_dir: &Path) -> Result<Vec<i64>, String> {
         .collect())
 }
 
-fn collect_usage(state_dir: &Path) -> Result<ForwardingUsageReportRequest, String> {
+fn collect_usage(state_dir: &Path) -> Result<Option<ForwardingUsageReportRequest>, String> {
     let content = fs::read_to_string(state_dir.join("xray.json"))
         .map_err(|error| format!("read xray config: {error}"))?;
     let api_address = xray_api_address(&content).ok_or("xray config has no API address")?;
     let process = xray_process_identity(state_dir)?;
     let counter_epoch = crate::accounting::epoch(state_dir, &process.epoch, process.pid)?;
-    let (agent_instance_id, sequence) = reserve_usage_sequence(state_dir)?;
     let counters = read_counters(api_address)?;
     crate::accounting::sync_live_journal(state_dir, &process.epoch, process.pid)?;
     crate::validate_xray_sample_process(state_dir, &process)?;
-    Ok(ForwardingUsageReportRequest {
+    if counters.is_empty() {
+        return Ok(None);
+    }
+    let (agent_instance_id, sequence) = reserve_usage_sequence(state_dir)?;
+    Ok(Some(ForwardingUsageReportRequest {
         agent_instance_id,
         sequence,
         read_at_unix_secs: current_unix_secs()?,
@@ -756,7 +797,7 @@ fn collect_usage(state_dir: &Path) -> Result<ForwardingUsageReportRequest, Strin
                 },
             )
             .collect(),
-    })
+    }))
 }
 
 pub(crate) fn read_counters(api_address: SocketAddr) -> Result<BTreeMap<i64, (u64, u64)>, String> {
@@ -841,6 +882,34 @@ mod tests {
     use super::*;
     use brocade_deployment::protocol::ForwardingProtocol;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn options(token: &str) -> Options {
+        Options {
+            command: "run".into(),
+            server: "http://127.0.0.1".into(),
+            token: token.into(),
+            state_dir: std::env::temp_dir(),
+            apply_mode: crate::ApplyMode::StateDir,
+            vpngate_stats_window: Duration::from_secs(900),
+        }
+    }
+
+    #[test]
+    fn forwarding_only_backs_off_when_idle_and_connected() {
+        let options = options("fixture-token");
+        let idle = poll_intervals(&options, RoundOutcome::Idle);
+        assert_eq!(idle.0, FORWARDING_INTERVAL);
+        assert!((Duration::from_secs(45)..=Duration::from_secs(75)).contains(&idle.1));
+        assert_eq!(idle, poll_intervals(&options, RoundOutcome::Idle));
+        assert_eq!(
+            poll_intervals(&options, RoundOutcome::Active),
+            (FORWARDING_INTERVAL, FORWARDING_INTERVAL)
+        );
+        assert_eq!(
+            poll_intervals(&options, RoundOutcome::Retry),
+            (FORWARDING_RETRY_INTERVAL, FORWARDING_RETRY_INTERVAL)
+        );
+    }
 
     struct TestDir(std::path::PathBuf);
     impl TestDir {

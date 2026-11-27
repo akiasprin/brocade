@@ -49,6 +49,8 @@ use crate::{
 
 const DESIRED_INTERVAL: Duration = Duration::from_secs(60);
 const RUNTIME_DESIRED_INTERVAL: Duration = Duration::from_secs(10);
+const CONNECTED_RUNTIME_DESIRED_MIN_SECS: u64 = 45;
+const CONNECTED_RUNTIME_DESIRED_JITTER_SECS: u64 = 30;
 const RUNTIME_INTERVAL: Duration = Duration::from_secs(5);
 const CONTINUOUS_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const FULL_PROBE_INTERVAL_SECS: i64 = 15 * 60;
@@ -113,11 +115,16 @@ pub(crate) fn run_forever(options: &Options, realtime: crate::realtime::VpngateC
     let mut next_fetch = Instant::now();
     let mut last_report = None;
     let mut telemetry = TelemetrySupervisor::new();
+    let mut wake = crate::wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Desired);
     loop {
         let started = Instant::now();
+        let maximum_fetch_delay = runtime_desired_interval(options, crate::wake::connected());
+        next_fetch = next_fetch.min(started + maximum_fetch_delay);
         if Instant::now() >= next_fetch {
+            let mut synchronized = true;
             if let Err(error) = resend_pending_reports(&client, options) {
                 eprintln!("vpngate: {error}");
+                synchronized = false;
             }
             match fetch_desired(&client, options, &mut desired_cache) {
                 Ok(Some(next)) if desired.as_ref() == Some(next) => {}
@@ -141,9 +148,11 @@ pub(crate) fn run_forever(options: &Options, realtime: crate::realtime::VpngateC
                     // A failed poll is not permission to tear down a working egress. Desired state
                     // remains authoritative until a newer complete response arrives.
                     eprintln!("vpngate: {error}");
+                    synchronized = false;
                 }
             }
-            next_fetch = Instant::now() + RUNTIME_DESIRED_INTERVAL;
+            next_fetch = Instant::now()
+                + runtime_desired_retry_interval(options, crate::wake::connected(), synchronized);
         }
         if options.apply_mode != ApplyMode::StateDir {
             if let Some(desired) = desired.as_ref() {
@@ -170,7 +179,34 @@ pub(crate) fn run_forever(options: &Options, realtime: crate::realtime::VpngateC
                 }
             }
         }
-        thread::sleep(RUNTIME_INTERVAL.saturating_sub(started.elapsed()));
+        if wake.wait(RUNTIME_INTERVAL.saturating_sub(started.elapsed())) {
+            next_fetch = Instant::now();
+        }
+    }
+}
+
+fn runtime_desired_interval(options: &Options, connected: bool) -> Duration {
+    if connected {
+        crate::wake::stable_poll_interval(
+            &options.token,
+            "vpngate-desired",
+            CONNECTED_RUNTIME_DESIRED_MIN_SECS,
+            CONNECTED_RUNTIME_DESIRED_JITTER_SECS,
+        )
+    } else {
+        RUNTIME_DESIRED_INTERVAL
+    }
+}
+
+fn runtime_desired_retry_interval(
+    options: &Options,
+    connected: bool,
+    synchronized: bool,
+) -> Duration {
+    if synchronized {
+        runtime_desired_interval(options, connected)
+    } else {
+        RUNTIME_DESIRED_INTERVAL
     }
 }
 
@@ -4783,6 +4819,30 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn runtime_desired_fallback_is_fast_offline_and_staggered_online() {
+        let options = Options {
+            command: "run".into(),
+            server: "http://127.0.0.1".into(),
+            token: "fixture-token".into(),
+            state_dir: PathBuf::new(),
+            apply_mode: ApplyMode::StateDir,
+            vpngate_stats_window: Duration::from_secs(900),
+        };
+        assert_eq!(
+            runtime_desired_interval(&options, false),
+            RUNTIME_DESIRED_INTERVAL
+        );
+        let online = runtime_desired_interval(&options, true);
+        assert!((Duration::from_secs(45)..=Duration::from_secs(75)).contains(&online));
+        assert_eq!(online, runtime_desired_interval(&options, true));
+        assert_eq!(
+            runtime_desired_retry_interval(&options, true, false),
+            RUNTIME_DESIRED_INTERVAL
+        );
+        assert_eq!(runtime_desired_retry_interval(&options, true, true), online);
+    }
 
     #[test]
     fn conditional_desired_reuses_validated_state_and_accepts_a_new_generation() {

@@ -94,7 +94,7 @@ fn empty_network_round_acknowledges_a_new_generation_over_http() {
     server.join().unwrap();
     let requests = received.recv().unwrap();
     std::fs::remove_dir_all(root).unwrap();
-    result.unwrap();
+    assert!(!result.unwrap(), "an empty network round must become idle");
     assert_eq!(
         requests.len(),
         3,
@@ -1178,7 +1178,7 @@ fn kvm_network_service() {
             .zip(&mut errors)
         {
             match outcome {
-                Ok(()) => previous.clear(),
+                Ok(_) => previous.clear(),
                 Err(next) => {
                     if next != *previous {
                         eprintln!("isolated network convergence: {next}");

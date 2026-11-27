@@ -325,7 +325,7 @@ impl PgStore {
         {
             return Err(invalid("无效的远端网卡能力回报"));
         }
-        sqlx::query("INSERT INTO cvm_nic_nodes(node_id,capabilities) VALUES($1,$2) ON CONFLICT(node_id) DO UPDATE SET capabilities=excluded.capabilities,observed_at=now()") .bind(node).bind(serde_json::to_value(caps)?).execute(&self.pool).await?;
+        sqlx::query("INSERT INTO cvm_nic_nodes(node_id,capabilities) VALUES($1,$2) ON CONFLICT(node_id) DO UPDATE SET capabilities=excluded.capabilities,observed_at=now() WHERE cvm_nic_nodes.capabilities IS DISTINCT FROM excluded.capabilities OR cvm_nic_nodes.observed_at<=now()-interval '60 seconds'") .bind(node).bind(serde_json::to_value(caps)?).execute(&self.pool).await?;
         Ok(())
     }
 }
