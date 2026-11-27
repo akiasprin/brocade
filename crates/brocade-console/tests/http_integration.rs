@@ -1096,7 +1096,7 @@ async fn performance_diagnostics_are_system_admin_only_and_never_cached() {
     )
     .unwrap();
     assert_eq!(body["performance"]["window_minutes"], 15);
-    assert_eq!(body["pool"]["max_connections"], 5);
+    assert_eq!(body["pool"]["max_connections"], 12);
     assert_eq!(body["database"]["pg_stat_statements_installed"], false);
     assert!(body["database"]["server_version_num"].as_u64().unwrap() >= 160000);
     let created = post_json(

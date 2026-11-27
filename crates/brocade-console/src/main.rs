@@ -9,7 +9,7 @@ use brocade_console::lifecycle::{
     serve_http_surfaces, ShutdownOutcome, ShutdownSignal, DEFAULT_SHUTDOWN_GRACE,
 };
 use brocade_store::PgStore;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 /// How often quotas are checked. Usage reports in 30-second windows, so anything denser has no new
 /// data to look at; with the agent's 15-second fetch interval, going over to being cut off takes
@@ -18,6 +18,9 @@ const QUOTA_TICK: Duration = Duration::from_secs(60);
 /// Durable permission jobs normally arrive through a wake signal.  The timer covers a lost signal,
 /// another process writing the row, and restart recovery.
 const GRANTS_TICK: Duration = Duration::from_secs(5);
+/// Cap concurrent background maintenance passes so periodic jobs leave database pool capacity for
+/// live agent and admin traffic.
+const BACKGROUND_DB_CONCURRENCY: usize = 2;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -148,14 +151,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // added when BROCADE_NOTIFICATION_WEBHOOK_URL is configured; its delivery state is durable.
     brocade_console::notifications::spawn(store.clone()).await;
 
+    let background_db = Arc::new(Semaphore::new(BACKGROUND_DB_CONCURRENCY));
+
     // Preserve recent raw telemetry; seal older history incrementally, never one large rewrite.
     // Skip missed ticks and bound the whole pass so catch-up cannot monopolise the database.
     let compactor = store.clone();
+    let compactor_permits = Arc::clone(&background_db);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
+            let Ok(_permit) = compactor_permits.acquire().await else {
+                break;
+            };
             match tokio::time::timeout(
                 std::time::Duration::from_secs(20),
                 compactor.compact_load_history(),
@@ -174,11 +183,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // what the forecast page said. The first pass after midnight records the day; hourly passes
     // only cover restarts and outages, since a day's first record stands.
     let forecaster = store.clone();
+    let forecaster_permits = Arc::clone(&background_db);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(3600));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
+            let Ok(_permit) = forecaster_permits.acquire().await else {
+                break;
+            };
             match tokio::time::timeout(
                 Duration::from_secs(60),
                 forecaster.record_machine_traffic_forecasts(),
@@ -197,11 +210,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         // Independent retention also runs when no CVM is uploading observations.
         let cvm_pruner = store.clone();
+        let cvm_pruner_permits = Arc::clone(&background_db);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
+                let Ok(_permit) = cvm_pruner_permits.acquire().await else {
+                    break;
+                };
                 if let Err(error) = cvm_pruner.prune_cvm_observations().await {
                     eprintln!("CVM observation retention: {error}");
                 }
@@ -211,11 +228,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Each table owns its due time and bounded transaction. Backlogs retry every minute;
     // normally settled history runs hourly. One failure never skips another table.
     let pruner = store.clone();
+    let pruner_permits = Arc::clone(&background_db);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
+            let Ok(_permit) = pruner_permits.acquire().await else {
+                break;
+            };
             match pruner.run_data_retention().await {
                 Ok(results) => {
                     for result in results {
@@ -298,10 +319,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // idempotency key.
     let quota_wake = Arc::new(Notify::new());
     let user_traffic_store = store.clone();
+    let user_traffic_permits = Arc::clone(&background_db);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tick.tick().await;
+            let Ok(_permit) = user_traffic_permits.acquire().await else {
+                break;
+            };
             if let Err(error) = user_traffic_store.enforce_user_traffic_policies().await {
                 eprintln!("user traffic: {error}");
             }
@@ -310,6 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let quota_store = store.clone();
     let quota_signal = quota_wake.clone();
+    let quota_permits = Arc::clone(&background_db);
     tokio::spawn(async move {
         loop {
             // Two triggers: the timer, and somebody having just changed a quota. A quota change
@@ -319,6 +345,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = tokio::time::sleep(QUOTA_TICK) => {}
                 _ = quota_signal.notified() => {}
             }
+            let Ok(_permit) = quota_permits.acquire().await else {
+                break;
+            };
             match quota_store.enforce_user_service_periods().await {
                 Ok(changed) if changed > 0 => {
                     eprintln!("user service: 已更新 {changed} 个用户的服务状态")

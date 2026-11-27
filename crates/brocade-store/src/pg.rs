@@ -83,6 +83,11 @@ pub struct PgStore {
     usage_runtime: Arc<usage::UsageRuntimeState>,
 }
 
+pub const DEFAULT_DB_MAX_CONNECTIONS: u32 = 12;
+const MIN_DB_MAX_CONNECTIONS: u32 = 1;
+const MAX_DB_MAX_CONNECTIONS: u32 = 128;
+const DB_MAX_CONNECTIONS_ENV: &str = "BROCADE_DB_MAX_CONNECTIONS";
+
 /// SQLSTATE for "the database named in the connection string is not on this server".
 const INVALID_CATALOG_NAME: &str = "3D000";
 /// SQLSTATE for "it already exists" — here, somebody else created it between the probe and the
@@ -125,10 +130,38 @@ fn sqlstate(error: &sqlx::Error) -> Option<String> {
     }
 }
 
+fn parse_max_connections(raw: Option<&str>) -> Result<u32> {
+    let Some(trimmed) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_DB_MAX_CONNECTIONS);
+    };
+    let value = trimmed.parse::<u32>().map_err(|_| {
+        StoreError::InvalidData(format!(
+            "{DB_MAX_CONNECTIONS_ENV} must be an integer between {MIN_DB_MAX_CONNECTIONS} and {MAX_DB_MAX_CONNECTIONS}, got `{trimmed}`"
+        ))
+    })?;
+    if !(MIN_DB_MAX_CONNECTIONS..=MAX_DB_MAX_CONNECTIONS).contains(&value) {
+        return Err(StoreError::InvalidData(format!(
+            "{DB_MAX_CONNECTIONS_ENV} must be between {MIN_DB_MAX_CONNECTIONS} and {MAX_DB_MAX_CONNECTIONS}, got {value}"
+        )));
+    }
+    Ok(value)
+}
+
+fn configured_max_connections() -> Result<u32> {
+    match std::env::var(DB_MAX_CONNECTIONS_ENV) {
+        Ok(value) => parse_max_connections(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_DB_MAX_CONNECTIONS),
+        Err(std::env::VarError::NotUnicode(_)) => Err(StoreError::InvalidData(format!(
+            "{DB_MAX_CONNECTIONS_ENV} must be valid UTF-8"
+        ))),
+    }
+}
+
 impl PgStore {
     pub async fn connect(database_url: &str) -> Result<Self> {
+        let max_connections = configured_max_connections()?;
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_connections)
             // Numeric acquire events are consumed by Console's privacy-filtered observer, not
             // a text logger. With no observer installed tracing discards them.
             .acquire_time_level(log::LevelFilter::Debug)
@@ -3060,7 +3093,51 @@ mod tests {
     use sha2::{Digest, Sha384};
     use sqlx::migrate::MigrationSource;
 
-    use super::MIGRATOR;
+    use super::{
+        parse_max_connections, StoreError, DEFAULT_DB_MAX_CONNECTIONS, MAX_DB_MAX_CONNECTIONS,
+        MIGRATOR, MIN_DB_MAX_CONNECTIONS,
+    };
+
+    #[test]
+    fn parse_max_connections_uses_default_when_unset_or_blank() {
+        assert_eq!(
+            parse_max_connections(None).unwrap(),
+            DEFAULT_DB_MAX_CONNECTIONS
+        );
+        assert_eq!(
+            parse_max_connections(Some("")).unwrap(),
+            DEFAULT_DB_MAX_CONNECTIONS
+        );
+        assert_eq!(
+            parse_max_connections(Some("   \t\n ")).unwrap(),
+            DEFAULT_DB_MAX_CONNECTIONS
+        );
+    }
+
+    #[test]
+    fn parse_max_connections_accepts_valid_bounds_and_trimmed_values() {
+        assert_eq!(
+            parse_max_connections(Some("1")).unwrap(),
+            MIN_DB_MAX_CONNECTIONS
+        );
+        assert_eq!(parse_max_connections(Some("12")).unwrap(), 12);
+        assert_eq!(parse_max_connections(Some(" 32 ")).unwrap(), 32);
+        assert_eq!(
+            parse_max_connections(Some("128")).unwrap(),
+            MAX_DB_MAX_CONNECTIONS
+        );
+    }
+
+    #[test]
+    fn parse_max_connections_rejects_out_of_range_and_non_numeric_values() {
+        for raw in ["0", "129", "9999", "-1", "abc", "12.5"] {
+            let result = parse_max_connections(Some(raw));
+            assert!(
+                matches!(result, Err(StoreError::InvalidData(_))),
+                "expected InvalidData for `{raw}`"
+            );
+        }
+    }
 
     #[test]
     fn embedded_initial_migration_checksum_matches_the_source_file() {
