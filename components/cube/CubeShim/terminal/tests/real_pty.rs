@@ -64,10 +64,15 @@ impl Guest for PtyGuest {
             .stdin(Stdio::from(slave.try_clone().map_err(|e| e.to_string())?))
             .stdout(Stdio::from(slave.try_clone().map_err(|e| e.to_string())?))
             .stderr(Stdio::from(slave));
-        // SAFETY: the child hook only invokes async-signal-safe libc session/TTY operations.
+        // SAFETY: the child hook only invokes async-signal-safe libc signal/session/TTY
+        // operations. Test harnesses may start this process with terminal signals ignored.
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR
+                    || libc::signal(libc::SIGQUIT, libc::SIG_DFL) == libc::SIG_ERR
+                    || libc::setsid() < 0
+                    || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0
+                {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -138,26 +143,37 @@ fn req(operation: Operation) -> Request {
     }
 }
 async fn text_until(manager: &Arc<Manager<PtyGuest>>, attachment: usize, marker: &str) -> String {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        let mut data = Vec::new();
-        loop {
-            if let Response::Data { data: part, .. } = manager
-                .handle(req(Operation::Read {
-                    id: id(10),
-                    attachment: id(attachment),
-                }))
-                .await
-            {
-                data.extend(part);
-                if String::from_utf8_lossy(&data).contains(marker) {
-                    return String::from_utf8(data).unwrap();
-                }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut data = Vec::new();
+    loop {
+        if let Response::Data {
+            data: part, exit, ..
+        } = manager
+            .handle(req(Operation::Read {
+                id: id(10),
+                attachment: id(attachment),
+            }))
+            .await
+        {
+            data.extend(part);
+            if String::from_utf8_lossy(&data).contains(marker) {
+                return String::from_utf8(data).unwrap();
             }
-            tokio::task::yield_now().await;
+            if let Some(code) = exit {
+                panic!(
+                    "PTY exited with {code} while waiting for marker {marker}; output: {}",
+                    String::from_utf8_lossy(&data)
+                );
+            }
         }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for PTY marker {marker}"))
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for PTY marker {marker}; output: {}",
+                String::from_utf8_lossy(&data)
+            );
+        }
+        tokio::task::yield_now().await;
+    }
 }
 #[tokio::test]
 async fn same_shell_pid_variables_directory_resize_and_final_output_survive_detach() {
@@ -253,9 +269,9 @@ async fn same_shell_pid_variables_directory_resize_and_final_output_survive_deta
         .handle(req(Operation::Input {
             id: id(10),
             attachment: id(101),
-            // The child can run before the interactive shell transfers the PTY foreground
-            // process group. Wait for that handoff so the following ETX reaches this job.
-            data: br#"/bin/sh -c 'while :; do read -r _ _ _ _ pgrp _ _ tpgid _ < /proc/$$/stat; [ "$pgrp" = "$tpgid" ] && break; sleep 0.01; done; printf "__WAITING__\n"; exec sleep 30'
+            // Drive the interactive shell itself so child signal inheritance cannot vary.
+            // Split the marker so PTY input echo cannot satisfy the wait early.
+            data: br#"interrupted=0; trap 'interrupted=1' INT; printf '__WAIT%s__\n' 'ING'; while [ "$interrupted" -eq 0 ]; do :; done; trap - INT
 "#
             .to_vec(),
         }))
