@@ -81,6 +81,7 @@ pub struct PgStore {
     listener_pool: PgPool,
     pub(crate) subscription_render: Arc<crate::subscription_render::SubscriptionRenderRuntime>,
     usage_runtime: Arc<usage::UsageRuntimeState>,
+    current_snapshot_cache: Arc<materialize::CurrentSnapshotCache>,
 }
 
 pub const DEFAULT_DB_MAX_CONNECTIONS: u32 = 12;
@@ -273,6 +274,7 @@ impl PgStore {
                 crate::subscription_render::SubscriptionRenderRuntime::default(),
             ),
             usage_runtime: Arc::new(usage::UsageRuntimeState::default()),
+            current_snapshot_cache: Arc::new(materialize::CurrentSnapshotCache::default()),
         }
     }
 
@@ -2526,7 +2528,11 @@ impl PgStore {
     /// Asked once by the agent before each probing round: which endpoints to probe, and how
     /// much to subtract for each.
     pub async fn probe_targets(&self, node_id: &str) -> Result<ProbeTargetList> {
-        probe::probe_targets(&self.pool, node_id).await
+        let snapshot = self
+            .current_snapshot_cache
+            .load_snapshot(&self.pool)
+            .await?;
+        Ok(probe::probe_targets_from_snapshot(&snapshot, node_id))
     }
 
     pub async fn record_link_health(
@@ -2547,7 +2553,11 @@ impl PgStore {
     /// Asked once by the agent before each end-to-end probing round: which chains to dial on
     /// behalf of as their head, and at which endpoints.
     pub async fn e2e_probe_targets(&self, node_id: &str) -> Result<E2eProbeTargetList> {
-        probe::e2e_probe_targets(&self.pool, node_id).await
+        let (snapshot, compiled) = self
+            .current_snapshot_cache
+            .load_compiled(&self.pool)
+            .await?;
+        probe::e2e_targets_from_compiled(&self.pool, &snapshot, &compiled, node_id).await
     }
 
     pub async fn record_e2e_probe(

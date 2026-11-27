@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr},
+    sync::{Arc, Mutex},
 };
 
 use brocade_core::client_config::ClientProjectionDownloadEndpoint;
@@ -288,19 +289,119 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
     })
 }
 
-/// The immutable JSON already written for the current revision, fetched in one round trip.
-/// Agent work-list GETs need a coherent published model, not six live-table scans per node.
-pub(crate) async fn load_current_immutable_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
-    let row = sqlx::query(
-        "SELECT state.current_revision, snapshots.snapshot
-           FROM control_state AS state
-           JOIN model_snapshots AS snapshots ON snapshots.revision_id = state.current_revision
-          WHERE state.id = TRUE",
-    )
-    .fetch_one(pool)
-    .await?;
-    let revision = revision_to_u64(row.try_get::<i64, _>("current_revision")?)?;
-    decode_stored_snapshot(row.try_get("snapshot")?, revision)
+struct CachedCurrentSnapshot {
+    revision: u64,
+    snapshot_xmin: String,
+    snapshot: Arc<ModelSnapshot>,
+    compiled: Option<Arc<brocade_core::compile::CompileOutput>>,
+}
+
+/// Per-store cache for the current immutable snapshot and its compiled output.
+///
+/// Keyed by `(current_revision, model_snapshots.xmin)` so steady-state agent target GETs avoid
+/// fetching and decoding the TOASTed JSONB snapshot on every poll, while any new revision or
+/// in-place snapshot rewrite invalidates immediately.
+#[derive(Default)]
+pub(crate) struct CurrentSnapshotCache {
+    cached: Mutex<Option<CachedCurrentSnapshot>>,
+}
+
+impl CurrentSnapshotCache {
+    pub(crate) async fn load_snapshot(&self, pool: &PgPool) -> Result<Arc<ModelSnapshot>> {
+        Ok(self.load_entry(pool, false).await?.0)
+    }
+
+    pub(crate) async fn load_compiled(
+        &self,
+        pool: &PgPool,
+    ) -> Result<(
+        Arc<ModelSnapshot>,
+        Arc<brocade_core::compile::CompileOutput>,
+    )> {
+        let (snapshot, compiled) = self.load_entry(pool, true).await?;
+        let compiled = compiled.expect("compiled output requested");
+        Ok((snapshot, compiled))
+    }
+
+    async fn load_entry(
+        &self,
+        pool: &PgPool,
+        need_compiled: bool,
+    ) -> Result<(
+        Arc<ModelSnapshot>,
+        Option<Arc<brocade_core::compile::CompileOutput>>,
+    )> {
+        let meta = sqlx::query(
+            "SELECT state.current_revision, snapshots.xmin::text AS snapshot_xmin
+               FROM control_state AS state
+               JOIN model_snapshots AS snapshots ON snapshots.revision_id = state.current_revision
+              WHERE state.id = TRUE",
+        )
+        .fetch_one(pool)
+        .await?;
+        let revision = revision_to_u64(meta.try_get::<i64, _>("current_revision")?)?;
+        let snapshot_xmin: String = meta.try_get("snapshot_xmin")?;
+
+        let cached_snapshot = {
+            let guard = self
+                .cached
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .as_ref()
+                .filter(|entry| entry.revision == revision && entry.snapshot_xmin == snapshot_xmin)
+                .map(|entry| (Arc::clone(&entry.snapshot), entry.compiled.clone()))
+        };
+
+        if let Some((snapshot, compiled)) = cached_snapshot {
+            if !need_compiled {
+                return Ok((snapshot, compiled));
+            }
+            if let Some(compiled) = compiled {
+                return Ok((snapshot, Some(compiled)));
+            }
+            let compiled = crate::compile_cache::compile_snapshot(&snapshot).await?;
+            let mut guard = self
+                .cached
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = guard
+                .as_mut()
+                .filter(|entry| entry.revision == revision && entry.snapshot_xmin == snapshot_xmin)
+            {
+                entry.compiled = Some(Arc::clone(&compiled));
+            }
+            return Ok((snapshot, Some(compiled)));
+        }
+
+        let row = sqlx::query(
+            "SELECT state.current_revision, snapshots.xmin::text AS snapshot_xmin, snapshots.snapshot
+               FROM control_state AS state
+               JOIN model_snapshots AS snapshots ON snapshots.revision_id = state.current_revision
+              WHERE state.id = TRUE",
+        )
+        .fetch_one(pool)
+        .await?;
+        let revision = revision_to_u64(row.try_get::<i64, _>("current_revision")?)?;
+        let snapshot_xmin: String = row.try_get("snapshot_xmin")?;
+        let snapshot = Arc::new(decode_stored_snapshot(row.try_get("snapshot")?, revision)?);
+        let compiled = if need_compiled {
+            Some(crate::compile_cache::compile_snapshot(&snapshot).await?)
+        } else {
+            None
+        };
+        let mut guard = self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(CachedCurrentSnapshot {
+            revision,
+            snapshot_xmin,
+            snapshot: Arc::clone(&snapshot),
+            compiled: compiled.clone(),
+        });
+        Ok((snapshot, compiled))
+    }
 }
 
 async fn load_stored_snapshot(pool: &PgPool, revision: u64) -> Result<Option<ModelSnapshot>> {

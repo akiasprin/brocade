@@ -1636,6 +1636,8 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// administrator does not have to wait for the path-MTU probe cadence after debt has converged.
 const RUNTIME_INTERVAL: Duration = Duration::from_secs(30);
 const PROBE_TARGETS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const CONNECTED_PROBE_TARGETS_MIN_SECS: u64 = 5 * 60;
+const CONNECTED_PROBE_TARGETS_JITTER_SECS: u64 = 60;
 /// Host sampling. Shorter than every other cycle by necessity: CPU is differenced over this
 /// interval, and a 30-second difference averages a spike away, while spikes are the dominant
 /// component of forwarding load. The report is still sent every 30 seconds, carrying the peak
@@ -1646,9 +1648,13 @@ const LOAD_INTERVAL: Duration = Duration::from_secs(load::SUB_INTERVAL_SECS);
 /// control plane usually has nothing measurable either, and a longer interval reduces
 /// load in that state.
 const E2E_TARGETS_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const CONNECTED_E2E_TARGETS_MIN_SECS: u64 = 60;
+const CONNECTED_E2E_TARGETS_JITTER_SECS: u64 = 30;
 /// Settings change much less often than samples. Refresh independently so even a day-long sampling
 /// interval learns a policy change promptly, without putting a GET in front of every observation.
 const PING_PROBE_SETTINGS_INTERVAL: Duration = Duration::from_secs(15);
+const CONNECTED_PING_SETTINGS_MIN_SECS: u64 = 60;
+const CONNECTED_PING_SETTINGS_JITTER_SECS: u64 = 30;
 const SPOOL_IDLE_POLL: Duration = Duration::from_secs(1);
 
 fn connected_apply_poll_interval(options: &Options, successful: bool) -> Duration {
@@ -1661,6 +1667,20 @@ fn connected_apply_poll_interval(options: &Options, successful: bool) -> Duratio
         CONNECTED_APPLY_POLL_MIN_SECS,
         CONNECTED_APPLY_POLL_JITTER_SECS,
     )
+}
+
+fn connected_probe_poll_interval(
+    options: &Options,
+    domain: &str,
+    fallback: Duration,
+    minimum_secs: u64,
+    jitter_secs: u64,
+    successful: bool,
+) -> Duration {
+    if !successful {
+        return fallback;
+    }
+    wake::stable_poll_interval(&options.token, domain, minimum_secs, jitter_secs)
 }
 const SPOOL_MAX_RETRY: Duration = Duration::from_secs(60);
 const LATEST_REPORT_RETRY_MIN: Duration = Duration::from_secs(1);
@@ -1993,17 +2013,35 @@ fn run_forever(options: Options) -> Result<(), String> {
                 let mut wake =
                     wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Probe);
                 let mut tick = Instant::now();
+                let mut connected_tick = tick;
                 loop {
+                    let mut succeeded = false;
                     each_round("probe-targets", || {
                         match fetch_probe_targets(&settings_options) {
-                            Ok(next) => settings_out.publish(next),
+                            Ok(next) => {
+                                settings_out.publish(next);
+                                succeeded = true;
+                            }
                             Err(error) => eprintln!("probe targets: {error}"),
                         }
                     });
                     let now = Instant::now();
                     tick = next_periodic_tick(tick, PROBE_TARGETS_REFRESH_INTERVAL, now);
-                    if wake.wait(tick.saturating_duration_since(now)) {
+                    let connected_interval = connected_probe_poll_interval(
+                        &settings_options,
+                        "probe-targets",
+                        PROBE_TARGETS_REFRESH_INTERVAL,
+                        CONNECTED_PROBE_TARGETS_MIN_SECS,
+                        CONNECTED_PROBE_TARGETS_JITTER_SECS,
+                        succeeded,
+                    );
+                    connected_tick = next_periodic_tick(connected_tick, connected_interval, now);
+                    if wake.wait_connected(
+                        tick.saturating_duration_since(now),
+                        connected_tick.saturating_duration_since(now),
+                    ) {
                         tick = Instant::now();
+                        connected_tick = tick;
                     }
                 }
             })
@@ -2171,17 +2209,35 @@ fn run_forever(options: Options) -> Result<(), String> {
                 let mut wake =
                     wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Probe);
                 let mut tick = Instant::now();
+                let mut connected_tick = tick;
                 loop {
+                    let mut succeeded = false;
                     each_round("ping-settings", || {
                         match fetch_ping_probe_settings(&settings_options) {
-                            Ok(next) => settings_out.publish(next),
+                            Ok(next) => {
+                                settings_out.publish(next);
+                                succeeded = true;
+                            }
                             Err(error) => eprintln!("ping-probe settings: {error}"),
                         }
                     });
                     let now = Instant::now();
                     tick = next_periodic_tick(tick, PING_PROBE_SETTINGS_INTERVAL, now);
-                    if wake.wait(tick.saturating_duration_since(now)) {
+                    let connected_interval = connected_probe_poll_interval(
+                        &settings_options,
+                        "ping-settings",
+                        PING_PROBE_SETTINGS_INTERVAL,
+                        CONNECTED_PING_SETTINGS_MIN_SECS,
+                        CONNECTED_PING_SETTINGS_JITTER_SECS,
+                        succeeded,
+                    );
+                    connected_tick = next_periodic_tick(connected_tick, connected_interval, now);
+                    if wake.wait_connected(
+                        tick.saturating_duration_since(now),
+                        connected_tick.saturating_duration_since(now),
+                    ) {
                         tick = Instant::now();
+                        connected_tick = tick;
                     }
                 }
             })
@@ -2242,17 +2298,35 @@ fn run_forever(options: Options) -> Result<(), String> {
                 let mut wake =
                     wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Probe);
                 let mut tick = Instant::now();
+                let mut connected_tick = tick;
                 loop {
+                    let mut succeeded = false;
                     each_round("e2e-targets", || {
                         match fetch_e2e_probe_targets(&settings_options) {
-                            Ok(next) => settings_out.publish(next),
+                            Ok(next) => {
+                                settings_out.publish(next);
+                                succeeded = true;
+                            }
                             Err(error) => eprintln!("e2e targets: {error}"),
                         }
                     });
                     let now = Instant::now();
                     tick = next_periodic_tick(tick, E2E_TARGETS_REFRESH_INTERVAL, now);
-                    if wake.wait(tick.saturating_duration_since(now)) {
+                    let connected_interval = connected_probe_poll_interval(
+                        &settings_options,
+                        "e2e-targets",
+                        E2E_TARGETS_REFRESH_INTERVAL,
+                        CONNECTED_E2E_TARGETS_MIN_SECS,
+                        CONNECTED_E2E_TARGETS_JITTER_SECS,
+                        succeeded,
+                    );
+                    connected_tick = next_periodic_tick(connected_tick, connected_interval, now);
+                    if wake.wait_connected(
+                        tick.saturating_duration_since(now),
+                        connected_tick.saturating_duration_since(now),
+                    ) {
                         tick = Instant::now();
+                        connected_tick = tick;
                     }
                 }
             })
@@ -5672,6 +5746,56 @@ mod tests {
         assert_eq!(
             successful,
             super::connected_apply_poll_interval(&options, true)
+        );
+    }
+
+    #[test]
+    fn probe_poll_only_backs_off_after_a_successful_round() {
+        let options = super::Options {
+            command: "run".into(),
+            server: "http://127.0.0.1".into(),
+            token: "fixture-token".into(),
+            state_dir: std::path::PathBuf::new(),
+            apply_mode: super::ApplyMode::StateDir,
+            vpngate_stats_window: std::time::Duration::from_secs(900),
+        };
+        assert_eq!(
+            super::connected_probe_poll_interval(
+                &options,
+                "e2e-targets",
+                super::E2E_TARGETS_REFRESH_INTERVAL,
+                super::CONNECTED_E2E_TARGETS_MIN_SECS,
+                super::CONNECTED_E2E_TARGETS_JITTER_SECS,
+                false,
+            ),
+            super::E2E_TARGETS_REFRESH_INTERVAL
+        );
+        let successful = super::connected_probe_poll_interval(
+            &options,
+            "e2e-targets",
+            super::E2E_TARGETS_REFRESH_INTERVAL,
+            super::CONNECTED_E2E_TARGETS_MIN_SECS,
+            super::CONNECTED_E2E_TARGETS_JITTER_SECS,
+            true,
+        );
+        assert!(
+            (std::time::Duration::from_secs(super::CONNECTED_E2E_TARGETS_MIN_SECS)
+                ..=std::time::Duration::from_secs(
+                    super::CONNECTED_E2E_TARGETS_MIN_SECS
+                        + super::CONNECTED_E2E_TARGETS_JITTER_SECS,
+                ))
+                .contains(&successful)
+        );
+        assert_eq!(
+            successful,
+            super::connected_probe_poll_interval(
+                &options,
+                "e2e-targets",
+                super::E2E_TARGETS_REFRESH_INTERVAL,
+                super::CONNECTED_E2E_TARGETS_MIN_SECS,
+                super::CONNECTED_E2E_TARGETS_JITTER_SECS,
+                true,
+            )
         );
     }
 

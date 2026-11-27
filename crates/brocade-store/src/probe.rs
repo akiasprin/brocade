@@ -91,8 +91,10 @@ pub struct LinkMtuItem {
 /// Computed from the current model: every other live backbone member, taking their
 /// `public_ipv4` and wg transport. Peers behind NAT do not enter the list — they cannot be
 /// probed from this side, and that link is probed by them (`ProbeTarget`).
-pub async fn probe_targets(pool: &PgPool, node_id: &str) -> Result<ProbeTargetList> {
-    let snapshot = crate::materialize::load_current_immutable_snapshot(pool).await?;
+pub(crate) fn probe_targets_from_snapshot(
+    snapshot: &ModelSnapshot,
+    node_id: &str,
+) -> ProbeTargetList {
     // Links exist only between backbone members, and a decommissioned one is not on the
     // network. A machine does not probe itself.
     let mut targets = snapshot
@@ -113,7 +115,7 @@ pub async fn probe_targets(pool: &PgPool, node_id: &str) -> Result<ProbeTargetLi
         .collect::<Vec<_>>();
     targets.sort_by(|a, b| a.peer_node_id.cmp(&b.peer_node_id));
 
-    Ok(ProbeTargetList { targets })
+    ProbeTargetList { targets }
 }
 
 pub async fn record_link_probe(
@@ -561,24 +563,23 @@ pub struct E2eProbeSampleSeries {
     pub ttfb_ms: Vec<Option<u32>>,
 }
 
-/// Which chains this machine probes as their head.
-///
-/// Compiled on demand from the current model rather than looked up: the work list is a function
-/// of the model, and storing a copy introduces a state where the stored and the compiled
-/// disagree — whose symptom is the probe knocking with a credential xray does not know, which
-/// looks exactly like a genuinely broken chain.
-pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeTargetList> {
-    let snapshot = crate::materialize::load_current_immutable_snapshot(pool).await?;
-    e2e_targets_from_snapshot(pool, &snapshot, node_id).await
-}
-
 pub(crate) async fn e2e_targets_from_snapshot(
     pool: &PgPool,
     snapshot: &ModelSnapshot,
     node_id: &str,
 ) -> Result<E2eProbeTargetList> {
+    let output = crate::compile_cache::compile_snapshot(snapshot).await?;
+    e2e_targets_from_compiled(pool, snapshot, &output, node_id).await
+}
+
+pub(crate) async fn e2e_targets_from_compiled(
+    pool: &PgPool,
+    snapshot: &ModelSnapshot,
+    output: &brocade_core::compile::CompileOutput,
+    node_id: &str,
+) -> Result<E2eProbeTargetList> {
     let probe_settings = snapshot.settings.probe.clone();
-    let plan = e2e_probe_plan(snapshot, node_id)?;
+    let plan = e2e_probe_plan(output, node_id)?;
     let pinned_peer_cert_sha256 = self_signed_certificate_pin(pool, node_id).await?;
 
     Ok(E2eProbeTargetList {
@@ -730,9 +731,11 @@ async fn self_signed_certificate_pin(pool: &PgPool, node_id: &str) -> Result<Opt
 /// Keep the publish gate on the store boundary. A compile failure is not an empty work list:
 /// empty means this node genuinely heads no chains, while failure means the control plane cannot
 /// safely state what it should probe.
-fn e2e_probe_plan(snapshot: &ModelSnapshot, node_id: &str) -> Result<ProbePlan> {
-    let output = crate::compile_cache::compile_incremental(snapshot);
-    crate::compile_cache::project_probe(&output, node_id)
+fn e2e_probe_plan(
+    output: &brocade_core::compile::CompileOutput,
+    node_id: &str,
+) -> Result<ProbePlan> {
+    crate::compile_cache::project_probe(output, node_id)
         .map(|plan| plan.as_ref().clone())
         .map_err(StoreError::from)
 }
@@ -1028,7 +1031,8 @@ pub(crate) fn unlock_family_probe_nodes(
     app: &str,
     chain: &str,
 ) -> Result<Option<Vec<String>>> {
-    Ok(e2e_probe_plan(snapshot, node)?
+    let output = crate::compile_cache::compile_incremental(snapshot);
+    Ok(e2e_probe_plan(&output, node)?
         .targets
         .into_iter()
         .find(|target| target.app_id.as_deref() == Some(app) && target.chain_id == chain)
@@ -1043,7 +1047,8 @@ pub(crate) fn unlock_dns_exits(
     app: &str,
     chain: &str,
 ) -> Result<Option<Vec<String>>> {
-    Ok(e2e_probe_plan(snapshot, node)?
+    let output = crate::compile_cache::compile_incremental(snapshot);
+    Ok(e2e_probe_plan(&output, node)?
         .targets
         .into_iter()
         .find(|target| target.app_id.as_deref() == Some(app) && target.chain_id == chain)
@@ -1082,7 +1087,8 @@ mod tests {
             apps: Vec::new(),
         };
 
-        let error = e2e_probe_plan(&snapshot, "hk").unwrap_err();
+        let output = crate::compile_cache::compile_incremental(&snapshot);
+        let error = e2e_probe_plan(&output, "hk").unwrap_err();
         let blocked = match error {
             StoreError::PublishBlocked(blocked) => blocked,
             other => panic!("编译失败必须保留为发布门禁错误：{other:?}"),
