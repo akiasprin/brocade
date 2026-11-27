@@ -7,6 +7,7 @@ fetch mutable images, or import a developer machine's running Cube installation.
 import importlib.util
 import json
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import subprocess
@@ -17,6 +18,102 @@ from cvm_elf import validate as validate_elf
 
 
 ASSETS = ('system.json', 'root.ext4', 'vmlinux', 'guest.img', 'agent.ext4')
+GUEST_EXECUTABLES = (
+    '/usr/bin/cat',
+    '/usr/bin/id',
+    '/usr/bin/install',
+    '/usr/bin/kill',
+    '/usr/bin/mktemp',
+    '/usr/bin/rm',
+    '/usr/bin/sed',
+    '/usr/bin/ssh-keygen',
+    '/usr/bin/touch',
+    '/usr/sbin/chpasswd',
+    '/usr/sbin/sshd',
+)
+
+
+def _debugfs(image, command):
+    try:
+        result = subprocess.run(
+            ['debugfs', '-R', command, str(image)],
+            check=False,
+            capture_output=True,
+        )
+    except FileNotFoundError as error:
+        raise stack.StackError('debugfs is required to validate the Guest image') from error
+    diagnostics = result.stderr.decode(errors='replace')
+    if result.returncode or 'File not found by ext2_lookup' in diagnostics:
+        raise stack.StackError(f'Guest image lookup failed: {command}')
+    return result.stdout
+
+
+def _guest_read(image, path):
+    return _debugfs(image, f'cat {path}')
+
+
+def _guest_stat(image, path):
+    output = _debugfs(image, f'stat {path}').decode(errors='replace')
+    match = re.search(r'Type:\s+(\w+)\s+Mode:\s+([0-7]+)', output)
+    if not match:
+        raise stack.StackError(f'Guest image path is missing or invalid: {path}')
+    destination = None
+    if match[1] == 'symlink':
+        link = re.search(r'Fast link dest:\s+"([^"]+)"', output)
+        if not link:
+            raise stack.StackError(f'Guest image symlink cannot be resolved: {path}')
+        destination = link[1]
+    return match[1], int(match[2], 8), destination
+
+
+def _validate_guest_executable(image, path, stat_file):
+    current = path
+    seen = set()
+    for _ in range(8):
+        if current in seen:
+            raise stack.StackError(f'Guest image executable has a symlink cycle: {path}')
+        seen.add(current)
+        try:
+            kind, mode, destination = stat_file(image, current)
+        except (KeyError, stack.StackError) as error:
+            raise stack.StackError(f'Guest image is missing required executable: {path}') from error
+        if kind == 'regular':
+            if not mode & 0o111:
+                raise stack.StackError(f'Guest image path is not executable: {path}')
+            return
+        if kind != 'symlink' or not destination:
+            raise stack.StackError(f'Guest image executable has invalid file type: {path}')
+        current = posixpath.normpath(
+            destination if destination.startswith('/') else posixpath.join(posixpath.dirname(current), destination)
+        )
+        if not current.startswith('/'):
+            raise stack.StackError(f'Guest image executable symlink escapes the root: {path}')
+    raise stack.StackError(f'Guest image executable has too many symlink levels: {path}')
+
+
+def validate_guest_contract(image, read_file=_guest_read, stat_file=_guest_stat):
+    try:
+        passwd = read_file(image, '/etc/passwd').decode('utf-8')
+    except (KeyError, UnicodeDecodeError, stack.StackError) as error:
+        raise stack.StackError('Guest image has no valid /etc/passwd') from error
+    accounts = [line.split(':') for line in passwd.splitlines() if line and not line.startswith('#')]
+    cube = [fields for fields in accounts if len(fields) == 7 and fields[0] == 'cube']
+    if len(cube) != 1 or cube[0][5] != '/home/cube' or cube[0][6] in ('', '/bin/false', '/sbin/nologin'):
+        raise stack.StackError('Guest image must contain one login-capable cube account with /home/cube')
+    try:
+        home_kind, _, _ = stat_file(image, '/home/cube')
+    except (KeyError, stack.StackError) as error:
+        raise stack.StackError('Guest image cube account has no home directory') from error
+    if home_kind != 'directory':
+        raise stack.StackError('Guest image cube account home is not a directory')
+    try:
+        sshd_config = read_file(image, '/etc/ssh/sshd_config')
+    except (KeyError, stack.StackError) as error:
+        raise stack.StackError('Guest image has no OpenSSH server configuration') from error
+    if not sshd_config.strip() or b'\0' in sshd_config:
+        raise stack.StackError('Guest image OpenSSH server configuration is invalid')
+    for path in ('/bin/sh', cube[0][6], *GUEST_EXECUTABLES):
+        _validate_guest_executable(image, path, stat_file)
 
 
 @stack.progress_task('assemble node bundle')
@@ -41,6 +138,7 @@ def prepare(root, build_manifest, assets, output):
         source = assets / name
         if source.is_symlink() or not source.is_file() or stack.digest(source) != asset_manifest['files'][name]:
             raise stack.StackError('Guest asset SHA-256 mismatch')
+    validate_guest_contract(assets / 'guest.img')
     with tempfile.TemporaryDirectory(prefix='package-', dir=build_manifest.parent) as temporary:
         tree = Path(temporary)
 

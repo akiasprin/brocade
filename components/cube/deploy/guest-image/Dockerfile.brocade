@@ -1,0 +1,20 @@
+FROM tencentos/tencentos4-minimal@sha256:9a154ca0cba3392c8d29fd08db6b8bb499c917085af9c218ad522952c44ce43a
+
+WORKDIR /work
+
+RUN yum install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
+        busybox \
+        openssh-clients \
+        openssh-server \
+        shadow-utils \
+        util-linux \
+ && useradd --create-home --shell /bin/bash cube \
+ && rm -f /etc/ssh/ssh_host_* \
+ && yum clean all \
+ && rm -rf /var/cache/yum /var/cache/dnf /var/log/yum.log /var/log/dnf.* \
+           /usr/share/doc /usr/share/man /usr/share/info \
+           /usr/share/licenses /usr/share/groff \
+           /usr/share/locale/* /usr/lib/locale/* \
+           /tmp/* /var/tmp/*
+
+CMD ["bash"]

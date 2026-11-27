@@ -487,7 +487,12 @@ config=$(mktemp /etc/ssh/.brocade-sshd.XXXXXX)
 trap 'rm -f "$config"' EXIT
 printf '# BROCADE PASSWORD BEGIN\nPasswordAuthentication yes\n# BROCADE PASSWORD END\n' > "$config"
 cat /etc/ssh/sshd_config >> "$config"
+install -d -m 0755 /run/sshd
 /usr/sbin/sshd -t -f "$config"
 cat "$config" > /etc/ssh/sshd_config
-if [ -s /run/sshd.pid ]; then kill -HUP "$(cat /run/sshd.pid)"; fi
+if [ -s /run/sshd.pid ]; then
+  kill -HUP "$(cat /run/sshd.pid)"
+else
+  /usr/sbin/sshd
+fi
 "#;

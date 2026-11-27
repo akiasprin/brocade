@@ -296,3 +296,11 @@ fn password_initialization_compiles_only_a_versioned_secret_reference() {
     input.spec.login_revision = 0;
     assert!(compile(&input).is_err());
 }
+
+#[test]
+fn password_initialization_creates_runtime_state_and_starts_ssh() {
+    assert!(PASSWORD_INIT_SCRIPT.contains("install -d -m 0755 /run/sshd"));
+    assert!(PASSWORD_INIT_SCRIPT.contains("/usr/sbin/sshd -t -f \"$config\""));
+    assert!(PASSWORD_INIT_SCRIPT.contains("kill -HUP \"$(cat /run/sshd.pid)\""));
+    assert!(PASSWORD_INIT_SCRIPT.contains("else\n  /usr/sbin/sshd\nfi"));
+}
