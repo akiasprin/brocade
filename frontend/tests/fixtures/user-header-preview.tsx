@@ -132,7 +132,7 @@ const presenceSource = (
 };
 const presenceState = params.get('presence');
 const incompletePresence = presenceState === 'partial' || presenceState === 'unavailable';
-const withSources = presenceState === 'sources' || incompletePresence;
+const withSources = presenceState === 'sources' || incompletePresence || params.has('historyPages');
 const onlineSources = withSources
   ? [presenceSource('198.51.100.77', 'tw-01', 371, true, 8.4), presenceSource('203.0.113.24', 'hk-01', 134, true, 1.2)]
   : [];
@@ -157,6 +157,14 @@ if (params.has('sessionHistory')) {
       session_downlink_bytes: null,
     },
   );
+  historySources.forEach((source, index) => {
+    source.session_id = String(index + 1);
+    source.offline_at = source.last_observed_at;
+  });
+}
+if (params.has('historyPages')) {
+  const burst = historySources[0];
+  historySources.push(...Array.from({ length: 253 }, () => ({ ...burst })));
   historySources.forEach((source, index) => {
     source.session_id = String(index + 1);
     source.offline_at = source.last_observed_at;
@@ -429,15 +437,25 @@ globalThis.fetch = async (input, init) => {
       });
     return Response.json({ tenant_id: tenant, user_id: selected, ...empty });
   }
-  if (path.endsWith('/presence-history'))
+  if (path.split('?')[0].endsWith('/presence-history')) {
+    const more = path.includes('?before=');
+    const paged = params.has('historyPages') && selected === 'alice';
+    const sources =
+      selected !== 'alice'
+        ? []
+        : paged && more
+          ? [{ ...presenceSource('198.51.100.88', 'jp-01', 20 * 24 * 60, false, 0.5), session_id: 'older' }]
+          : historySources;
     return Response.json({
       tenant_id: tenant,
       user_id: selected,
       retention_days: 30,
-      truncated: false,
-      sources: selected === 'alice' ? historySources : [],
-      ...locate(historySources.map(source => source.ip)),
+      truncated: paged && !more,
+      next_cursor: paged && !more ? '1760000000123456:1' : null,
+      sources,
+      ...locate(sources.map(source => source.ip)),
     });
+  }
   if (path === '/grant-probes/capability') return Response.json({ available: false, reason: '示例不拨测' });
   return Response.json({ error: `示例未提供 ${path}` }, { status: 404 });
 };

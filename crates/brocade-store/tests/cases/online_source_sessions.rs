@@ -147,6 +147,97 @@ async fn online_source_sessions_survive_reconnects_and_retries() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn online_source_sessions_history_pages_preserve_every_epoch() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    // Interleaved timestamps and IP families exercise ordering independent of identity/IP.
+    sqlx::query("INSERT INTO user_online_sources(node_id,tenant_id,user_id,ingress_id,source_ip,active,first_observed_at,last_observed_at,xray_last_seen_at,offline_at)
+        SELECT 'n1','platform.acme','alice','ing-a1b2',
+            CASE WHEN i % 2 = 0 THEN '2001:db8::1'::inet ELSE '1.1.1.1'::inet END,
+            FALSE,now()-interval '2 days',now()-interval '1 day'+(i%3)*interval '1 microsecond',now(),now()
+        FROM generate_series(1,600) AS i")
+        .execute(db.pool()).await.unwrap();
+    let expected: Vec<String> = sqlx::query_scalar("SELECT session_id::text FROM user_online_sources ORDER BY last_observed_at DESC,user_online_sources.session_id DESC")
+        .fetch_all(db.pool()).await.unwrap();
+    let first = history(&db).await;
+    assert!(first.truncated);
+    assert_eq!(first.sources.len(), 256);
+    let mut cursor = first.next_cursor;
+    let mut actual: Vec<String> = first
+        .sources
+        .into_iter()
+        .map(|s| s.session_id.unwrap())
+        .collect();
+    // A pruned boundary row must not invalidate its cursor or hide the next rows.
+    sqlx::query("DELETE FROM user_online_sources WHERE session_id=$1::bigint")
+        .bind(actual.last().unwrap().parse::<i64>().unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    // A newer epoch arriving between requests belongs to the next refresh, not an older page.
+    sqlx::query("INSERT INTO user_online_sources(node_id,tenant_id,user_id,ingress_id,source_ip,active,first_observed_at,last_observed_at,xray_last_seen_at,offline_at)
+        VALUES('n1','platform.acme','alice','ing-a1b2','8.8.8.8',FALSE,now(),now(),now(),now())")
+        .execute(db.pool()).await.unwrap();
+    let mut pages = 1;
+    while let Some(before) = cursor {
+        let page = db
+            .store
+            .user_online_source_history_page(
+                &system_admin(),
+                "platform.acme",
+                "alice",
+                Some(&before),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.truncated, page.next_cursor.is_some());
+        assert!(page.sources.len() <= 256);
+        actual.extend(page.sources.into_iter().map(|s| s.session_id.unwrap()));
+        cursor = page.next_cursor;
+        pages += 1;
+        assert!(pages <= 3, "cursor must make progress");
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(actual, expected);
+    for invalid in [
+        "",
+        "1",
+        "-1:1",
+        "1:0",
+        "1:2:3",
+        "253402300800000000:1",
+        "1:9223372036854775808",
+    ] {
+        assert!(matches!(
+            db.store
+                .user_online_source_history_page(
+                    &system_admin(),
+                    "platform.acme",
+                    "alice",
+                    Some(invalid)
+                )
+                .await,
+            Err(StoreError::InvalidData(_))
+        ));
+    }
+    assert!(matches!(
+        db.store
+            .user_online_source_history_page(
+                &tenant_admin("other"),
+                "platform.acme",
+                "alice",
+                Some("1:1")
+            )
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn online_source_sessions_upgrade_preserves_rows_and_rolls_back_ddl_failure() {
     use sha2::{Digest, Sha384};
     let Some(db) = TestPg::start_if_enabled().await else {

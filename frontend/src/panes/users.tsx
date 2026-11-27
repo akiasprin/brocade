@@ -14,7 +14,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from 'react';
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   createUser,
   fetchMyUser,
@@ -759,29 +759,44 @@ function UserPresenceCard({
     )
     .sort()
     .join(' ');
-  const history = useQuery({
+  const history = useInfiniteQuery({
     queryKey: ['user-presence-history', user.tenant_id, user.id, onlineKey],
-    queryFn: () => fetchUserOnlineSourceHistory(user.tenant_id, user.id),
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) => fetchUserOnlineSourceHistory(user.tenant_id, user.id, pageParam),
+    getNextPageParam: page => page.next_cursor ?? undefined,
     enabled: !pending,
     staleTime: 0,
     // 同一地址在两次轮询之间重连时，在线 IP 集合可能不变，历史仍需定期更新。
     refetchInterval: 30_000,
-    placeholderData: keepPreviousData,
+    // 只沿用同一用户的结果，切换用户不能短暂显示另一位用户的来源。
+    placeholderData: (previous, query) =>
+      query?.queryKey[1] === user.tenant_id && query.queryKey[2] === user.id ? previous : undefined,
   });
+  const historyData = useMemo(() => {
+    const pages = history.data?.pages;
+    if (!pages?.length) return undefined;
+    return {
+      ...pages[0],
+      truncated: pages[pages.length - 1].truncated,
+      sources: pages.flatMap(page => page.sources),
+      source_countries: pages.flatMap(page => page.source_countries ?? []),
+      source_operators: pages.flatMap(page => page.source_operators ?? []),
+    };
+  }, [history.data]);
   const mergedHistory = useMemo(
-    () => mergePresenceHistory(history.data?.sources ?? [], masked),
-    [history.data?.sources, masked],
+    () => mergePresenceHistory(historyData?.sources ?? [], masked),
+    [historyData?.sources, masked],
   );
   // 已结束周期按时间逐条展示，地址重新上线也不隐藏旧周期。
   // 旧 Console 仅返回地址快照，仍沿用旧版去重，避免重复当前快照。
   const onlineIps = new Set(online.map(source => source.ip));
-  const offline = (history.data?.sources ?? [])
+  const offline = (historyData?.sources ?? [])
     .filter(source => source.session_id || !onlineIps.has(source.ip))
     .sort((a, b) => lastSeenOrder(b) - lastSeenOrder(a) || a.ip.localeCompare(b.ip));
   const addressCount = new Set([...online, ...offline].map(source => source.ip)).size;
-  const retentionDays = history.data?.retention_days ?? 30;
-  const historyCountries = new Map(history.data?.source_countries?.map(({ ip, country }) => [ip, country]));
-  const historyOperators = new Map(history.data?.source_operators?.map(({ ip, operator }) => [ip, operator]));
+  const retentionDays = historyData?.retention_days ?? 30;
+  const historyCountries = new Map(historyData?.source_countries?.map(({ ip, country }) => [ip, country]));
+  const historyOperators = new Map(historyData?.source_operators?.map(({ ip, operator }) => [ip, operator]));
 
   // 封禁名单在卡底管理；已结束周期仍按时间排列，不因当前被封禁而隐藏。
   const bannedIps = new Set(masked ? [] : (bans?.ips ?? []));
@@ -822,7 +837,7 @@ function UserPresenceCard({
   const banOperators = new Map(bans?.source_operators?.map(({ ip, operator }) => [ip, operator]));
   const confirmedNodes = new Set(bans?.nodes.filter(node => node.phase === 'applied').map(node => node.node_id));
   // 「30 天内未出现」要有完整的在线统计和未截断的历史作依据，否则只能不写。
-  const absenceKnown = !masked && presence?.state === 'complete' && !!history.data && !history.data.truncated;
+  const absenceKnown = !masked && presence?.state === 'complete' && !!historyData && !historyData.truncated;
   const banList = bans?.ips ?? [];
   const bannedRows: BannedSource[] = banList
     .map((ip, index): BannedSource => {
@@ -886,10 +901,10 @@ function UserPresenceCard({
     <>
       {partial ? '在线至少 ' : '在线 '}
       <b>{online.length}</b>
-      {history.data && !masked && (
+      {historyData && !masked && (
         <>
           {' '}
-          · {retentionDays} 天{history.data.truncated ? '至少 ' : ' '}
+          · {retentionDays} 天{historyData.truncated ? '至少 ' : ' '}
           <b>{addressCount}</b> 个地址
         </>
       )}
@@ -948,7 +963,7 @@ function UserPresenceCard({
             ? null
             : offline.length > 0
               ? { tone: 'idle', text: '暂无在线连接' }
-              : history.data
+              : historyData
                 ? { tone: 'idle', text: `最近 ${retentionDays} 天没有来源记录` }
                 : null;
 
@@ -1004,7 +1019,7 @@ function UserPresenceCard({
           </div>
         )}
         {!!history.error && <ErrorBox error={history.error} />}
-        {history.data?.truncated && (
+        {historyData?.truncated && !history.hasNextPage && (
           <span className="user-presence-history-note">记录较多，仅显示最近 256 段已结束会话。</span>
         )}
         {timelineOffline.length > PRESENCE_HISTORY_PREVIEW_LIMIT && (
@@ -1015,6 +1030,19 @@ function UserPresenceCard({
             onClick={() => setHistoryExpanded(expanded => !expanded)}
           >
             {historyExpanded ? '收起历史记录' : `显示其余 ${hiddenHistoryCount} 条历史记录`}
+          </button>
+        )}
+        {history.hasNextPage && (
+          <button
+            type="button"
+            className="user-presence-more"
+            disabled={history.isFetching}
+            onClick={() => {
+              setHistoryExpanded(true);
+              void history.fetchNextPage();
+            }}
+          >
+            {history.isFetchingNextPage ? '正在读取更早的历史记录…' : '读取更早的历史记录'}
           </button>
         )}
         {bans && bannedRows.length > 0 && (

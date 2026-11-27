@@ -106,6 +106,9 @@ pub struct UserOnlineSourceHistory {
     pub user_id: String,
     pub retention_days: u32,
     pub truncated: bool,
+    /// Continue strictly before this observation/session pair; absent on the final page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     pub sources: Vec<UserOnlineSourceView>,
 }
 
@@ -585,6 +588,19 @@ pub async fn list(pool: &PgPool, actor: &AdminContext) -> Result<UserPresenceLis
     })
 }
 
+fn history_cursor(value: &str) -> Result<(i64, i64)> {
+    let parsed = value
+        .split_once(':')
+        .and_then(|(micros, id)| Some((micros.parse::<i64>().ok()?, id.parse::<i64>().ok()?)));
+    match parsed {
+        // Restrict timestamps to 1970–9999 and IDs to the positive identity range.
+        Some((micros @ 0..=253_402_300_799_999_999, id @ 1..)) => Ok((micros, id)),
+        _ => Err(StoreError::InvalidData(
+            "invalid online source history cursor".to_owned(),
+        )),
+    }
+}
+
 /// List completed ingress/IP epochs for one user, including addresses currently online again.
 ///
 /// History is intentionally separate from [`list`]: the roster polls current presence, while
@@ -595,6 +611,7 @@ pub async fn history(
     actor: &AdminContext,
     tenant_id: &str,
     user_id: &str,
+    before: Option<&str>,
 ) -> Result<UserOnlineSourceHistory> {
     let retention_hours = crate::retention::ttl_hours(pool, "user_online_sources").await?;
     let retention_days = retention_hours.div_ceil(24);
@@ -619,10 +636,13 @@ pub async fn history(
         return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
     }
 
+    let cursor = before.map(history_cursor).transpose()?;
+
     let fetch_limit = i64::try_from(USER_ONLINE_SOURCE_HISTORY_LIMIT + 1)
         .expect("online source history limit fits i64");
     let rows = sqlx::query(
         "SELECT host(source.source_ip) AS ip, source.session_id::text AS session_id,
+                (extract(epoch FROM source.last_observed_at) * 1000000)::bigint AS cursor_micros,
                 source.offline_at::text AS offline_at,
                 source.first_observed_at::text AS first_observed_at,
                 source.last_observed_at::text AS last_observed_at,
@@ -644,17 +664,34 @@ pub async fn history(
             AND source.user_id = $2
             AND NOT source.active
             AND source.last_observed_at >= now() - make_interval(secs => $3)
-          ORDER BY source.last_observed_at DESC, host(source.source_ip), source.session_id DESC
+            AND ($5::bigint IS NULL OR (source.last_observed_at, source.session_id) < (
+                'epoch'::timestamptz + ($5::bigint / 1000000) * interval '1 second'
+                    + ($5::bigint % 1000000) * interval '1 microsecond', $6::bigint))
+          ORDER BY source.last_observed_at DESC, source.session_id DESC
           LIMIT $4",
     )
     .bind(&tenant_id)
     .bind(&user_id)
     .bind(f64::from(retention_hours) * 3600.0)
     .bind(fetch_limit)
+    .bind(cursor.map(|(micros, _)| micros))
+    .bind(cursor.map(|(_, id)| id))
     .fetch_all(pool)
     .await?;
 
     let truncated = rows.len() > USER_ONLINE_SOURCE_HISTORY_LIMIT;
+    // The cursor carries the ordering values, so retention may delete its row without
+    // invalidating the next page. Split seconds/microseconds above to avoid float rounding.
+    let next_cursor = if truncated {
+        let row = &rows[USER_ONLINE_SOURCE_HISTORY_LIMIT - 1];
+        Some(format!(
+            "{}:{}",
+            row.try_get::<i64, _>("cursor_micros")?,
+            row.try_get::<String, _>("session_id")?
+        ))
+    } else {
+        None
+    };
     let sources = rows
         .into_iter()
         .take(USER_ONLINE_SOURCE_HISTORY_LIMIT)
@@ -697,6 +734,7 @@ pub async fn history(
         user_id,
         retention_days,
         truncated,
+        next_cursor,
         sources,
     })
 }

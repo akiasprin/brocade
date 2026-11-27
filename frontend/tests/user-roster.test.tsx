@@ -1358,6 +1358,61 @@ describe('user roster rows', () => {
     expect(card.querySelectorAll('.user-presence-row.off')).toHaveLength(6);
   });
 
+  it('reads past a full page of merged epochs, preserves results on failure and retries the cursor', async () => {
+    const fallback = fetch;
+    const path = `/users/${tenant}/alice/presence-history`;
+    const cursor = '1760000000123456:1';
+    const now = Date.now();
+    const sources = Array.from({ length: 256 }, (_, index) => ({
+      ...offlineSource('8.8.8.8', now - HOUR - index * 1000, ['vless']),
+      session_id: String(256 - index),
+    }));
+    let attempts = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === path)
+        return Response.json({
+          tenant_id: tenant,
+          user_id: 'alice',
+          retention_days: 30,
+          truncated: true,
+          next_cursor: cursor,
+          sources,
+        });
+      if (String(input) === `${path}?before=${encodeURIComponent(cursor)}`) {
+        if (++attempts === 1) return Response.json({ error: '历史读取暂不可用' }, { status: 503 });
+        return Response.json({
+          tenant_id: tenant,
+          user_id: 'alice',
+          retention_days: 30,
+          truncated: false,
+          sources: [
+            { ...offlineSource('8.8.8.8', now - HOUR - 256_000, ['anytls']), session_id: '257' },
+            { ...offlineSource('2001:db8::5', now - 24 * HOUR, ['vless']), session_id: '258' },
+          ],
+          source_countries: [{ ip: '2001:db8::5', country: 'JP' }],
+        });
+      }
+      return fallback(input, init);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { view } = mount();
+    const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
+    const more = await within(card).findByRole('button', { name: '读取更早的历史记录' });
+    expect(card.querySelectorAll('.user-presence-row.off')).toHaveLength(1);
+    expect(readingOf(card)).toBe('在线 1 · 30 天至少 2 个地址');
+    fireEvent.click(more);
+    expect(await within(card).findByText(/历史读取暂不可用/)).toBeTruthy();
+    expect(within(card).getByText('8.8.8.8')).toBeTruthy();
+    fireEvent.click(within(card).getByRole('button', { name: '读取更早的历史记录' }));
+    const old = await within(card).findByText('2001:db8::5');
+    expect(old.closest('.user-presence-row')?.querySelector('.geo-flag')?.getAttribute('title')).toBe('JP');
+    expect(card.querySelectorAll('.user-presence-row.off')).toHaveLength(2);
+    expect(within(card).getByText(/257 段记录/)).toBeTruthy();
+    expect(readingOf(card)).toBe('在线 1 · 30 天 3 个地址');
+    expect(within(card).queryByRole('button', { name: '读取更早的历史记录' })).toBeNull();
+    expect(attempts).toBe(2);
+  });
+
   it('keeps masked epochs separate when their address prefixes look identical', async () => {
     const fallback = fetch;
     const path = `/users/${tenant}/alice/presence-history`;

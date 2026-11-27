@@ -1303,14 +1303,18 @@ export interface UserOnlineSourceHistory {
   user_id: string;
   retention_days: number;
   truncated: boolean;
+  /** Continue reading earlier sessions. Older Consoles may omit pagination. */
+  next_cursor?: string | null;
   sources: UserOnlineSource[];
   source_countries?: SourceCountry[];
   source_operators?: SourceOperator[];
 }
 
 export const fetchUserPresence = () => api<UserPresenceList>('/users/presence');
-export const fetchUserOnlineSourceHistory = (tenantId: string, userId: string) =>
-  api<UserOnlineSourceHistory>(`/users/${encodeURIComponent(tenantId)}/${encodeURIComponent(userId)}/presence-history`);
+export const fetchUserOnlineSourceHistory = (tenantId: string, userId: string, before?: string) =>
+  api<UserOnlineSourceHistory>(
+    `/users/${encodeURIComponent(tenantId)}/${encodeURIComponent(userId)}/presence-history${before == null ? '' : `?before=${encodeURIComponent(before)}`}`,
+  );
 
 export const createUser = (body: { tenant_id: string; id: string }) =>
   immediateModelWrite(() => post<{ revision_id: number; user: UserListItem }>('/users', body));

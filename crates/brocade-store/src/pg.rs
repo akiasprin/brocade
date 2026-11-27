@@ -1957,7 +1957,18 @@ impl PgStore {
         tenant_id: &str,
         user_id: &str,
     ) -> Result<crate::UserOnlineSourceHistory> {
-        user_presence::history(&self.pool, actor, tenant_id, user_id).await
+        self.user_online_source_history_page(actor, tenant_id, user_id, None)
+            .await
+    }
+
+    pub async fn user_online_source_history_page(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        before: Option<&str>,
+    ) -> Result<crate::UserOnlineSourceHistory> {
+        user_presence::history(&self.pool, actor, tenant_id, user_id, before).await
     }
 
     pub async fn rotate_user_uuid(
