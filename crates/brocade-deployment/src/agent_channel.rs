@@ -129,7 +129,8 @@ pub fn rpc_allowed(method: &str, path: &str) -> bool {
 pub fn request_header_allowed(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "x-brocade-arch"
+        "if-none-match"
+            | "x-brocade-arch"
             | "x-brocade-agent-release-receipt"
             | "x-brocade-route-ipv4"
             | "x-brocade-route-ipv6"
@@ -155,6 +156,7 @@ mod tests {
             assert!(!rpc_allowed("POST", path));
             assert!(!rpc_allowed("GET", path));
         }
+        assert!(request_header_allowed("If-None-Match"));
         assert!(!request_header_allowed("authorization"));
         assert!(!request_header_allowed("x-brocade-protocol-version"));
     }

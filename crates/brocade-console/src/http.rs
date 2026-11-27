@@ -6568,7 +6568,35 @@ async fn agent_user_traffic_assignments(
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
     require_user_traffic_protocol(&headers)?;
-    Ok(Json(state.store.user_traffic_assignments(&node.node_id).await?).into_response())
+    let snapshot = state.store.user_traffic_assignments(&node.node_id).await?;
+    let etag = format!("\"{}\"", snapshot.sha256);
+    let unchanged = headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|candidate| {
+            let candidate = candidate.trim();
+            candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+        });
+    let mut response = if unchanged {
+        state
+            .store
+            .touch_user_traffic_applied(&node.node_id, &snapshot.sha256)
+            .await?;
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        Json(snapshot).into_response()
+    };
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).expect("a hex SHA-256 validator is a valid header"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    Ok(response)
 }
 async fn agent_user_traffic_budget(
     State(state): State<AppState>,

@@ -2056,6 +2056,9 @@ impl PgStore {
     pub async fn acknowledge_user_traffic(&self, node: &str, hash: &str) -> Result<()> {
         crate::user_traffic::acknowledge(&self.pool, node, hash).await
     }
+    pub async fn touch_user_traffic_applied(&self, node: &str, hash: &str) -> Result<()> {
+        crate::user_traffic::touch_applied(&self.pool, node, hash).await
+    }
     pub async fn user_traffic_assignments(
         &self,
         node: &str,

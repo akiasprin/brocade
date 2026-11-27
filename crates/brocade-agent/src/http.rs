@@ -319,6 +319,18 @@ impl HttpClient {
         body: Option<&str>,
         timeout: Duration,
     ) -> Result<HttpResponse, String> {
+        self.request_timeout_with_headers(method, path, token, body, &[], timeout)
+    }
+
+    pub(crate) fn request_timeout_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        token: &str,
+        body: Option<&str>,
+        extra_headers: &[(&str, String)],
+        timeout: Duration,
+    ) -> Result<HttpResponse, String> {
         self.request_inner(
             method,
             path,
@@ -327,7 +339,7 @@ impl HttpClient {
                 bytes: body.unwrap_or("").as_bytes(),
                 content_type: "application/json",
             },
-            &[],
+            extra_headers,
             RequestTransport {
                 family: None,
                 timeout,

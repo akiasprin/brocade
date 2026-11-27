@@ -673,17 +673,7 @@ async fn pending(
     }
     Ok(pending)
 }
-pub async fn acknowledge(pool: &PgPool, node: &str, hash: &str) -> Result<()> {
-    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(StoreError::InvalidData(
-            "invalid user policy acknowledgment".into(),
-        ));
-    }
-    if assignments(pool, node).await?.sha256 != hash {
-        return Err(StoreError::InvalidData(
-            "stale user policy acknowledgment".into(),
-        ));
-    }
+pub async fn touch_applied(pool: &PgPool, node: &str, hash: &str) -> Result<()> {
     sqlx::query(
         "UPDATE nodes SET user_traffic_applied_hash=$2,user_traffic_policy_seen_at=now()
          WHERE id=$1 AND (user_traffic_applied_hash IS DISTINCT FROM $2
@@ -695,4 +685,18 @@ pub async fn acknowledge(pool: &PgPool, node: &str, hash: &str) -> Result<()> {
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn acknowledge(pool: &PgPool, node: &str, hash: &str) -> Result<()> {
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(StoreError::InvalidData(
+            "invalid user policy acknowledgment".into(),
+        ));
+    }
+    if assignments(pool, node).await?.sha256 != hash {
+        return Err(StoreError::InvalidData(
+            "stale user policy acknowledgment".into(),
+        ));
+    }
+    touch_applied(pool, node, hash).await
 }

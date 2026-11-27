@@ -35,6 +35,7 @@ struct LocalRequest {
 }
 struct PolicyCache {
     effects: BTreeMap<String, UserTrafficEffect>,
+    sha256: Option<String>,
     ready: bool,
 }
 struct Service {
@@ -64,6 +65,7 @@ pub(crate) fn initialize(options: &Options) -> Result<(), String> {
         eprintln!("user traffic checkpoint: {error}; waiting for a complete policy snapshot");
         PolicyCache {
             effects: BTreeMap::new(),
+            sha256: None,
             ready: false,
         }
     });
@@ -156,12 +158,15 @@ fn load_policies(dir: &Path) -> Result<PolicyCache, String> {
     let Some(bytes) = crate::fsutil::read_bounded(&policy_path(dir), MAX_SOURCES * 1024)? else {
         return Ok(PolicyCache {
             effects: BTreeMap::new(),
+            sha256: None,
             ready: false,
         });
     };
     let snapshot = serde_json::from_slice(&bytes).map_err(|_| "invalid user policy checkpoint")?;
+    let effects = validate_snapshot(&snapshot)?;
     Ok(PolicyCache {
-        effects: validate_snapshot(&snapshot)?,
+        effects,
+        sha256: Some(snapshot.sha256),
         ready: true,
     })
 }
@@ -217,6 +222,7 @@ fn install_snapshot(service: &Service, snapshot: &UserTrafficSnapshot) -> Result
         policies.effects = effects;
         policies.ready = true;
     }
+    policies.sha256 = Some(snapshot.sha256.clone());
     Ok(())
 }
 
@@ -283,22 +289,38 @@ fn assigned(service: &Service, source: &str) -> Result<Option<Admission>, String
     })
 }
 fn synchronize(service: &Service) -> Result<(), String> {
-    let response = HttpClient::new(&service.options.server)?.request_timeout(
+    let applied_sha256 = {
+        let policies = service
+            .policies
+            .lock()
+            .map_err(|_| "user policy cache lock")?;
+        policies.ready.then(|| policies.sha256.clone()).flatten()
+    };
+    let mut extra_headers = Vec::new();
+    if let Some(hash) = applied_sha256.as_deref() {
+        extra_headers.push(("If-None-Match", format!("\"{hash}\"")));
+    }
+    let response = HttpClient::new(&service.options.server)?.request_timeout_with_headers(
         "GET",
         "/agent/v1/user-traffic/policies",
         &service.options.token,
         None,
+        &extra_headers,
         Duration::from_secs(15),
     )?;
+    if response.status == 304 && applied_sha256.is_some() {
+        return Ok(());
+    }
     if response.status == 404 {
         if required_at_start(&service.options.state_dir) {
             return Err("old Console cannot release a previously limited user".into());
         }
-        service
+        let mut policies = service
             .policies
             .lock()
-            .map_err(|_| "user policy cache lock")?
-            .ready = true;
+            .map_err(|_| "user policy cache lock")?;
+        policies.sha256 = None;
+        policies.ready = true;
         return Ok(());
     }
     if response.status != 200 {
