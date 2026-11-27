@@ -342,7 +342,9 @@ async fn evaluate_one(
     Ok(())
 }
 pub async fn enforce(pool: &PgPool) -> Result<usize> {
-    let changed: i64 = sqlx::query_scalar(
+    // The update and its wake-up hint share one transaction. If either fails, the mismatch
+    // remains visible to the next pass instead of leaving committed state without a hint.
+    let row = sqlx::query(
         "WITH targets AS (
              SELECT q.tenant_id, q.user_id, q.app_id
              FROM user_app_quotas q
@@ -361,17 +363,20 @@ pub async fn enforce(pool: &PgPool) -> Result<usize> {
                AND q.user_id = t.user_id
                AND q.app_id = t.app_id
              RETURNING 1
+         ),
+         notified AS (
+             SELECT pg_notify(
+                 'brocade_agent_change',
+                 '{\"domain\":\"user_traffic\",\"node\":null}'
+             )
+             WHERE EXISTS (SELECT 1 FROM updated)
          )
-         SELECT count(*)::bigint FROM updated",
+         SELECT (SELECT count(*)::bigint FROM updated) AS changed,
+                (SELECT count(*)::bigint FROM notified) AS notifications",
     )
     .fetch_one(pool)
     .await?;
-    if changed > 0 {
-        sqlx::query("SELECT pg_notify('brocade_agent_change', $1)")
-            .bind(r#"{"domain":"user_traffic","node":null}"#)
-            .execute(pool)
-            .await?;
-    }
+    let changed: i64 = row.try_get("changed")?;
     Ok(changed as usize)
 }
 

@@ -56,6 +56,58 @@ async fn policy_ack_row(db: &TestPg) -> (String, Option<String>, Option<String>)
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn enforcement_notifies_agents_only_for_committed_exhaustion_changes() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    db.store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            policy(1024, None),
+        )
+        .await
+        .unwrap();
+    let mut listener = sqlx::postgres::PgListener::connect_with(db.pool())
+        .await
+        .unwrap();
+    listener.listen("brocade_agent_change").await.unwrap();
+
+    usage(&db, 1024).await;
+    assert_eq!(db.store.enforce_user_traffic_policies().await.unwrap(), 1);
+    let notification = tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(notification.payload()).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({"domain":"user_traffic","node":null})
+    );
+    let exhausted: bool = sqlx::query_scalar(
+        "SELECT exhausted FROM user_app_quotas WHERE tenant_id=$1 AND user_id='alice' AND app_id='app-main'",
+    )
+    .bind(TENANT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(exhausted);
+
+    assert_eq!(db.store.enforce_user_traffic_policies().await.unwrap(), 0);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), listener.recv())
+            .await
+            .is_err(),
+        "an unchanged pass must not emit another wake-up"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn support_heartbeat_skips_duplicates_but_refreshes_changes_and_old_rows() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
