@@ -15,6 +15,9 @@ use tokio::sync::{Notify, Semaphore};
 /// data to look at; with the agent's 15-second fetch interval, going over to being cut off takes
 /// about two minutes.
 const QUOTA_TICK: Duration = Duration::from_secs(60);
+/// How often user-traffic exhaustion flags are reconciled on the timer. Usage reports arrive in
+/// 30-second windows, and admin quota/profile edits wake the quota loop immediately.
+const USER_TRAFFIC_ENFORCE_TICK: Duration = Duration::from_secs(30);
 /// Durable permission jobs normally arrive through a wake signal.  The timer covers a lost signal,
 /// another process writing the row, and restart recovery.
 const GRANTS_TICK: Duration = Duration::from_secs(5);
@@ -321,7 +324,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user_traffic_store = store.clone();
     let user_traffic_permits = Arc::clone(&background_db);
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let mut tick = tokio::time::interval(USER_TRAFFIC_ENFORCE_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
             let Ok(_permit) = user_traffic_permits.acquire().await else {
@@ -348,6 +352,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Ok(_permit) = quota_permits.acquire().await else {
                 break;
             };
+            if let Err(error) = quota_store.enforce_user_traffic_policies().await {
+                eprintln!("user traffic: {error}");
+            }
             match quota_store.enforce_user_service_periods().await {
                 Ok(changed) if changed > 0 => {
                     eprintln!("user service: 已更新 {changed} 个用户的服务状态")

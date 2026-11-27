@@ -342,19 +342,37 @@ async fn evaluate_one(
     Ok(())
 }
 pub async fn enforce(pool: &PgPool) -> Result<usize> {
-    let mut tx = pool.begin().await?;
-    crate::console::lock_control_state(&mut tx).await?;
-    let rows=sqlx::query("SELECT tenant_id,user_id,scope FROM user_traffic_scopes
-        WHERE exhausted IS DISTINCT FROM (quota_bytes IS NOT NULL AND user_traffic_usage(tenant_id,user_id,kind,scope)>=quota_bytes)
-        ORDER BY tenant_id,user_id,kind,scope LIMIT 128").fetch_all(&mut *tx).await?;
-    for row in &rows {
-        let tenant: String = row.try_get("tenant_id")?;
-        let user: String = row.try_get("user_id")?;
-        let scope: String = row.try_get("scope")?;
-        evaluate_one(&mut tx, &tenant, &user, &scope).await?;
+    let changed: i64 = sqlx::query_scalar(
+        "WITH targets AS (
+             SELECT q.tenant_id, q.user_id, q.app_id
+             FROM user_app_quotas q
+             WHERE q.exhausted IS DISTINCT FROM (
+                 user_traffic_usage(q.tenant_id, q.user_id, 'access', q.app_id) >= q.limit_bytes
+             )
+             ORDER BY q.tenant_id, q.user_id, q.app_id
+             LIMIT 128
+             FOR UPDATE OF q SKIP LOCKED
+         ),
+         updated AS (
+             UPDATE user_app_quotas q
+             SET exhausted = user_traffic_usage(q.tenant_id, q.user_id, 'access', q.app_id) >= q.limit_bytes
+             FROM targets t
+             WHERE q.tenant_id = t.tenant_id
+               AND q.user_id = t.user_id
+               AND q.app_id = t.app_id
+             RETURNING 1
+         )
+         SELECT count(*)::bigint FROM updated",
+    )
+    .fetch_one(pool)
+    .await?;
+    if changed > 0 {
+        sqlx::query("SELECT pg_notify('brocade_agent_change', $1)")
+            .bind(r#"{"domain":"user_traffic","node":null}"#)
+            .execute(pool)
+            .await?;
     }
-    tx.commit().await?;
-    Ok(rows.len())
+    Ok(changed as usize)
 }
 
 pub async fn support(pool: &PgPool, node: &str, supported: bool) -> Result<bool> {
