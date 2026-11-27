@@ -20146,11 +20146,27 @@ h4.sec > .btn {
   background: color-mix(in srgb, var(--sunk) 46%, transparent);
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ink) 3%, transparent);
 }
-.user-split-roster > header {
-  gap: 6px;
+/* 名册页头使用页面身份（图标板 + 15px 标题），与机器、线路、用量页一致；高度取详情页头的
+   66px，使左右两张卡片的标题条同高。名册卡只有 320px，身份区可收窄、标题省略，操作不换行。 */
+.panel.titled.user-list-panel > .user-roster-head {
+  min-height: 66px;
+  gap: 10px;
+  padding: 0 14px 0 16px;
 }
-.user-split-roster > header h4 {
-  flex: none;
+.user-roster-head > .user-roster-identity {
+  flex: 1 1 auto;
+  padding-right: 0;
+  overflow: hidden;
+  border-right: 0;
+}
+.user-roster-title {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 700 15px/1.2 var(--sans);
+  letter-spacing: 0;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .user-split-roster > .user-list-search {
@@ -23353,6 +23369,10 @@ select.f.fwr-sort {
   .user-split-roster {
     width: 100%;
     border-radius: 8px;
+  }
+  .panel.titled.user-list-panel > .user-roster-head {
+    min-height: 56px;
+    padding: 0 10px 0 12px;
   }
   .user-roster-options {
     display: grid;

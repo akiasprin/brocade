@@ -49,7 +49,7 @@ import {
 } from '../api';
 import { can, isVisitor, useSession } from '../session';
 import { Ago, Confirm, EmptyState, ErrorBox, Loading, SegmentedControl } from '../ui/bits';
-import { Icon, ListIcon, PanelTitle } from '../ui/icons';
+import { Icon, PanelTitle } from '../ui/icons';
 import { bytes } from '../ui/format';
 import { useNodeNames } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
@@ -2759,6 +2759,32 @@ function UserList({
   const activeRows = rows.filter(row => row !== selfRow && row.u.status !== 'disabled');
   const disabledRows = rows.filter(row => row !== selfRow && row.u.status === 'disabled');
 
+  /* 名册页头沿用机器、线路、用量的页面身份：30px 图标板加 15px 标题。高度与右侧详情页头
+     一致，两张卡片的标题条落在同一水平线上。总数由下方「全部」筛选给出，标题不重复。 */
+  const rosterHeader = (
+    <header className="user-roster-head">
+      <div className="nd-page-identity user-roster-identity">
+        <span className="cg-plate">
+          <Icon of="users" size={18} />
+        </span>
+        <h1 className="user-roster-title">用户</h1>
+      </div>
+      <TitleActions
+        className="user-roster-head-actions"
+        primary={
+          <button
+            className="btn primary"
+            disabled={!editable || tenantOptions.length !== 1 || !!newUser}
+            title={tenantOptions.length !== 1 ? '当前账户无法新增用户，请联系管理员。' : undefined}
+            onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
+          >
+            ＋ 新增用户
+          </button>
+        }
+      />
+    </header>
+  );
+
   /* 名册与详情是两张同级面板：名册承担搜索和开户入口，详情保留块档背景，
      内部使用机器详情的紧凑横向页头和独立内容卡。 */
   const body = (
@@ -2798,23 +2824,7 @@ function UserList({
       )}
       {list.length === 0 ? (
         <section className="panel titled user-list-panel user-empty-panel" data-page-title="true">
-          <header>
-            <ListIcon of="users" />
-            <h4>用户</h4>
-            <TitleActions
-              className="user-roster-head-actions"
-              primary={
-                <button
-                  className="btn primary"
-                  disabled={!editable || tenantOptions.length !== 1 || !!newUser}
-                  title={tenantOptions.length !== 1 ? '当前账户无法新增用户，请联系管理员。' : undefined}
-                  onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
-                >
-                  ＋ 新增用户
-                </button>
-              }
-            />
-          </header>
+          {rosterHeader}
           <div className="user-roster-options">
             {newUserEditor}
             {!newUser && (
@@ -2841,23 +2851,7 @@ function UserList({
         // 已停用的用户在名册末尾单独成组。
         <div className={`user-split${drill.p === 'user' ? ' user-detail-route' : ''}`}>
           <section className="panel titled user-list-panel user-split-roster" data-page-title="true">
-            <header>
-              <ListIcon of="users" />
-              <h4>用户</h4>
-              <TitleActions
-                className="user-roster-head-actions"
-                primary={
-                  <button
-                    className="btn primary"
-                    disabled={!editable || tenantOptions.length !== 1 || !!newUser}
-                    title={tenantOptions.length !== 1 ? '当前账户无法新增用户，请联系管理员。' : undefined}
-                    onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
-                  >
-                    ＋ 新增用户
-                  </button>
-                }
-              />
-            </header>
+            {rosterHeader}
             <span className="user-list-search">
               <Icon of="search" size={13} className="user-list-search-icon" />
               <input

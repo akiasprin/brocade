@@ -123,7 +123,8 @@ test('用户详情数据卡共用面板留白令牌和满幅正文契约', () =>
 });
 
 test('所有面板标题固定使用 PanelTitle，列表页只使用 ListIcon 标题', () => {
-  const delegatedHeaders = /^\s*(?:\{(?:renderHeader\(|head\})|<(?:MachineEgressDnsRules|NodeChainsSection)\b)/;
+  const delegatedHeaders =
+    /^\s*(?:\{(?:renderHeader\(|head\}|rosterHeader\})|<(?:MachineEgressDnsRules|NodeChainsSection)\b)/;
 
   for (const { file, classes, tail } of panelDeclarations()) {
     const content = tail.replace(/^(?:\s*\{\/\*[\s\S]*?\*\/\})*\s*/, '');
@@ -142,6 +143,14 @@ test('所有面板标题固定使用 PanelTitle，列表页只使用 ListIcon �
     assert.match(header[2], /<(?:PanelTitle|SettingsTitle|ListIcon)\b/, `${file}: 不得在面板里直接写另一种 h4 标题`);
     assert.doesNotMatch(header[2], /className="no"/, `${file}: 面板标题不得恢复页面私有编号`);
   }
+
+  // 用户名册的正常与空状态共用 rosterHeader，标题采用机器、线路、用量页的页面身份。
+  const users = panes.get('users.tsx');
+  assert.equal(users.match(/\{rosterHeader\}/g)?.length, 2, 'users.tsx: 名册正常与空状态都必须使用 rosterHeader');
+  assert.match(
+    users,
+    /const rosterHeader = \([\s\S]*?<span className="cg-plate">\s*<Icon of="users" size=\{18\} \/>\s*<\/span>\s*<h1 className="user-roster-title">用户<\/h1>/,
+  );
 
   const settings = panes.get('settings.tsx');
   assert.match(settings, /function SettingsTitle[\s\S]*?<PanelTitle of=\{ICON_OF\[id\]\}>/);
