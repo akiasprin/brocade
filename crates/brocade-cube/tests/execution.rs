@@ -190,6 +190,81 @@ fn lost_create_response_is_reconciled_by_owner_without_second_allocation() {
 }
 
 #[test]
+fn definitive_preallocation_rejection_reports_failure_and_can_retry() {
+    let fixture = Fixture::new();
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .reject_create_before_allocation = true;
+    let mut desired = fixture.desired();
+    fixture.backend().submit(&desired).unwrap();
+    let rejected = fixture.report(1);
+    assert_eq!(rejected["status"], "failed", "{rejected}");
+    assert_eq!(rejected["error"], "Cube 创建前检查被拒绝（代码 130568）");
+    assert!(!rejected.to_string().contains("synthetic"));
+
+    desired.generation = 2;
+    desired.operation_id = "op-retry".into();
+    fixture.backend().submit(&desired).unwrap();
+    assert_eq!(fixture.report(2)["status"], "applied");
+    assert_eq!(fixture.state.lock().unwrap().creates, 1);
+}
+
+fn age_unallocated_absence(fixture: &mut Fixture) {
+    fixture.backend.take();
+    let path = fixture.records.join("cvm-test.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["unallocated_absence_since_unix_secs"] = serde_json::json!(1);
+    std::fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+    fixture.backend = Some(brocade_cube::Backend::open(&fixture.config, &fixture.records).unwrap());
+}
+
+#[test]
+fn transport_loss_recovers_only_after_separated_absence_proofs() {
+    let mut fixture = Fixture::new();
+    fixture.state.lock().unwrap().fail_create_before_allocation = true;
+    let desired = fixture.desired();
+    fixture.backend().submit(&desired).unwrap();
+    let uncertain = fixture.report(1);
+    assert_eq!(uncertain["status"], "unknown", "{uncertain}");
+
+    // The first complete absence proof starts the deadline fence but cannot allocate again.
+    fixture.backend().submit(&desired).unwrap();
+    assert_eq!(fixture.report(1)["status"], "unknown");
+    assert_eq!(fixture.state.lock().unwrap().creates, 0);
+
+    age_unallocated_absence(&mut fixture);
+    fixture.backend().submit(&desired).unwrap();
+    assert_eq!(fixture.report(1)["status"], "applied");
+    assert_eq!(fixture.state.lock().unwrap().creates, 1);
+}
+
+#[test]
+fn explicit_retry_keeps_unknown_attempt_quarantined_when_root_exists() {
+    let mut fixture = Fixture::new();
+    fixture.state.lock().unwrap().fail_create_before_allocation = true;
+    let desired = fixture.desired();
+    fixture.backend().submit(&desired).unwrap();
+    assert_eq!(fixture.report(1)["status"], "unknown");
+    fixture.backend().submit(&desired).unwrap();
+    assert_eq!(fixture.report(1)["status"], "unknown");
+    age_unallocated_absence(&mut fixture);
+    fixture.state.lock().unwrap().root_exists = true;
+
+    fixture.backend().submit(&desired).unwrap();
+    assert_eq!(fixture.report(1)["status"], "unknown");
+    assert_eq!(fixture.state.lock().unwrap().creates, 0);
+
+    // Disappearing evidence must start a fresh deadline fence instead of reusing the old proof.
+    fixture.state.lock().unwrap().root_exists = false;
+    fixture.backend().submit(&desired).unwrap();
+    assert_eq!(fixture.report(1)["status"], "unknown");
+    assert_eq!(fixture.state.lock().unwrap().creates, 0);
+}
+
+#[test]
 fn missing_physical_root_never_allocates_an_empty_replacement() {
     let fixture = Fixture::new();
     let mut desired = fixture.desired();

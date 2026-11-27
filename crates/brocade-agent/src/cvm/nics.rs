@@ -52,6 +52,9 @@ pub(super) fn private_dir(path: &Path) -> Result<()> {
 fn desired_path(root: &Path) -> PathBuf {
     root.join("cvm-nics-desired.json")
 }
+fn carries_authority(desired: &NicDesired) -> bool {
+    !desired.bindings.is_empty() || !desired.fences.is_empty()
+}
 fn snapshot(root: &Path) -> Result<NicDesired> {
     let Some(bytes) = read_bounded(&desired_path(root), 16 * 1024 * 1024)? else {
         return Ok(NicDesired::default());
@@ -524,7 +527,10 @@ fn round(options: &Options) -> Result<bool> {
         authority(options).as_bytes(),
     )?;
     let previous = snapshot(&options.state_dir)?;
-    if desired.node_id == previous.node_id && desired.generation < previous.generation {
+    if desired.node_id == previous.node_id
+        && desired.generation < previous.generation
+        && carries_authority(&desired)
+    {
         return Err("stale NIC desired generation rejected".into());
     }
     if desired.bindings.is_empty()

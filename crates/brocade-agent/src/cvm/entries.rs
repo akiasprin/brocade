@@ -36,6 +36,9 @@ static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 fn desired_path(root: &Path) -> PathBuf {
     root.join("cvm-entries-desired.json")
 }
+fn carries_authority(desired: &EntryDesired) -> bool {
+    !desired.rules.is_empty() || !desired.deliveries.is_empty() || !desired.tunnels.is_empty()
+}
 fn snapshot(root: &Path) -> Result<EntryDesired> {
     let Some(bytes) = read_bounded(&desired_path(root), 16 * 1024 * 1024)? else {
         return Ok(EntryDesired::default());
@@ -167,7 +170,10 @@ pub(super) fn round(options: &Options) -> Result<bool> {
     desired.validate()?;
     let previous = snapshot(&options.state_dir)?;
     flows::seed(&options.state_dir, &previous)?;
-    if desired.node_id == previous.node_id && desired.generation < previous.generation {
+    if desired.node_id == previous.node_id
+        && desired.generation < previous.generation
+        && carries_authority(&desired)
+    {
         return Err("stale entry desired generation rejected".into());
     }
     if desired.generation == 0 && previous.node_id.is_empty() {

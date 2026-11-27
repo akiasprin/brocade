@@ -68,7 +68,17 @@ impl Inner {
                 return Err("运行时身份变化，拒绝接管未知系统盘".into());
             }
             record.runtime = id.into();
+            record.unallocated_absence_since_unix_secs = 0;
             record.save(&self.root)?;
+        }
+        if self.cfg.capabilities.stable_storage
+            && desired.power == PowerState::Running
+            && boxes.is_empty()
+            && record.attempted
+            && record.volume.is_empty()
+            && record.objects.is_empty()
+        {
+            self.recover_unallocated_create(record, desired)?;
         }
         if self.cfg.capabilities.stable_storage && desired.power != PowerState::Deleted {
             if let Some(report) = self.reconcile_lifecycle(record, desired, &boxes)? {
@@ -134,6 +144,15 @@ impl Inner {
                         json!(record.objects[0].name);
                 }
             }
+            let runtime = crate::text(&request["annotations"], "cube.master.desired.sandbox.id");
+            if runtime != desired.id
+                || crate::text(&request["labels"], "brocade.cvm.instance") != desired.id
+                || (!record.runtime.is_empty() && record.runtime != runtime)
+            {
+                return Err("Cube 创建请求缺少确定性运行身份".into());
+            }
+            record.runtime = runtime.into();
+            record.unallocated_absence_since_unix_secs = 0;
             record.launch_sha256 = desired.spec_sha256.clone();
             record.boot_sha256 = boot_digest(desired)?;
             record.contact_id = contact.id.clone();
@@ -144,12 +163,26 @@ impl Inner {
             record.attempted = true;
             record.save(&self.root)?;
             let response = self.cube("Create", request)?;
-            crate::successful(&response)?;
-            let runtime = crate::text(&response, "sandboxID");
-            if !valid_runtime(runtime) {
+            let returned_runtime = crate::text(&response, "sandboxID");
+            if !returned_runtime.is_empty() && returned_runtime != record.runtime {
+                return Err("Cube 返回了不同的运行身份".into());
+            }
+            if let Err(error) = crate::successful(&response) {
+                if returned_runtime.is_empty() {
+                    record.attempted = false;
+                    record.unallocated_absence_since_unix_secs = 0;
+                    record.save(&self.root)?;
+                    let message = format!(
+                        "Cube 创建前检查被拒绝（代码 {}）",
+                        crate::number(&response["ret"], "ret_code")
+                    );
+                    return Ok(report(desired, ApplyStatus::Failed, Some(&message)));
+                }
+                return Err(error);
+            }
+            if !valid_runtime(returned_runtime) {
                 return Err("Cube 创建结果未确认，后续仅核查原身份".into());
             }
-            record.runtime = runtime.into();
             record.save(&self.root)?;
         }
         if !valid_runtime(&record.runtime) {

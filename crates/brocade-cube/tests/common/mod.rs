@@ -53,6 +53,8 @@ pub struct State {
     pub cpu: u64,
     pub memory: u64,
     pub fail_create_reply: bool,
+    pub fail_create_before_allocation: bool,
+    pub reject_create_before_allocation: bool,
     pub block_create: bool,
     pub create_entered: bool,
     pub suppress_delete: bool,
@@ -197,6 +199,20 @@ impl cb::cubebox_mgr_server::CubeboxMgr for Cube {
         }
         let request = request.into_inner();
         let mut state = self.state.lock().unwrap();
+        if state.fail_create_before_allocation {
+            state.fail_create_before_allocation = false;
+            return Err(Status::unavailable("lost create request"));
+        }
+        if state.reject_create_before_allocation {
+            state.reject_create_before_allocation = false;
+            return Ok(Response::new(cb::RunCubeSandboxResponse {
+                ret: Some(Ret {
+                    ret_code: 130568,
+                    ret_msg: "synthetic create preflight rejection".into(),
+                }),
+                ..Default::default()
+            }));
+        }
         state.creates += 1;
         state.initial_internet_access = request
             .cube_network_config

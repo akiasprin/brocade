@@ -20,7 +20,7 @@ fn empty_network_sweep_still_publishes_one_completion_receipt() {
 }
 
 #[test]
-fn empty_network_round_acknowledges_a_new_generation_over_http() {
+fn empty_network_round_acknowledges_a_lower_revocation_generation_over_http() {
     use std::{io::Read, net::TcpListener, sync::mpsc, thread, time::Instant};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -90,6 +90,16 @@ fn empty_network_round_acknowledges_a_new_generation_over_http() {
         apply_mode: ApplyMode::StateDir,
         vpngate_stats_window: Duration::from_secs(900),
     };
+    atomic_write_private(
+        &desired_path(&root),
+        &serde_json::to_vec(&NicDesired {
+            node_id: "n1".into(),
+            generation: 18,
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
     let result = round(&options);
     server.join().unwrap();
     let requests = received.recv().unwrap();

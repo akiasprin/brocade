@@ -1,6 +1,30 @@
 use super::*;
 
 #[test]
+fn lower_empty_generation_is_a_revocation_not_stale_authority() {
+    let previous = EntryDesired {
+        node_id: "hk".into(),
+        generation: 18,
+        ..Default::default()
+    };
+    let desired = EntryDesired {
+        generation: 2,
+        ..previous.clone()
+    };
+    assert!(desired.rules.is_empty());
+    assert!(desired.deliveries.is_empty());
+    assert!(desired.tunnels.is_empty());
+    assert!(desired.generation < previous.generation);
+    assert!(!carries_authority(&desired));
+
+    let mut stale_authority = desired;
+    stale_authority
+        .tunnels
+        .push(tunnel(EntryTunnelSide::Entry, 3));
+    assert!(carries_authority(&stale_authority));
+}
+
+#[test]
 fn legacy_private_entry_checkpoint_can_be_read_before_current_state_is_persisted() {
     let root = std::env::temp_dir().join(format!("entry-checkpoint-compat-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
