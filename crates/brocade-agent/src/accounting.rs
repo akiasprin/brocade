@@ -657,6 +657,16 @@ mod tests {
             bytes[40 + index] = u8::from_str_radix(&boot[index * 2..index * 2 + 2], 16).unwrap();
         }
         atomic_write_private(&journal_path(&root), &bytes).unwrap();
+        // spawn() returns before the child necessarily completes exec. Wait until /proc exposes
+        // the candidate's final environment before asserting its joined journal identity.
+        let environment_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !process_uses_shared_journal(&root, candidate_ref.pid, b"join").unwrap() {
+            assert!(
+                std::time::Instant::now() < environment_deadline,
+                "candidate accounting environment did not become ready"
+            );
+            std::thread::yield_now();
+        }
         let process_epoch = format!("boot:{}", candidate_ref.start_ticks);
         let original = epoch(&root, &process_epoch, candidate_ref.pid).unwrap();
         assert!(original.starts_with("journal:"));
