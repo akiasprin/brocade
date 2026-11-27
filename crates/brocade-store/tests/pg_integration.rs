@@ -7627,7 +7627,8 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
             .iter()
             .map(|source| source.ip.as_str())
             .collect::<Vec<_>>(),
-        ["1.1.1.1", "2606:4700:4700::1111"]
+        ["2606:4700:4700::1111", "1.1.1.1"],
+        "equal-time history follows the documented descending session cursor order"
     );
     sqlx::query(
         "UPDATE user_online_sources
@@ -12809,6 +12810,16 @@ async fn deployment_base_revision_is_the_last_succeeded_of_the_same_kind() {
     .try_get("id")
     .unwrap();
     sqlx::query(
+        "INSERT INTO model_snapshots (revision_id, snapshot)
+         SELECT $1, jsonb_set(snapshot, '{revision}', to_jsonb($1::bigint))
+           FROM model_snapshots
+          WHERE revision_id = 1",
+    )
+    .bind(newer_revision)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
         "INSERT INTO deployments (revision_id, status, kind, idempotency_key)
          VALUES ($1, 'succeeded', 'grants', 'base-grants')",
     )
@@ -12819,7 +12830,10 @@ async fn deployment_base_revision_is_the_last_succeeded_of_the_same_kind() {
 
     let second = db
         .store
-        .create_deployment(&system_admin(), create_deployment_request(1, "base-second"))
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(u64::try_from(newer_revision).unwrap(), "base-second"),
+        )
         .await
         .unwrap();
     assert_eq!(
