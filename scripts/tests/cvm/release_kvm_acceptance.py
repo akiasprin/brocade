@@ -93,7 +93,7 @@ class Acceptance:
     def revision(self):
         return int(self.sql('SELECT current_revision FROM control_state WHERE id=TRUE'))
 
-    def gate(self, **flags):
+    def gate(self, *, restart=True, **flags):
         current = self.state.setdefault('gate', {})
         current.update(flags)
         current['nodes'] = {
@@ -110,10 +110,11 @@ class Acceptance:
         self.save()
         # Close an already-upgraded channel before enabling HTTP fault injection.
         # With no fault active, the production Agent channel remains available.
-        self.lab.remote(
-            'compute',
-            'if sudo systemctl is-active --quiet brocade-lab-gate; then sudo systemctl restart brocade-lab-gate; fi',
-        )
+        if restart:
+            self.lab.remote(
+                'compute',
+                'if sudo systemctl is-active --quiet brocade-lab-gate; then sudo systemctl restart brocade-lab-gate; fi',
+            )
 
     def wait(self, description, function, predicate=lambda x: bool(x), timeout=180):
         start = time.monotonic()
@@ -206,6 +207,13 @@ class Acceptance:
         )
 
     def bootstrap(self):
+        agent_only = self.lab.state.get('agent_only_compute') is True
+        if agent_only:
+            self.lab.verify_owned()
+            if self.prefix != '/var/lib/brocade/acceptance-' + self.lab.state['task'] or any(
+                self.state[key] for key in ('nodes', 'instances', 'checks')
+            ):
+                raise RuntimeError('Agent-only enrollment requires an unused disposable lab')
         self.call(
             'POST',
             '/auth/init',
@@ -275,29 +283,44 @@ class Acceptance:
             unit.encode(),
         )
         self.lab.remote('compute', 'sudo systemctl daemon-reload && sudo systemctl start brocade-lab-gate')
-        for node, data in self.state['nodes'].items():
+        for data in self.state['nodes'].values():
             role = data['role']
+            fresh_compute = agent_only and role == 'compute'
+            service = 'brocade-agent.service' if fresh_compute else 'brocade-lab-agent.service'
             environment = {
                 'BROCADE_AGENT_SERVER': 'http://' + self.lab.state['roles']['compute']['ipv4'] + ':18081',
                 'BROCADE_NODE_TOKEN_FILE': self.prefix + '/node.token',
                 'BROCADE_AGENT_STATE_DIR': '/var/lib/bc-' + self.lab.state['task'][:6],
                 'BROCADE_AGENT_APPLY': 'linux',
-                'BROCADE_CVM_CONFIG': '/opt/brocade/cvm/current/generated/cube.json',
-                'BROCADE_CVM_STATE_DIR': self.prefix + '/runtime',
                 'BROCADE_XRAY_BIN': self.prefix + '/xray',
                 'PATH': self.prefix + ':/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
             }
+            if not fresh_compute:
+                environment.update(
+                    BROCADE_CVM_CONFIG='/opt/brocade/cvm/current/generated/cube.json',
+                    BROCADE_CVM_STATE_DIR=self.prefix + '/runtime',
+                )
+            after = 'network-online.target' if fresh_compute else 'network-online.target brocade-cvm-cubelet.service'
             unit = (
-                '[Unit]\nAfter=network-online.target brocade-cvm-cubelet.service\n[Service]\n'
+                f'[Unit]\nAfter={after}\n[Service]\n'
                 + ''.join('Environment=' + json.dumps(k + '=' + v) + '\n' for k, v in environment.items())
                 + 'ExecStart=/usr/local/bin/brocade-agent run\nRestart=always\nKillMode=control-group\nTimeoutStopSec=20\n'
             )
+            if fresh_compute:
+                unit += '\n[Install]\nWantedBy=multi-user.target\n'
             self.lab.python(
                 role,
-                'from pathlib import Path;import sys;Path("/etc/systemd/system/brocade-lab-agent.service").write_bytes(sys.stdin.buffer.read())',
+                'from pathlib import Path;import sys;with_path=Path(' + repr('/etc/systemd/system/' + service) + ');'
+                'f=with_path.open('
+                + repr('xb' if fresh_compute else 'wb')
+                + ');f.write(sys.stdin.buffer.read());f.close()',
                 unit.encode(),
             )
-            self.lab.remote(role, 'sudo systemctl daemon-reload && sudo systemctl start brocade-lab-agent')
+            self.lab.remote(role, 'sudo systemctl daemon-reload && sudo systemctl start ' + service)
+        if agent_only:
+            # The first-install endpoints must admit a node before any CVM host policy or instance exists.
+            self.record('Agent-only compute enrolled without Cube configuration, CVM policy or instances')
+            return
         workspace = self.wait(
             'both real Agent inventories and verified native image manifests',
             lambda: self.call('GET', '/cvm'),

@@ -946,6 +946,11 @@ pub(crate) async fn claim_binary_release_for_flavor(
         ));
     }
     let mut tx = pool.begin().await?;
+    crate::resource_coordination::synchronize_stack_claim(&mut tx).await?;
+    if crate::resource_coordination::stack_busy(&mut tx, &[node_id]).await? {
+        tx.commit().await?;
+        return Ok(None);
+    }
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(BINARY_RELEASE_ADVISORY_LOCK)
         .execute(&mut *tx)

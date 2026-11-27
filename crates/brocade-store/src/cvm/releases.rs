@@ -105,6 +105,7 @@ pub(crate) async fn freeze_chain_dependents(
                 return Err(invalid("同一全局修订的线路客户端输入不一致"));
             }
         }
+        crate::resource_coordination::ensure_stack_idle(tx, std::slice::from_ref(&node)).await?;
         let payload = encode(&node, revision as i64, &config)?;
         let sha = sha256_hex(&serde_json::to_vec(&config)?);
         sqlx::query("INSERT INTO cvm_revision_nodes(revision_id,node_id,sha256,payload) VALUES($1,$2,$3,$4)")
@@ -150,6 +151,7 @@ pub(crate) type Before = BTreeMap<String, NodeConfig>;
 /// pre-upgrade running intent as the baseline, so merely upgrading Console never unpublishes it.
 pub(crate) async fn begin(tx: &mut Transaction<'_, Postgres>, scope: Scope<'_>) -> Result<Before> {
     let nodes = scope_nodes(tx, scope).await?;
+    crate::resource_coordination::ensure_stack_idle(tx, &nodes).await?;
     let revision: i64 =
         sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id=TRUE")
             .fetch_one(&mut **tx)
@@ -221,6 +223,11 @@ async fn changed_configurations(
         }
     }
 
+    let affected = changed
+        .iter()
+        .map(|(node, _)| node.clone())
+        .collect::<Vec<_>>();
+    crate::resource_coordination::ensure_stack_idle(tx, &affected).await?;
     Ok(changed)
 }
 

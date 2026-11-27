@@ -1,24 +1,50 @@
 #!/usr/bin/env python3
 """Deploy frozen current production artifacts only into the owned KVM lab."""
 
+import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
 import secrets
+import shlex
 import shutil
-import sys
 import time
 import urllib.request
 
 from release_kvm_lab import Lab
 
 
+AGENT_ONLY_LAYOUT = """set -eu
+prefix=$1
+for path in "$prefix" /data/cubelet/storage /opt/brocade/cvm /usr/local/bin/brocade-agent \\
+  /usr/local/lib/brocade/cvm-stack.py /etc/brocade/cvm-stack-update.pub \\
+  /etc/systemd/system/brocade-agent.service /etc/systemd/system/brocade-lab-agent.service; do
+  test ! -e "$path" && test ! -L "$path" || exit 1
+done
+test ! -L /data && test ! -L /data/cubelet && test ! -L /var/lib/brocade || exit 1
+mkdir -p /var/lib/brocade
+mkdir -m 0700 "$prefix"
+mkdir -p /data/cubelet/storage
+"""
+
+
 def main():
-    lab_path, build_path, output_path = map(Path, sys.argv[1:])
-    lab = Lab(lab_path)
-    output_path.mkdir(mode=0o700, exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--agent-only-compute', action='store_true', help='prepare compute without a Cube installation')
+    for name in ('lab_path', 'build_path', 'output_path'):
+        parser.add_argument(name, type=Path)
+    args = parser.parse_args()
+    lab = Lab(args.lab_path)
+    build_path, output_path = args.build_path, args.output_path
+    if lab.state.get('agent_only_compute'):
+        raise RuntimeError('preserved existing Agent-only deployment; use a fresh lab')
+    if args.agent_only_compute:
+        lab.verify_owned()
+        if 'prefix' in lab.state or 'credentials_file' in lab.state:
+            raise RuntimeError('Agent-only compute requires a new disposable lab deployment')
+    output_path.mkdir(mode=0o700, exist_ok=not args.agent_only_compute)
     inputs = output_path / 'inputs'
     inputs.mkdir(mode=0o700, exist_ok=True)
     bundle = json.loads((build_path / 'target/cube/artifacts/x86_64/bundle.json').read_text())
@@ -68,26 +94,42 @@ def main():
     lab.save()
 
     def install(role):
-        lab.remote(role, f'sudo mkdir -p {prefix} /usr/local/lib/brocade /data/cubelet/storage')
+        agent_only = role == 'compute' and args.agent_only_compute
+        if agent_only:
+            lab.remote(role, shlex.join(['sudo', 'sh', '-s', '--', prefix]), data=AGENT_ONLY_LAYOUT.encode())
+        else:
+            lab.remote(role, f'sudo mkdir -p {prefix} /usr/local/lib/brocade /data/cubelet/storage')
         for name in ('geoip.dat', 'geosite.dat'):
             lab.upload(role, inputs / name, prefix + '/' + name, 0o600)
         lab.upload(role, inputs / 'agent', '/usr/local/bin/brocade-agent')
-        lab.upload(role, inputs / 'bundle.tar.gz', prefix + '/bundle.tar.gz', 0o600)
-        lab.upload(role, inputs / 'cvm_stack.py', '/usr/local/lib/brocade/cvm-stack.py')
-        script = f"""set -eu
+        script = 'set -eu\n'
+        if agent_only:
+            # Create this image exclusively; never reuse or reformat an existing volume.
+            script += f"""! mountpoint -q /data/cubelet/storage || exit 1
+(set -C; : > {prefix}/storage.img)
+"""
+        script += f"""\
 if ! mountpoint -q /data/cubelet/storage; then
  truncate -s 20G {prefix}/storage.img
  mkfs.ext4 -F -E nodiscard {prefix}/storage.img
  mount -o loop {prefix}/storage.img /data/cubelet/storage
 fi
+"""
+        if not agent_only:
+            lab.upload(role, inputs / 'bundle.tar.gz', prefix + '/bundle.tar.gz', 0o600)
+            lab.upload(role, inputs / 'cvm_stack.py', '/usr/local/lib/brocade/cvm-stack.py')
+            script += f"""\
 python3 /usr/local/lib/brocade/cvm-stack.py install --bundle {prefix}/bundle.tar.gz --sha256 {hashes['bundle.tar.gz']}
 python3 /usr/local/lib/brocade/cvm-stack.py status
 """
         result = lab.remote(role, 'sudo sh -s', data=script.encode(), timeout=600, check=False)
         (output_path / (role + '-runtime.log')).write_bytes(result.stdout + result.stderr)
         if result.returncode:
-            raise RuntimeError(role + ' runtime installation failed; see private log')
-        print('PASS: current Cube production runtime installed on ' + role, flush=True)
+            raise RuntimeError(role + ' runtime preparation failed; see private log')
+        print(
+            'PASS: ' + ('Agent and empty storage prepared on ' if agent_only else 'Cube installed on ') + role,
+            flush=True,
+        )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(install, ('compute', 'provider')))
@@ -137,6 +179,9 @@ python3 /usr/local/lib/brocade/cvm-stack.py status
             time.sleep(1)
     else:
         raise RuntimeError('current Console did not become healthy')
+    if args.agent_only_compute:
+        lab.state['agent_only_compute'] = True
+        lab.save()
     print('PASS: actual production Console and native PostgreSQL healthy inside Ubuntu 26.04 KVM', flush=True)
 
 

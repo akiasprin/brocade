@@ -1069,8 +1069,10 @@ fn is_cvm_view_path(path: &str) -> bool {
     match parts.as_slice() {
         ["cvm"] | ["cvm", "networks" | "readings" | "entries"] => true,
         ["cvm", id] | ["cvm", id, "monitoring" | "network" | "entries"] => {
-            !matches!(*id, "quota" | "readings" | "entries" | "entry-publications")
-                && brocade_deployment::cvm::valid_id(id)
+            !matches!(
+                *id,
+                "quota" | "readings" | "entries" | "entry-publications" | "stack-releases"
+            ) && brocade_deployment::cvm::valid_id(id)
         }
         _ => false,
     }
@@ -1346,6 +1348,17 @@ fn masking_failed(detail: &str) -> Response {
 fn cvm_admin_routes() -> Router<AppState> {
     Router::new()
         .route("/cvm", get(cvm::workspace).post(cvm::create))
+        .route(
+            "/cvm/stack-releases",
+            get(cvm::stack::overview)
+                .post(cvm::stack::create)
+                .layer(DefaultBodyLimit::max(8192)),
+        )
+        .route(
+            "/cvm/stack-releases/{id}/approve",
+            post(cvm::stack::approve),
+        )
+        .route("/cvm/stack-releases/{id}/cancel", post(cvm::stack::cancel))
         .route("/cvm/adopt", post(cvm::adopt))
         .route("/cvm/readings", get(cvm::readings))
         .route("/cvm/chain-egress", get(cvm::chain_catalog))
@@ -1432,6 +1445,18 @@ fn cvm_agent_routes() -> Router<AppState> {
             get(cvm::terminal::agent_stream),
         )
         .route("/agent/v1/cvm/inventory", post(cvm::inventory))
+        .route(
+            "/agent/v1/cvm/stack-releases/poll",
+            post(cvm::stack::poll).layer(DefaultBodyLimit::max(8192)),
+        )
+        .route(
+            "/agent/v1/cvm/stack-releases/{id}/claim",
+            post(cvm::stack::claim).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/agent/v1/cvm/stack-bundles/{sha256}",
+            get(cvm::stack::bundle),
+        )
         .route(
             "/agent/v1/cvm/image-manifests",
             post(cvm::image_manifest).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),

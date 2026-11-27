@@ -118,6 +118,10 @@ struct PendingUpdate {
 }
 
 pub(crate) fn selfupdate_cycle(options: &Options) -> Result<bool, String> {
+    #[cfg(all(feature = "cvm", target_os = "linux"))]
+    if crate::cvm::stack::fenced()? {
+        return Ok(false);
+    }
     let Some(running) = identity::self_sha256() else {
         return Ok(false);
     };
@@ -454,6 +458,15 @@ fn install_release(
     fs::File::open(&staging)
         .and_then(|f| f.sync_all())
         .map_err(|e| format!("同步 Agent 暂存文件失败：{e}"))?;
+    #[cfg(all(feature = "cvm", target_os = "linux"))]
+    let _cvm_switch = {
+        let guard = crate::cvm::stack::switch_guard()?;
+        if crate::cvm::stack::fenced()? {
+            let _ = fs::remove_file(&staging);
+            return Err("Cube 运行栈维护期间不会替换 Agent".into());
+        }
+        guard
+    };
     if let Err(error) = before_replace() {
         let _ = fs::remove_file(&staging);
         return Err(error);

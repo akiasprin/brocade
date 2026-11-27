@@ -232,6 +232,7 @@ async fn manual_tx(tx: &mut Transaction<'_, Postgres>, id: i64, reason: &str) ->
 
 async fn process_job(pool: &PgPool, id: i64) -> Result<()> {
     let mut tx = pool.begin().await?;
+    crate::resource_coordination::synchronize_stack_claim(&mut tx).await?;
     lock_tx(&mut tx).await?;
     // Model writers take this same singleton lock; no business edit can enter between the
     // eligibility check and persisting the immutable single-node target.
@@ -331,7 +332,10 @@ async fn process_job(pool: &PgPool, id: i64) -> Result<()> {
     )
     .fetch_one(&mut *tx)
     .await?;
-    if config_active || binary_active {
+    if config_active
+        || binary_active
+        || crate::resource_coordination::stack_busy(&mut tx, &[intent.node_id.as_str()]).await?
+    {
         // Another bootstrap or this node's binary upgrade owns the execution slot. Waiting does
         // not consume a failure attempt and may never expand the selected target set.
         sqlx::query(

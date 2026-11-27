@@ -96,6 +96,25 @@ async fn ensure_no_cvm_release(
     }
     let busy:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM deployments d JOIN deployment_targets t ON t.deployment_id=d.id JOIN deployment_target_state s ON s.deployment_id=t.deployment_id AND s.node_id=t.node_id WHERE d.active=TRUE AND s.cvm_revision_id IS NOT NULL AND ($1::text IS NULL OR t.node_id=$1) AND t.status IN ('pending','dispatched','converging','failed-recovered','failed-dirty'))").bind(node).fetch_one(&mut **tx).await?;
     let pending:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_revision_nodes r LEFT JOIN cvm_serving_nodes s ON s.node_id=r.node_id WHERE ($1::text IS NULL OR r.node_id=$1) AND r.revision_id>COALESCE(s.revision_id,0))").bind(node).fetch_one(&mut **tx).await?;
+    let stack_table: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.cvm_stack_releases') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if stack_table {
+        let stack_open: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM cvm_stack_releases WHERE ($1::text IS NULL OR node_id=$1)
+              AND (status IN ('applying','blocked') OR (status IN ('preparing','ready','approved')
+                AND expires_at > floor(extract(epoch FROM clock_timestamp())))))",
+        )
+        .bind(node)
+        .fetch_one(&mut **tx)
+        .await?;
+        if stack_open {
+            return Err(StoreError::Conflict(
+                "无法在 Cube 运行栈发布未结束时切换为基础版".into(),
+            ));
+        }
+    }
     if busy || pending {
         return Err(StoreError::Conflict(
             "容器配置尚未发布或发布尚未结束，不能切换为基础版".into(),

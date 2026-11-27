@@ -2,6 +2,8 @@ import { CVM_ENABLED } from '../product';
 import { TitleActions } from '../ui/title-actions';
 import {
   Fragment,
+  lazy,
+  Suspense,
   useEffect,
   useId,
   useState,
@@ -474,19 +476,24 @@ function FlowGroup({
    每个页签照用量页：左侧 300px 读数栏，右侧列表。配置页的列表是发布流水，Agent / Xray 是逐台机器表。
    稿件：mockups/deploy-cockpit.html。 */
 
-type DeployTab = 'config' | 'agent' | 'xray';
+type DeployTab = 'config' | 'agent' | 'xray' | 'cube-stack';
 
 const DEPLOY_TABS: { key: DeployTab; label: string; icon: IconName }[] = [
   { key: 'config', label: '配置', icon: 'config' },
   { key: 'agent', label: 'Agent', icon: 'agent' },
   { key: 'xray', label: 'Xray', icon: 'xray' },
 ];
+const CUBE_STACK_TAB = { key: 'cube-stack', label: 'Cube 运行栈', icon: 'host' } as const;
+const CubeStackReleaseTab = CVM_ENABLED ? lazy(() => import('./cvm/stack-release')) : null;
 
 type TabBadge = { tone: 'run' | 'gold'; text: string } | null;
 
 function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: boolean }) {
   // 页签是一次浏览中的位置，不进地址栏（与机器详情页相同）。
-  const [tab, setTab] = useState<DeployTab>('config');
+  const [selectedTab, setTab] = useState<DeployTab>('config');
+  const showCubeStack = CVM_ENABLED && editable;
+  const tabs = showCubeStack ? [...DEPLOY_TABS, CUBE_STACK_TAB] : DEPLOY_TABS;
+  const tab = selectedTab === 'cube-stack' && !showCubeStack ? 'config' : selectedTab;
   const [editing, setEditing] = useState<'agent' | 'xray' | null>(null);
   const tabIdBase = useId();
   useSyncExternalStore(draft.subscribe, draft.version);
@@ -507,7 +514,7 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
   const agent = useAgentRelease();
   const xray = useXrayRelease();
 
-  // 页头的角标与状态灯读全部三页的数据：任一组还在加载就挂载，会先画出「没有待处理」再改口。
+  // 页头的角标与状态灯读配置、Agent 和 Xray 的数据，等读完再判断是否仍有待处理事项。
   if (
     all.isPending ||
     revisions.isPending ||
@@ -555,11 +562,12 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
           ? { tone: 'warn', why: '有待处理的发布' }
           : running
             ? { tone: 'run', why: '发布进行中' }
-            : { tone: 'ok', why: '配置与软件版本均已收敛' };
+            : { tone: 'ok', why: '配置、Agent 和 Xray 均已收敛' };
   const badges: Record<DeployTab, TabBadge> = {
     config: hasPendingConfig ? { tone: 'gold', text: String(changedConfigTargets) } : null,
     agent: agentBadge(agent),
     xray: xrayBadge(xray),
+    'cube-stack': null,
   };
 
   const stopEditing = () => {
@@ -581,16 +589,15 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
     setTab(next);
   };
   const moveTab = (event: ReactKeyboardEvent<HTMLButtonElement>, from: DeployTab) => {
-    const index = DEPLOY_TABS.findIndex(item => item.key === from);
+    const index = tabs.findIndex(item => item.key === from);
     let next: number | null = null;
-    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % DEPLOY_TABS.length;
-    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp')
-      next = (index - 1 + DEPLOY_TABS.length) % DEPLOY_TABS.length;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % tabs.length;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (index - 1 + tabs.length) % tabs.length;
     if (event.key === 'Home') next = 0;
-    if (event.key === 'End') next = DEPLOY_TABS.length - 1;
+    if (event.key === 'End') next = tabs.length - 1;
     if (next === null) return;
     event.preventDefault();
-    const key = DEPLOY_TABS[next].key;
+    const key = tabs[next].key;
     selectTab(key);
     window.requestAnimationFrame(() => document.getElementById(tabId(key))?.focus());
   };
@@ -625,7 +632,7 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
           升级 Agent
         </button>
       )
-    ) : xray.active ? (
+    ) : tab === 'cube-stack' ? null : xray.active ? (
       <button
         className="btn danger"
         type="button"
@@ -666,7 +673,7 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
           </div>
           <div className="nd-tabs" role="tablist" aria-label="发布页签">
             <div className="nd-tabs-seg">
-              {DEPLOY_TABS.map(item => {
+              {tabs.map(item => {
                 const badge = badges[item.key];
                 return (
                   <button
@@ -713,6 +720,18 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
                 editing={editing === 'agent'}
                 onEditingChange={setEditingFor('agent')}
               />
+            ) : tab === 'cube-stack' ? (
+              CubeStackReleaseTab && (
+                <Suspense
+                  fallback={
+                    <div className="cgc-main cgc-span">
+                      <Loading />
+                    </div>
+                  }
+                >
+                  <CubeStackReleaseTab />
+                </Suspense>
+              )
             ) : (
               <XrayReleaseTab
                 xray={xray}

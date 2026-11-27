@@ -108,6 +108,7 @@ impl PgStore {
         request: TerminalPolicyUpdate,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        crate::resource_coordination::lock(&mut tx).await?;
         let tenant:String=sqlx::query_scalar("SELECT n.tenant_id FROM nodes n JOIN cvm_hosts h ON h.node_id=n.id WHERE n.id=$1 AND n.retired_at IS NULL FOR SHARE OF n").bind(node).fetch_optional(&mut *tx).await?.ok_or_else(||StoreError::NotFound("CVM 承载机器".into()))?;
         if !matches!(
             actor.role(),
@@ -116,6 +117,7 @@ impl PgStore {
         {
             return Err(StoreError::Forbidden("无权管理该机器的 WebShell".into()));
         }
+        crate::resource_coordination::ensure_stack_idle(&mut tx, &[node]).await?;
         sqlx::query("INSERT INTO cvm_terminal_policies(node_id,actor_id) VALUES($1,$2) ON CONFLICT(node_id) DO NOTHING").bind(node).bind(actor.operator_id()).execute(&mut *tx).await?;
         let (current, revision): (bool, i64) = sqlx::query_as(
             "SELECT enabled,revision FROM cvm_terminal_policies WHERE node_id=$1 FOR UPDATE",

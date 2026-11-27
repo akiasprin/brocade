@@ -8,18 +8,23 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import select
 import socket
 import threading
 import time
 
 MAX_BODY = 16 * 1024 * 1024
+MAX_STACK_BUNDLE = 8 * 1024**3
+STACK_BUNDLE = re.compile(r'/agent/v1/cvm/stack-bundles/([a-f0-9]{64})')
+STACK_POLL = '/agent/v1/cvm/stack-releases/poll'
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--port', type=int, default=18081)
+    parser.add_argument('--upstream-port', type=int, default=8080)
     args = parser.parse_args()
     root = args.root.resolve()
     root.mkdir(mode=0o700, exist_ok=True)
@@ -49,6 +54,38 @@ def main():
             if body:
                 self.wfile.write(body)
 
+        def bundle(self, response, node, mode):
+            raw_length = response.getheader('Content-Length', '')
+            if not raw_length.isdigit() or not 0 < int(raw_length) <= MAX_STACK_BUNDLE:
+                return self.respond(502)
+            remaining = int(raw_length)
+            if mode == 'size':
+                remaining -= 1
+            if mode:
+                proof = {'mode': mode, 'path': self.path, 'upstream_bytes': int(raw_length)}
+                private(root / (node + '-stack-download.summary.json'), json.dumps(proof).encode())
+            self.send_response(200)
+            for name, value in response.getheaders():
+                if name.lower() not in ('content-length', 'connection', 'transfer-encoding'):
+                    self.send_header(name, value)
+            self.send_header('Content-Length', str(remaining))
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.close_connection = True
+            flip = mode == 'hash'
+            while remaining:
+                block = response.read(min(remaining, 65536))
+                if not block:
+                    return
+                if flip:
+                    block = bytes([block[0] ^ 1]) + block[1:]
+                    flip = False
+                try:
+                    self.wfile.write(block)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                remaining -= len(block)
+
         def handle_request(self):
             if self.headers.get('Upgrade', '').lower() == 'websocket':
                 with lock:
@@ -69,7 +106,7 @@ def main():
                     return self.respond(503, b'owned lab HTTP fault-injection phase')
                 # Pass the real authenticated Agent channel byte-for-byte, including its
                 # handshake. Delays apply only to HTTP claims/receipts, never fake wake data.
-                upstream = socket.create_connection(('127.0.0.1', 8080), timeout=5)
+                upstream = socket.create_connection(('127.0.0.1', args.upstream_port), timeout=5)
                 try:
                     upstream.settimeout(None)
                     request = (
@@ -100,6 +137,28 @@ def main():
             with lock:
                 control = json.loads((root / 'control.json').read_text())
                 node = control.get('nodes', {}).get(digest, '')
+                stack_download = control.get('stack_download') or {}
+                bundle = STACK_BUNDLE.fullmatch(self.path) if self.command == 'GET' else None
+                mode = None
+                if node and bundle and stack_download.get('node') == node and stack_download.get('sha256') == bundle[1]:
+                    if stack_download.get('mode') in ('hash', 'size'):
+                        mode = stack_download['mode']
+                receipt_gate = control.get('hold_stack_report') or {}
+                if self.command == 'POST' and self.path == STACK_POLL and node and receipt_gate.get('node') == node:
+                    try:
+                        report = json.loads(body).get('report') or {}
+                    except (ValueError, AttributeError):
+                        report = {}
+                    if (
+                        isinstance(report, dict)
+                        and report.get('id') == receipt_gate.get('id')
+                        and report.get('status') == receipt_gate.get('status')
+                        and report.get('status') in ('succeeded', 'recovered', 'blocked')
+                    ):
+                        proof = {key: report.get(key) for key in ('id', 'status', 'roots_sha256')}
+                        proof['sha256'] = hashlib.sha256(body).hexdigest()
+                        private(root / (node + '-stack-report.summary.json'), json.dumps(proof).encode())
+                        return self.respond(503, b'owned lab stack receipt unavailable')
                 flag = None
                 if self.path.startswith('/agent/v1/cvm/desired') and node in control.get('hold_cvm_desired', []):
                     return self.respond(
@@ -134,11 +193,13 @@ def main():
                     return self.respond(
                         503, b'{"error":"owned lab receipt delay"}', [('Content-Type', 'application/json')]
                     )
-            connection = http.client.HTTPConnection('127.0.0.1', 8080, timeout=40)
+            connection = http.client.HTTPConnection('127.0.0.1', args.upstream_port, timeout=40)
             try:
                 headers = {k: v for k, v in self.headers.items() if k.lower() not in ('host', 'connection')}
                 connection.request(self.command, self.path, body=body if size else None, headers=headers)
                 response = connection.getresponse()
+                if bundle and response.status == 200:
+                    return self.bundle(response, node, mode)
                 data = response.read(MAX_BODY + 1)
                 if len(data) > MAX_BODY:
                     return self.respond(502)

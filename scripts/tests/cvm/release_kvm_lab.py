@@ -7,8 +7,10 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import socket
+import stat
 import subprocess
 import tempfile
 import time
@@ -135,6 +137,44 @@ class Lab:
                     if 'return' in response:
                         break
             return response['return']
+
+    def verify_owned(self):
+        for directory in (self.output, Path(self.state['runtime'])):
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise RuntimeError('KVM lab directories must be private and owned')
+        task = self.state['task']
+        if not re.fullmatch(r'[a-f0-9]{10}', task):
+            raise RuntimeError('invalid KVM lab identity')
+        for role in ('compute', 'provider', 'client'):
+            machine = self.state['roles'][role]
+            name = f'brocade-release-{task}-{role}'
+            qmp = Path(self.state['runtime']) / (role + '.qmp')
+            pid = machine['pid']
+            if type(pid) is not int or pid <= 1 or machine.get('stopped'):
+                raise RuntimeError('invalid owned QEMU PID')
+            proc = Path(f'/proc/{pid}')
+            words = (proc / 'cmdline').read_bytes().split(b'\0')
+            forwards = f'user,id=wan,hostfwd=tcp:127.0.0.1:{machine["ssh_port"]}-:22'
+            if role == 'compute':
+                forwards += f',hostfwd=tcp:127.0.0.1:{self.state["console_port"]}-:8080'
+            if (
+                proc.stat().st_uid != os.getuid()
+                or not stat.S_ISSOCK(qmp.lstat().st_mode)
+                or machine['name'] != name
+                or machine['qmp'] != str(qmp)
+                or name.encode() not in words
+                or f'unix:{qmp},server=on,wait=off'.encode() not in words
+                or forwards.encode() not in words
+                or self.qmp(role, 'query-name')['name'] != name
+                or self.qmp(role, 'query-kvm')['enabled'] is not True
+            ):
+                raise RuntimeError('lab QEMU PID, QMP, KVM or port ownership check failed')
+            if (
+                self.remote(role, 'sudo cat /var/lib/cloud/data/instance-id', timeout=10).stdout.strip()
+                != (task + role).encode()
+            ):
+                raise RuntimeError('SSH did not identify the expected lab seed')
 
     def stop(self):
         for role, state in self.state['roles'].items():

@@ -89,11 +89,13 @@ const settingsResponses = {
 
 const params = new URLSearchParams(location.search);
 if (theme.snapshot() !== (params.get('theme') === 'light' ? 'light' : 'dark')) theme.toggle();
+const network = globalThis.fetch;
 installBackend();
 const backend = globalThis.fetch;
 let initializationChecks = 0;
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+  if (params.has('stack-release') && /^\/cvm\/stack-releases(?:\/|$)/.test(url.pathname)) return network(input, init);
   const state = params.get('state') ?? 'idle';
   if (url.pathname === '/deployments/verify') console.info('[fixture] deployment-verification-read');
   if (url.pathname === '/settings') return Response.json(settings);

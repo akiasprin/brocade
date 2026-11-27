@@ -52,7 +52,51 @@ OS 镜像和运行包须显式提供摘要；具体参数见各脚本。受限�
 恢复后继续透传实际 WebSocket 通道。不能把只拦截 HTTP、却仍放行通道 RPC 的脚本当作故障验收通过。
 实验网卡的整 IP 回程与探测网段使用持久静态路由；跨月改时钟后仍核对客户端回程，避免 DHCP 更新清除临时路由。
 
-`release_chain_acceptance.py` 在该实验状态上逐阶段执行：`prepare` 校验并上传 `chain_probe.go`
+### Cube Stack B 冷切换
+
+仅在本轮独占的 x86_64 原生 KVM／ext4 (`plain`) 实验中执行。先冻结带 Stack B 的 Console、Agent 和同次构建的 `scripts/cvm_stack.py`。`BUILD` 的 `target/cube/artifacts/x86_64/bundle.json` 必须指向源包 `A` 并记录 `A_SHA`；目标 `B` 和 `B_SHA` 必须来自另一个真实构建，Cubelet、Shim 字节和 Shim 不可变版本均须不同。两包须兼容同一状态 ABI，不允许简单改包名或伪造二进制。用新的数据库和实验目录，不将既有产品库作为夹具。
+
+```sh
+# 在 KVM 控制主机的仓库根目录；变量均指向本轮已固定的绝对路径或摘要。
+install -d -m 0700 "$RUN"
+CVM=scripts/tests/cvm
+python3 "$CVM/release_stack_acceptance.py" catalog --output "$RUN/catalog" \
+  --source "$A" --source-sha256 "$A_SHA" --target "$B" --target-sha256 "$B_SHA"
+python3 "$CVM/release_kvm_lab.py" prepare --output "$RUN/lab-3" \
+  --image "$OS_IMAGE" --image-sha256 "$OS_SHA"
+python3 "$CVM/release_kvm_services.py" --lab "$RUN/lab-3" --output "$RUN/prerequisites"
+python3 "$CVM/release_kvm_deploy.py" "$RUN/lab-3" "$BUILD" "$RUN/services"
+python3 "$CVM/release_kvm_acceptance.py" "$RUN" bootstrap
+python3 "$CVM/release_stack_acceptance.py" prepare --lab-output "$RUN" \
+  --catalog "$RUN/catalog" --active alpha --idle stack-idle --seed-missing
+python3 "$CVM/release_stack_acceptance.py" run --lab-output "$RUN" --late-receipt
+```
+
+`prepare` 保留原 ext4 backing image 和 Agent 执行记录，仅在本轮计算 VM 内将旧实验 Agent 转换为可重启的 `brocade-agent.service`，启用持久存储挂载，配置 Console 与 Agent 的本轮签名信任。已有实验可选择同一个 compute 上已登记的运行 Guest 与停机 Guest，省略 `--seed-missing`；计算 VM 不得有其他实例。未准备现有停机 Guest 时，脚本只在已确认归属的实验中创建并停机。运行前不要让其他脚本并发修改该实验，且两 VM 时钟须与当前维护窗口一致。
+
+完整顺序为 `bad-hash`、`bad-size`、`cancel`、`activation-failure`、`manager-death`、`success`、`rollback`，可用重复的 `--case` 显式选取子集；哈希／长度故障先于任何合法暂存目标，回滚先有真实目标成功。默认检查独立 provider/client 私有 LAN；若已部署现有发行网络探针和 TCP 业务网卡，可额外指定 `--provider-echo` 验证真实跨宿主业务 TCP。`--late-receipt` 只拒绝目标节点和发布单的最终 Stack HTTP 回执，直到真实 Agent 重启后重报；不声称测试全控制面断网。
+
+保留 `$RUN/stack-acceptance/state.json` 和隔离日志。出错不删除实例、盘、虚拟机和待恢复记录，也不补造回执。全部完成或人工收集失败现场后，可用 `python3 "$CVM/release_kvm_lab.py" stop --output "$RUN/lab-3"` 停止本轮拥有的外层 VM。此基线不代表 XFS、PVM 或其他架构已验收。
+
+### Cube Stack B 空机首装
+
+在另一套独占的 KVM 实验与空数据库中，只为计算 VM 接入 CVM Agent，保留准备好的 ext4 `plain` 存储。`catalog` 也会生成签向真实源包 `A` 的独立首装清单。复用它时确认清单未过期；`FRESH_RUN` 使用新的绝对路径。
+
+```sh
+install -d -m 0700 "$FRESH_RUN"
+python3 "$CVM/release_kvm_lab.py" prepare --output "$FRESH_RUN/lab-3" \
+  --image "$OS_IMAGE" --image-sha256 "$OS_SHA"
+python3 "$CVM/release_kvm_services.py" --lab "$FRESH_RUN/lab-3" --output "$FRESH_RUN/prerequisites"
+python3 "$CVM/release_kvm_deploy.py" --agent-only-compute \
+  "$FRESH_RUN/lab-3" "$BUILD" "$FRESH_RUN/services"
+python3 "$CVM/release_kvm_acceptance.py" "$FRESH_RUN" bootstrap
+python3 "$CVM/release_stack_acceptance.py" first-install \
+  --lab-output "$FRESH_RUN" --catalog "$RUN/catalog"
+```
+
+脚本核验 Agent 自行部署安装器并上报正向空机证据。篡改下载归档后，确认预检失败、存储身份与 Agent 进程均保持原样。合法归档须再走预检和人工审批接口，核验目标组件、持久安装回执、空盘摘要和首个真实 KVM Guest。证据保存在 `$FRESH_RUN/stack-acceptance/first-install.json`，失败时保留本轮环境。使用 `release_kvm_lab.py stop --output "$FRESH_RUN/lab-3"` 停止本轮实验。
+
+`release_chain_acceptance.py` 在发行路径实验状态上逐阶段执行：`prepare` 校验并上传 `chain_probe.go`
 构建的独立端点；执行 `chain_icmp` 时，另将同源 `attachment_probe.go` 产物作为 `prepare` 的第二个文件参数，
 供受限 Guest I/O 正向对照使用。`configure` 发布真实线路、授权与普通 WireGuard 下一跳，`primary` 为仅有主网卡的
 实例选择线路。`traffic`、`mixed_routes`、`source_guard`、`faults`、`quotas`、`grant_revocation`

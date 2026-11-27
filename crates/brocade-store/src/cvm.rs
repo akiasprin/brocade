@@ -26,6 +26,7 @@ mod recovery;
 pub(crate) mod releases;
 pub(crate) mod retirement;
 mod route_match;
+pub mod stack;
 pub use route_match::{
     CvmRouteBlockReason, CvmRouteMatch, CvmRouteMatchProtocol, CvmRouteMatchRequest,
 };

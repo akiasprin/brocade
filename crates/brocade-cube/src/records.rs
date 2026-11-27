@@ -49,6 +49,15 @@ impl Record {
 }
 
 pub(crate) fn load(root: &Path) -> Result<BTreeMap<String, Record>> {
+    let mut records = load_saved(root)?;
+    for record in records.values_mut() {
+        // A saved receipt is historical evidence, never proof that a runtime survived restart.
+        record.report = None;
+    }
+    Ok(records)
+}
+
+pub(crate) fn load_saved(root: &Path) -> Result<BTreeMap<String, Record>> {
     let mut records = BTreeMap::new();
     for entry in std::fs::read_dir(root).map_err(|_| "Cube execution records unavailable")? {
         let entry = entry.map_err(|_| "Cube execution record entry unavailable")?;
@@ -59,15 +68,13 @@ pub(crate) fn load(root: &Path) -> Result<BTreeMap<String, Record>> {
             return Err("Cube instance history limit reached".into());
         }
         let bytes = files::checked_file(&entry.path(), 32 * 1024, true)?;
-        let mut record: Record = serde_json::from_slice(&bytes)
+        let record: Record = serde_json::from_slice(&bytes)
             .map_err(|_| "invalid durable Cube record; refusing to recreate instances")?;
         if !brocade_deployment::cvm::valid_id(&record.instance)
             || entry.file_name() != std::ffi::OsString::from(format!("{}.json", record.instance))
         {
             return Err("Cube durable execution ownership is invalid".into());
         }
-        // A saved receipt is historical evidence, never proof that a runtime survived restart.
-        record.report = None;
         records.insert(record.instance.clone(), record);
     }
     Ok(records)

@@ -34343,6 +34343,12 @@ body.fg-dragging .fg-rail {
   justify-self: end;
 }
 
+@container (max-width: 360px) {
+  .cgc-page .nd-tabs-seg:has(> :nth-child(4)) .nd-tab-ic {
+    display: none;
+  }
+}
+
 /* 窄宽度：读数栏沿用用量页的断点（在 nd-page 容器上生效）；机器表一台两行，目标版本收起。 */
 @container (max-width: 700px) {
   .usage-cockpit.cgc-cockpit {
@@ -34350,6 +34356,9 @@ body.fg-dragging .fg-rail {
   }
   .cgc-main {
     padding: 14px 12px 16px;
+  }
+  .cgc-page .nd-tabs-seg:has(> :nth-child(4)) > button {
+    flex-basis: auto;
   }
   .cgc-th {
     display: none;

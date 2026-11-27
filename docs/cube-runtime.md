@@ -125,6 +125,40 @@ Guest PTY 的使用与策略见 [CVM 实例终端](cvm.md#实例终端webshell)�
 
 安装器在变更服务之前检查 `brocade-agent cvm-check --version` 和维护契约。运行包统一使用 `brocade-cvm-stack-v2`，每个包都包含模式管理与恢复程序。Agent 更新与 Cube 运行栈更新分别执行；回退须满足持久状态 ABI，并保留仍被实例引用的系统制品。CVM 开发阶段的执行器、状态和运行包不属于公开升级支持范围。
 
+### 从 Console 首装或冷切换运行栈
+
+当前流程一次维护一台受管 x86_64 原生 KVM 节点。冷切换的源包和目标包使用同一种本地存储后端（XFS 或 ext4/plain）与兼容的持久状态 ABI。节点必须没有跨宿主网卡、入口隧道、链路终端或其他执行后端的实例。PVM、换核和 Guest 启动制品升级仍有各自的维护流程。先在同架构、同存储后端的隔离环境验收相应的首装、正向升级、反向回退与故障恢复，再签发对应清单。验收入口见 [Cube Stack B 冷切换](../scripts/tests/cvm/README.md#cube-stack-b-冷切换)和[空机首装](../scripts/tests/cvm/README.md#cube-stack-b-空机首装)。已经执行过旧预发布版 `0009` 迁移的数据库，须先核验旧校验和与实际结构，再通过经验证的兼容转换接入。
+
+**启用发布。** 先更新 CVM Console 与节点上的 CVM Agent。节点的 `/etc/brocade/cvm-stack-update.pub` 是 root 所有的普通文件，内容为 Ed25519 原始公钥的 64 个小写十六进制字符，建议权限 `0644`。Console 同时设置 `BROCADE_CVM_STACK_PUBLIC_KEY` 为同一公钥，并将 `BROCADE_CVM_STACK_CATALOG_DIR` 指向 Console 可读、由发布管理员维护的绝对目录。已安装 Cube 的节点在维护窗口内更新 `/usr/local/lib/brocade/cvm-stack.py` 至与 Agent 同源的版本，保持文件由 root 所有且仅 root 可写。Agent 会校验安装器的完整字节。冷切换还要求本次启动的原生 KVM 初始化回执和持久的 Cubelet 元数据绑定挂载。
+
+**准备签名目录。** 对已验收的每个方向制作 UTF-8 JSON `payload`，包含以下字段。所有 SHA-256 均用 64 个小写十六进制字符表示。包、Cubelet 与 Shim 的身份来自已核验的发行档案。
+
+| 字段                                             | 值                                                                      |
+| ------------------------------------------------ | ----------------------------------------------------------------------- |
+| `contract`                                       | `brocade-cvm-stack-cold-pair-v1`                                        |
+| `architecture`                                   | `x86_64`                                                                |
+| `storage_backend`                                | `xfs` 或 `plain`，与节点和验收一致                                      |
+| `source_sha256`、`target_sha256`                 | 源、目标 `.tar.gz` 的 SHA-256                                           |
+| `source_cubelet_sha256`、`target_cubelet_sha256` | 对应运行包内 `runtime/Cubelet/bin/cubelet` 的 SHA-256                   |
+| `source_shim_sha256`、`target_shim_sha256`       | 对应运行包内 `runtime/cube-shim/bin/containerd-shim-cube-rs` 的 SHA-256 |
+| `target_bytes`                                   | 目标归档的精确字节数，最多 8 GiB                                        |
+| `expires_at`                                     | 此签名配对的 UTC Unix 秒数截止时间                                      |
+
+首装清单使用 `brocade-cvm-stack-fresh-install-v1`，省略三个 `source_*` 字段，保留架构、存储后端、三个目标摘要、目标字节数与截止时间。同一个目标归档可供各自签名的首装清单与冷切换配对使用。
+
+在离线签名环境中对 `payload` 的原始 UTF-8 字节做 Ed25519 签名，例如使用 `openssl pkeyutl -sign -rawin -inkey <离线私钥> -in payload.json -out signature.bin`。发布目录中的 `<payload SHA-256>.json` 存放包含 `payload` 字符串和 `signature` 十六进制字符串的 JSON 对象，签名是 64 字节，`payload` 字符串保留原始空白和换行。目标归档以 `<target_sha256>.tar.gz` 入库。先原子放置归档，再放置签名清单。签名私钥留在离线环境。计划内反向回退使用独立签名的反向配对和正常审批流程。
+
+**空机首装。** 先用 CVM Agent 接入节点，确认 `/usr/local/bin/brocade-agent` 由 `brocade-agent.service` 运行。准备原生 KVM、TUN、运行依赖及持久的空存储目录 `/data/cubelet/storage`。Agent 在公钥启用后可部署内嵌的安装器，并主动证明节点没有历史 Cube 安装、裸机 CVM 配置、活动 Cube 服务或保留执行记录。Console 还校验节点没有已分配的 CVM 工作、未收敛的发布或主机策略。待「发布 → Cube 运行栈」显示首装可用后，选择同存储后端的首装签名归档，等待预检，再在维护窗口内批准。Agent 安装并验证实际 Cubelet、已安装 Shim 和空盘证明后，才可分配 VM。首装中断后如果节点保持阻断，节点管理员用下述恢复命令核验或继续**同一已认领目标**，保留现场和存储。
+
+**操作及验收。**
+
+1. 记录维护前在运行的 VM。用现有 CVM 电源流程停机并等待 Console 显示已应用。保持已停机的 VM 原样。确认没有未收敛的配置、Agent 或 Xray 发布，也没有遗留隔离或网络清理任务。
+2. 进入「发布 → Cube 运行栈」，用节点最近观测到的源栈选择签名配对并创建发布。Agent 下载并预检目标包，同时核对 Cubelet 已无 Sandbox、原盘可见并可识别。预检完成后，系统管理员在维护窗口内确认并批准。窗口最长 24 小时，且不得超过配对签名有效期。Agent 认领前可取消。
+3. Agent 认领后，独立系统服务持有维护围栏。运行栈更新只切换宿主服务和可执行件。Console 允许在实际 Cubelet、磁盘和已安装 Shim 验证通过后结束维护。超期仍未认领的发布自动失效，认领后的任务一直等到有最终证据。
+4. 宿主成功后，通过 CVM 电源流程只启动维护前在运行的 VM。逐台核对实际 Shim、原系统盘与应用连通性。Guest 内核、系统镜像和 Guest Agent 等既有启动制品按实例原有记录复用。
+
+**发生阻断时。** 保存发布编号、`brocade-cvm-stack-<发布编号>.service` 与 `brocade-cvm-cubelet.service` 的日志，以及 `/opt/brocade/cvm/` 下的维护标记和安装回执。保持 VM 停机。修复外部原因后，可由节点管理员执行 `sudo /usr/local/bin/brocade-agent cvm-stack-execute <发布编号> --recover-blocked`。此命令只处理本机记录中的同一个已阻断发布。冷切换恢复核验原包、实际进程、Shim 和原盘，首装恢复核验同一目标和空盘。若安装器无法确认中断现场或证明所需证据，节点继续保持维护。保留双方围栏与记录，直到 Console 接受最终回执。
+
 ### 网络额度内存模型
 
 `network-state-budget-v1` 先取物理内存与可见 cgroup v2 各层 `memory.max` 的最小值 M，宿主服务保留 `R=max(448 MiB,M/16)`，共享预算 `B=M−R`。硬容量 C 为满足 `16 MiB+C×(48+1536) ≤ B` 的最大二次幂，范围 8192–1048576。固定预算 `F=16 MiB+48×C`；每状态预算为 1536 字节，系统保留 4096 条。

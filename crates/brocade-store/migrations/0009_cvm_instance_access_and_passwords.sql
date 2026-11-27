@@ -113,3 +113,44 @@ ALTER TABLE cvm_entry_tunnels
     DROP CONSTRAINT cvm_entry_tunnels_target_node_fkey;
 ALTER TABLE cvm_entries
     DROP CONSTRAINT cvm_entries_provider_node_fkey;
+
+-- Cube stack installation and cold maintenance have an independent inventory, lease and audit trail.
+CREATE TABLE cvm_stack_observations (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    installed JSONB CHECK (jsonb_typeof(installed) = 'object'),
+    installable TEXT CHECK (installable IN ('xfs', 'plain')),
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (num_nonnulls(installed, installable) = 1)
+);
+
+CREATE TABLE cvm_stack_releases (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    node_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    artifact JSONB NOT NULL CHECK (jsonb_typeof(artifact) = 'object'),
+    status TEXT NOT NULL CHECK (status IN (
+        'preparing', 'ready', 'approved', 'applying', 'succeeded', 'failed',
+        'recovered', 'blocked', 'cancelled'
+    )),
+    expires_at BIGINT NOT NULL CHECK (expires_at > 0),
+    roots_sha256 TEXT CHECK (roots_sha256 ~ '^[0-9a-f]{64}$'),
+    error TEXT CHECK (length(error) <= 128),
+    CHECK (status NOT IN ('ready', 'approved', 'applying', 'succeeded', 'recovered', 'blocked')
+        OR roots_sha256 IS NOT NULL)
+);
+
+CREATE UNIQUE INDEX cvm_stack_releases_open_host ON cvm_stack_releases(node_id)
+WHERE status IN ('preparing', 'ready', 'approved', 'applying', 'blocked');
+
+CREATE TABLE cvm_stack_release_events (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    release_id BIGINT NOT NULL REFERENCES cvm_stack_releases(id) ON DELETE RESTRICT,
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('admin', 'agent', 'system')),
+    actor_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    roots_sha256 TEXT,
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX cvm_stack_release_events_history ON cvm_stack_release_events(release_id,id);

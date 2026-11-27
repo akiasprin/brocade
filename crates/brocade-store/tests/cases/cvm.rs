@@ -12,6 +12,8 @@ mod baremetal_tests;
 mod chain_tests;
 #[path = "cvm_releases.rs"]
 mod release_tests;
+#[path = "cvm_stack.rs"]
+mod stack_tests;
 
 #[path = "cvm_host_policy.rs"]
 mod host_policy_tests;
@@ -100,7 +102,7 @@ async fn cvm_first_release_initializes_shared_schema() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(count, 40);
+    assert_eq!(count, 43);
 }
 
 #[tokio::test]

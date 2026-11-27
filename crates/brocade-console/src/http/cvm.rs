@@ -2,6 +2,7 @@
 use super::*;
 pub(super) mod entries;
 pub(super) mod nics;
+pub(super) mod stack;
 pub(super) mod terminal;
 use brocade_deployment::cvm::{CvmImageManifest, InstanceReport, InventoryReport};
 use brocade_store::cvm::{CvmCommand, CvmCreate};

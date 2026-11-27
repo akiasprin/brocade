@@ -34,6 +34,7 @@ impl PgStore {
         if !(actor.is_global_scope() || actor.can_access_tenant(&tenant)) {
             return Err(StoreError::Forbidden("无权管理该机器的容器宿主身份".into()));
         }
+        crate::resource_coordination::ensure_stack_idle(&mut tx, &[node]).await?;
         sqlx::query("INSERT INTO cvm_host_policies(node_id,actor_id) VALUES($1,$2) ON CONFLICT(node_id) DO NOTHING")
             .bind(node).bind(actor.operator_id()).execute(&mut *tx).await?;
         let (enabled, revision): (bool, i64) = sqlx::query_as(

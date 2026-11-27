@@ -698,6 +698,8 @@ fn run() -> Result<(), String> {
         Some("health") => return health(&health_state_dir(&args)),
         #[cfg(feature = "cvm")]
         Some("cvm-check") => return cvm::check(&args[1..]),
+        #[cfg(all(feature = "cvm", target_os = "linux"))]
+        Some("cvm-stack-execute") => return cvm::stack::execute(&args[1..]),
         #[cfg(feature = "cvm")]
         Some("cvm-host-terminal") => return cvm::host::terminal::run(&args[1..]),
         Some("repair") => return reconcile_local(&health_state_dir(&args), Drift::Always),

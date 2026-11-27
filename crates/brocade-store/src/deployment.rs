@@ -573,6 +573,7 @@ pub async fn create_deployment(
     }
 
     let mut tx = crate::model_timing::measure("pool_begin", pool.begin()).await?;
+    crate::resource_coordination::synchronize_stack_claim(&mut tx).await?;
     let result = crate::model_timing::measure(
         "deployment_persist",
         create_from_plan_tx(&mut tx, request, plan),
@@ -618,6 +619,13 @@ async fn create_from_plan_tx(
         });
     }
 
+    let affected = plan
+        .targets
+        .iter()
+        .filter(|target| target.status == PlannedTargetStatus::Pending)
+        .map(|target| target.node_id.as_str())
+        .collect::<Vec<_>>();
+    crate::resource_coordination::ensure_stack_idle(tx, &affected).await?;
     if request.kind == DeploymentKind::Config {
         let blockers = plan
             .warnings
@@ -748,7 +756,9 @@ pub async fn transition_node_status(
     };
 
     let mut tx = pool.begin().await?;
+    crate::resource_coordination::synchronize_stack_claim(&mut tx).await?;
     lock_deployment_isolation_tx(&mut tx).await?;
+    crate::resource_coordination::ensure_stack_idle(&mut tx, &[node_id]).await?;
     // Report, retry, cancel and rollback all lock the deployment row before any target or
     // lifecycle row. Preserve that global order here too: changing the epoch first and only then
     // waiting for an in-flight report's deployment row forms the inverse lock order and lets a
@@ -950,7 +960,9 @@ pub async fn abandon_node(
         ));
     }
     let mut tx = pool.begin().await?;
+    crate::resource_coordination::synchronize_stack_claim(&mut tx).await?;
     lock_deployment_isolation_tx(&mut tx).await?;
+    crate::resource_coordination::ensure_stack_idle(&mut tx, &[node_id]).await?;
     // Same lock order as report/cancel: deployment, then lifecycle/target.
     let active_ids = sqlx::query_scalar::<_, i64>(
         "SELECT id
@@ -2650,8 +2662,15 @@ pub async fn claim_desired_for_node_with_protocol(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
         .await?;
+    // LOCK TABLE is a utility statement: take the maintenance-lease barrier before the
+    // first repeatable-read snapshot, including a snapshot that would predate a waited mutex.
+    crate::resource_coordination::synchronize_stack_claim(&mut tx).await?;
     #[cfg(feature = "cvm")]
     crate::cvm::releases::lock(&mut tx).await?;
+    if crate::resource_coordination::stack_busy(&mut tx, &[node_id]).await? {
+        tx.commit().await?;
+        return Ok(None);
+    }
     let isolated = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (
              SELECT 1
@@ -3544,7 +3563,9 @@ async fn isolate_node_inner(
         ));
     }
     let mut tx = pool.begin().await?;
+    crate::resource_coordination::synchronize_stack_claim(&mut tx).await?;
     lock_deployment_isolation_tx(&mut tx).await?;
+    crate::resource_coordination::ensure_stack_idle(&mut tx, &[node_id]).await?;
     let rows = sqlx::query(
         "SELECT d.id AS deployment_id,
                 d.revision_id,
@@ -3793,7 +3814,9 @@ pub async fn restore_node_service(
         ));
     }
     let mut tx = pool.begin().await?;
+    crate::resource_coordination::synchronize_stack_claim(&mut tx).await?;
     lock_deployment_isolation_tx(&mut tx).await?;
+    crate::resource_coordination::ensure_stack_idle(&mut tx, &[node_id]).await?;
     let row = sqlx::query(
         "SELECT lifecycle.phase,
                 lifecycle.lifecycle_epoch,
@@ -4111,8 +4134,10 @@ pub async fn retry_target(
     ensure_node_access(pool, actor, node_id).await?;
     ensure_deployment_write_access(pool, actor, deployment_id).await?;
     let mut tx = pool.begin().await?;
+    crate::resource_coordination::synchronize_stack_claim(&mut tx).await?;
     #[cfg(feature = "cvm")]
     crate::cvm::releases::lock(&mut tx).await?;
+    crate::resource_coordination::ensure_stack_idle(&mut tx, &[node_id]).await?;
     let deployment = sqlx::query(
         "SELECT status, active
          FROM deployments
@@ -4717,6 +4742,10 @@ async fn restore_model_snapshot_tx(
     snapshot: &ModelSnapshot,
 ) -> Result<()> {
     crate::resource_coordination::lock(tx).await?;
+    let nodes: Vec<String> = sqlx::query_scalar("SELECT id FROM nodes")
+        .fetch_all(&mut **tx)
+        .await?;
+    crate::resource_coordination::ensure_stack_idle(tx, &nodes).await?;
     // Provider control tokens are operational state and intentionally absent from model
     // snapshots. Preserve one when the target restores the exact same Cloudflare device.
     let warp_binding_tokens = load_warp_binding_tokens_tx(tx).await?;

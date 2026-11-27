@@ -102,7 +102,7 @@ async fn cvm_new_migration_deletes_legacy_cvm_data_and_preserves_non_cvm_state()
     .fetch_all(db.pool())
     .await
     .unwrap();
-    assert_eq!(cvm_tables.len(), 40);
+    assert_eq!(cvm_tables.len(), 43);
     for table in cvm_tables {
         let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(db.pool())

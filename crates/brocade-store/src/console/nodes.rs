@@ -399,6 +399,7 @@ pub(crate) async fn update_node_status_tx(
     ensure_node_exists_tx(tx, &node_id).await?;
     if retired {
         crate::resource_coordination::lock(tx).await?;
+        crate::resource_coordination::ensure_stack_idle(tx, &[node_id.as_str()]).await?;
         // Serialize retirement with CVM host admission, including its first reservation.
         sqlx::query("SELECT id FROM nodes WHERE id=$1 FOR UPDATE")
             .bind(&node_id)
@@ -491,6 +492,7 @@ pub(crate) async fn update_node_tx(
         ));
     }
     let node_id = required_text(node_id, "node id")?;
+    crate::resource_coordination::ensure_stack_idle(tx, &[node_id.as_str()]).await?;
     if let Some(port) = request.wg_listen_port {
         ensure_nonzero_port(port, "wg_listen_port")?;
     }

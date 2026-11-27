@@ -8,6 +8,8 @@ mod network_quota;
 pub(crate) mod nics;
 mod observer;
 mod reconcile;
+#[cfg(target_os = "linux")]
+pub(crate) mod stack;
 mod terminal;
 
 pub(crate) fn check(args: &[String]) -> Result<(), String> {
@@ -28,6 +30,17 @@ pub(crate) fn check(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     if let [empty, flag, path] = args {
+        #[cfg(target_os = "linux")]
+        if matches!(empty.as_str(), "--stack-cold" | "--stack-cold-read-only") && flag == "--config"
+        {
+            let roots = brocade_cube::Backend::inspect_stack_cold(
+                std::path::Path::new(path),
+                std::path::Path::new(stack::EXECUTOR_STATE),
+                empty == "--stack-cold",
+            )?;
+            println!("{roots}");
+            return Ok(());
+        }
         if empty == "--empty" && flag == "--config" {
             let state = backend::state_path()?;
             brocade_cube::Backend::inspect_empty(std::path::Path::new(path), &state)?;
@@ -74,6 +87,10 @@ pub(crate) fn check(args: &[String]) -> Result<(), String> {
 
 /// Pending host transitions fence only CVM; the other Agent domains keep running.
 pub(super) fn maintenance() -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    if stack::fenced()? {
+        return Ok(true);
+    }
     maintenance_at(std::path::Path::new("/opt/brocade/cvm/host.json"))
 }
 
@@ -98,6 +115,8 @@ pub(crate) fn spawn(options: crate::options::Options) -> Result<(), String> {
     nics::spawn(options.clone())?;
     entries::spawn(options.clone())?;
     reconcile::spawn(options.clone())?;
+    #[cfg(target_os = "linux")]
+    stack::spawn(options.clone())?;
     observer::spawn(options.clone())?;
     terminal::spawn(options)
 }

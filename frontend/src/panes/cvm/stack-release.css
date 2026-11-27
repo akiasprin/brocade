@@ -1,0 +1,70 @@
+.cube-stack-release,
+.cube-stack-panels,
+.cube-stack-form {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.cube-stack-instructions {
+  margin: 0;
+}
+
+.cube-stack-panels {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+}
+
+@container (min-width: 900px) {
+  .cube-stack-panels {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+  }
+}
+
+.cube-stack-panels > .panel {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.cube-stack-release .kv {
+  grid-template-columns: minmax(0, 8.5em) minmax(0, 1fr);
+}
+
+.cube-stack-form label {
+  display: grid;
+  gap: 4px;
+}
+
+.cube-stack-form .f {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+}
+
+.cube-stack-form .note {
+  margin: 0;
+}
+
+.cube-stack-records {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.cube-stack-records > li {
+  padding: 12px 0;
+}
+
+.cube-stack-records > li + li {
+  border-top: 1px solid var(--line-soft);
+}
+
+.cube-stack-record-actions {
+  margin-top: 10px;
+}
+
+.cube-stack-ack {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
