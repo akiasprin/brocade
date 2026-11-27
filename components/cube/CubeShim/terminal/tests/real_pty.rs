@@ -253,7 +253,11 @@ async fn same_shell_pid_variables_directory_resize_and_final_output_survive_deta
         .handle(req(Operation::Input {
             id: id(10),
             attachment: id(101),
-            data: b"/bin/sh -c 'printf \"__WAITING__\\n\"; exec sleep 30'\n".to_vec(),
+            // The child can run before the interactive shell transfers the PTY foreground
+            // process group. Wait for that handoff so the following ETX reaches this job.
+            data: br#"/bin/sh -c 'while :; do read -r _ _ _ _ pgrp _ _ tpgid _ < /proc/$$/stat; [ "$pgrp" = "$tpgid" ] && break; sleep 0.01; done; printf "__WAITING__\n"; exec sleep 30'
+"#
+            .to_vec(),
         }))
         .await;
     text_until(&manager, 101, "__WAITING__").await;
