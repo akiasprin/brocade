@@ -35,6 +35,7 @@ cvm_entry_publication_versions cvm_entry_tunnels cvm_entries
 cvm_image_manifests cvm_spec_artifact_sets cvm_spec_artifacts cvm_revision_nodes
 cvm_serving_nodes cvm_revision_instances cvm_revision_bindings
 cvm_instance_access_events cvm_guest_credentials
+cvm_stack_observations cvm_stack_releases cvm_stack_release_events
 """.split()
 )
 MAX_TABLES = 512

@@ -129,6 +129,25 @@ INSERT INTO cvm_guest_credentials VALUES ('experiment','sealed-fixture');
         self.assertEqual(result['cvm']['cvm_guest_credentials'][0], 0)
         self.assertEqual(before['fingerprints']['preserved'], cleanup.inventory(self.url)['fingerprints']['preserved'])
 
+    def test_stack_release_history_and_observations_are_cleared(self):
+        self.sql("""
+CREATE TABLE cvm_stack_observations(node_id text PRIMARY KEY, installed jsonb);
+CREATE TABLE cvm_stack_releases(id bigint PRIMARY KEY, node_id text NOT NULL, status text NOT NULL);
+CREATE TABLE cvm_stack_release_events(
+    id bigint PRIMARY KEY,
+    release_id bigint NOT NULL REFERENCES cvm_stack_releases(id) ON DELETE RESTRICT,
+    status text NOT NULL
+);
+INSERT INTO cvm_stack_observations VALUES ('node','{}');
+INSERT INTO cvm_stack_releases VALUES (1,'node','succeeded');
+INSERT INTO cvm_stack_release_events VALUES (1,1,'succeeded');
+""")
+        before = cleanup.inventory(self.url)
+        result = cleanup.apply(self.url, before)
+        for table in ('cvm_stack_observations', 'cvm_stack_releases', 'cvm_stack_release_events'):
+            self.assertEqual(result['cvm'][table][0], 0)
+        self.assertEqual(before['fingerprints']['preserved'], cleanup.inventory(self.url)['fingerprints']['preserved'])
+
     def test_changed_inventory_is_refused_without_deleting_anything(self):
         before = cleanup.inventory(self.url)
         self.sql("INSERT INTO cvm_instances VALUES ('new-work','owner');")
