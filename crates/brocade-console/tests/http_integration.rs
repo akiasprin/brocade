@@ -40,6 +40,61 @@ use tower::ServiceExt;
 const ADMIN_PASSWORD: &str = "correct horse battery staple";
 const BOOTSTRAP_TOKEN: &str = "bootstrap-test-token-with-at-least-32-bytes";
 
+#[cfg(feature = "cvm")]
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_stack_uses_existing_v1_routes_without_changing_ordinary_cvm() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let node = db.store.issue_node_token("n1").await.unwrap().token;
+    let app = merged_router(
+        db.store.clone(),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        "https://console.example".into(),
+    );
+    let agent = |req: axum::http::request::Builder| {
+        req.header("authorization", format!("Bearer {node}"))
+            .header(
+                "x-brocade-protocol-version",
+                brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
+            )
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            agent(Request::post("/agent/v1/cvm/stack-releases/poll"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"installable":"plain"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await, Value::Null);
+    let observed: String =
+        sqlx::query_scalar("SELECT installable FROM cvm_stack_observations WHERE node_id='n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(observed, "plain");
+    let ordinary = app
+        .clone()
+        .oneshot(
+            agent(Request::get("/agent/v1/cvm/desired"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), StatusCode::OK);
+    let admin = admin_token(&db).await;
+    let gone = post_json(&app, &admin, "/cvm/stack-releases/1/approve", json!({})).await;
+    assert_eq!(gone.0, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn traffic_json_negotiates_compression_and_vpngate_validators_require_fresh_auth() {

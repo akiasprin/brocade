@@ -57,6 +57,10 @@ pub(crate) fn fenced() -> Result<bool, String> {
     }
 }
 
+pub(super) fn awaiting_claim() -> Result<bool, String> {
+    Ok(Job::read()?.is_some_and(|job| matches!(job.phase, Phase::Claiming)))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Phase {
@@ -193,10 +197,10 @@ fn verified(offer: &StackOffer, key: [u8; 32]) -> Result<StackPair, String> {
         .artifact
         .checked(|payload, signature| key.verify(payload, signature).is_ok())?;
     if offer.id <= 0
-        || offer.expires_at > pair.expires_at
+        || offer.start_deadline_at == 0
         || pair.architecture != crate::identity::self_arch()
     {
-        return Err("Cube stack offer does not match the node or signed window".into());
+        return Err("Cube stack offer does not match the node or has no start deadline".into());
     }
     Ok(pair)
 }
@@ -465,7 +469,12 @@ fn download(options: &Options, pair: &StackPair) -> Result<(), String> {
         .map_err(|_| "cannot sync Cube stack archive".into())
 }
 
-fn stage(options: &Options, pair: &StackPair, observed: &Observation) -> Result<String, String> {
+fn stage(
+    options: &Options,
+    pair: &StackPair,
+    observed: &Observation,
+    start_deadline_at: u64,
+) -> Result<String, String> {
     if !observed.matches_source(pair) {
         return Err("Cube host no longer matches the signed starting state".into());
     }
@@ -473,6 +482,9 @@ fn stage(options: &Options, pair: &StackPair, observed: &Observation) -> Result<
     let before = source_roots(pair)?;
     let result = (|| {
         download(options, pair)?;
+        if timestamp()? >= start_deadline_at {
+            return Err("Cube stack maintenance start deadline passed during download".into());
+        }
         let source = pair.source();
         let command = if source.is_some() {
             "stack-stage"
@@ -574,7 +586,7 @@ fn advance(options: &Options, mut job: Job, key: [u8; 32]) -> Result<(), String>
                 offer.id == job.offer.id
                     && matches!(
                         offer.status,
-                        StackReleaseStatus::Approved | StackReleaseStatus::Applying
+                        StackReleaseStatus::Ready | StackReleaseStatus::Applying
                     )
             }) {
                 // Poll is authoritative for a claim reply lost before the agent restarted.
@@ -589,6 +601,7 @@ fn advance(options: &Options, mut job: Job, key: [u8; 32]) -> Result<(), String>
             )?;
             if confirmed.id != job.offer.id
                 || confirmed.artifact != job.offer.artifact
+                || confirmed.start_deadline_at != job.offer.start_deadline_at
                 || confirmed.roots_sha256.as_deref() != Some(job.roots_sha256.as_str())
                 || confirmed.status != StackReleaseStatus::Applying
             {
@@ -610,7 +623,9 @@ fn advance(options: &Options, mut job: Job, key: [u8; 32]) -> Result<(), String>
                         ..report.clone()
                     }
                 }
-                StackReleaseStatus::Recovered | StackReleaseStatus::Failed
+                StackReleaseStatus::Recovered
+                | StackReleaseStatus::Failed
+                | StackReleaseStatus::Cancelled
                     if !observed.matches_source(&pair) =>
                 {
                     StackReport {
@@ -660,12 +675,12 @@ fn round(options: &Options) -> Result<(), String> {
         return Ok(());
     };
     let pair = verified(&offer, key)?;
-    if timestamp()? >= offer.expires_at {
+    if timestamp()? >= offer.start_deadline_at {
         return Ok(());
     }
     match offer.status {
         StackReleaseStatus::Preparing => {
-            let staged = stage(options, &pair, &observed);
+            let staged = stage(options, &pair, &observed, offer.start_deadline_at);
             let (status, roots_sha256, error) = match staged {
                 Ok(roots) => (StackReleaseStatus::Ready, Some(roots), None),
                 Err(error) => {
@@ -689,14 +704,24 @@ fn round(options: &Options) -> Result<(), String> {
             )?;
             Ok(())
         }
-        StackReleaseStatus::Approved => {
+        StackReleaseStatus::Ready => {
             let roots = offer
                 .roots_sha256
                 .as_deref()
                 .filter(|digest| valid_digest(digest))
-                .ok_or("Cube stack approval lacks cold root evidence")?;
-            if !observed.matches_source(&pair) || source_roots(&pair)? != roots {
-                return Err("approved Cube stack starting state has changed".into());
+                .ok_or("Cube stack readiness lacks cold root evidence")?;
+            if !observed.matches_source(&pair) || source_roots(&pair).as_deref() != Ok(roots) {
+                poll(
+                    options,
+                    Observation::read()?,
+                    Some(StackReport {
+                        id: offer.id,
+                        status: StackReleaseStatus::Failed,
+                        roots_sha256: Some(roots.into()),
+                        error: None,
+                    }),
+                )?;
+                return Ok(());
             }
             let job = Job {
                 roots_sha256: roots.to_owned(),
@@ -764,10 +789,10 @@ fn execute_first_install(mut job: Job, pair: &StackPair, resume: bool) -> Result
         Some("stack-install-resume")
     } else {
         match job.phase {
-            Phase::Claimed if timestamp()? >= job.offer.expires_at => {
+            Phase::Claimed if timestamp()? >= job.offer.start_deadline_at => {
                 return if source_roots(pair).as_deref() == Ok(job.roots_sha256.as_str()) {
                     job.finish(
-                        StackReleaseStatus::Failed,
+                        StackReleaseStatus::Cancelled,
                         Some("首装窗口已结束，宿主仍为空"),
                     )
                 } else {
@@ -851,10 +876,10 @@ pub(crate) fn execute(args: &[String]) -> Result<(), String> {
         return Err("the original Cube stack and roots still cannot be verified".into());
     }
     if let Phase::Claimed = job.phase {
-        if timestamp()? >= job.offer.expires_at {
+        if timestamp()? >= job.offer.start_deadline_at {
             return if verifying(&source, &job.roots_sha256) {
                 job.finish(
-                    StackReleaseStatus::Recovered,
+                    StackReleaseStatus::Cancelled,
                     Some("窗口已结束，未切换，已核验原栈"),
                 )
             } else {

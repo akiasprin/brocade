@@ -4,7 +4,7 @@ use super::valid_digest;
 use serde::{Deserialize, Serialize};
 
 pub const MAX_STACK_BUNDLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-pub const MAX_STACK_WINDOW_SECS: u64 = 24 * 60 * 60;
+pub const STACK_MAINTENANCE_WINDOW_SECS: u64 = 5 * 60 * 60;
 pub const STACK_OBSERVATION_MAX_AGE_SECS: u64 = 150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +45,6 @@ pub struct StackPair {
     pub source_shim_sha256: Option<String>,
     pub target_cubelet_sha256: String,
     pub target_shim_sha256: String,
-    pub expires_at: u64,
 }
 
 impl StackPair {
@@ -64,7 +63,6 @@ impl StackPair {
         if !valid_source
             || self.architecture != "x86_64"
             || !(1..=MAX_STACK_BUNDLE_BYTES).contains(&self.target_bytes)
-            || self.expires_at == 0
             || !self.target().valid()
         {
             return Err("invalid Cube stack compatibility manifest");
@@ -159,7 +157,6 @@ impl StackInstalled {
 pub enum StackReleaseStatus {
     Preparing,
     Ready,
-    Approved,
     Applying,
     Succeeded,
     Failed,
@@ -172,10 +169,11 @@ pub enum StackReleaseStatus {
 pub struct StackRelease {
     pub id: i64,
     pub node_id: String,
+    pub pair_id: String,
     pub source_sha256: Option<String>,
     pub target_sha256: String,
     pub status: StackReleaseStatus,
-    pub expires_at: u64,
+    pub start_deadline_at: u64,
     pub error: Option<String>,
     pub roots_sha256: Option<String>,
 }
@@ -183,7 +181,7 @@ pub struct StackRelease {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StackOffer {
     pub id: i64,
-    pub expires_at: u64,
+    pub start_deadline_at: u64,
     pub status: StackReleaseStatus,
     pub roots_sha256: Option<String>,
     pub artifact: SignedStackPair,
@@ -227,7 +225,6 @@ mod tests {
             source_shim_sha256: None,
             target_cubelet_sha256: "b".repeat(64),
             target_shim_sha256: "c".repeat(64),
-            expires_at: 1,
         };
         assert!(target.is_install());
         assert!(target.validate().is_ok());
@@ -240,6 +237,23 @@ mod tests {
         inconsistent.source_sha256 = Some("e".repeat(64));
         inconsistent.source_cubelet_sha256 = Some("f".repeat(64));
         assert!(inconsistent.validate().is_ok());
+    }
+
+    #[test]
+    fn stack_offer_on_v1_routes_requires_a_start_deadline() {
+        let mut offer = serde_json::json!({
+            "id": 1, "status": "ready", "roots_sha256": null,
+            "artifact": { "payload": "{}", "signature": "00" },
+            "expires_at": 3600,
+        });
+        assert!(serde_json::from_value::<StackOffer>(offer.clone()).is_err());
+        offer["start_deadline_at"] = offer.as_object_mut().unwrap().remove("expires_at").unwrap();
+        assert_eq!(
+            serde_json::from_value::<StackOffer>(offer)
+                .unwrap()
+                .start_deadline_at,
+            3600
+        );
     }
 
     #[test]

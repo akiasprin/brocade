@@ -105,6 +105,10 @@ pub(super) fn maintenance() -> Result<bool, String> {
     if stack::fenced()? {
         return Ok(true);
     }
+    virtualization_pending()
+}
+
+fn virtualization_pending() -> Result<bool, String> {
     maintenance_at(std::path::Path::new("/opt/brocade/cvm/host.json"))
 }
 

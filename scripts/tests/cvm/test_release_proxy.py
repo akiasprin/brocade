@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 from release_kvm_lab import Lab, free_port
 from release_proxy import MAX_BODY, STACK_POLL
-from release_stack_acceptance import cvm_stack, empty_observation, make_catalog, openssl, sign_pair
+from release_stack_acceptance import StackAcceptance, cvm_stack, empty_observation, make_catalog, openssl, sign_pair
 
 
 class LabRouteValidationTests(unittest.TestCase):
@@ -217,6 +217,25 @@ class StackFaultTests(unittest.TestCase):
             self.assertEqual(self.request('GET', self.route, auth=False), (200, self.bundle))
             self.assertEqual(self.request('GET', '/agent/v1/cvm/stack-bundles/' + 'a' * 64), (200, self.bundle))
 
+    def test_holds_real_claim_only_on_the_configured_node_and_route(self):
+        self.configure(hold_stack_claim=['compute-a'])
+        route = '/agent/v1/cvm/stack-releases/17/claim'
+        roots = 'd' * 64
+        claim = json.dumps({'roots_sha256': roots}).encode()
+        wrong_route = route + '/extra'
+        invalid_claim = b'{"roots_sha256":"invalid"}'
+        self.assertEqual(self.request('POST', route, claim, auth=False)[0], 200)
+        self.assertEqual(self.request('POST', wrong_route, claim)[0], 200)
+        self.assertEqual(self.request('POST', STACK_POLL, claim)[0], 200)
+        self.assertEqual(self.request('POST', route, invalid_claim)[0], 200)
+        self.assertEqual(self.request('POST', route, claim)[0], 503)
+        self.assertEqual(self.received, [claim, claim, claim, invalid_claim])
+        evidence = json.loads((self.root / 'compute-a-stack-claim.summary.json').read_text())
+        self.assertEqual(evidence, {'id': 17, 'path': route, 'roots_sha256': roots})
+        self.configure()
+        self.assertEqual(self.request('POST', route, claim)[0], 200)
+        self.assertEqual(self.received, [claim, claim, claim, invalid_claim, claim])
+
     def test_holds_only_matching_terminal_receipt_then_forwards_original_request(self):
         self.configure(hold_stack_report={'node': 'compute-a', 'id': 17, 'status': 'succeeded'})
         report = b'{"report":{"id":17,"status":"succeeded","roots_sha256":"proof"}}'
@@ -234,11 +253,41 @@ class StackFaultTests(unittest.TestCase):
         self.assertEqual(self.received, [other, report])
 
 
+class StackReleaseTests(unittest.TestCase):
+    def test_create_uses_pair_and_node_and_checks_five_hour_deadline_in_seconds(self):
+        harness = object.__new__(StackAcceptance)
+        pair = {'id': 'a' * 64, 'source_sha256': None, 'target_sha256': 'b' * 64}
+        now = 1795766400
+        entry = {
+            'id': 17,
+            'status': 'preparing',
+            'node_id': 'compute-a',
+            'source_sha256': pair['source_sha256'],
+            'target_sha256': pair['target_sha256'],
+            'start_deadline_at': now + 18000,
+        }
+        clock = SimpleNamespace(stdout=str(now).encode())
+        with (
+            patch.object(harness, 'remote', return_value=clock),
+            patch.object(harness, 'acceptance', create=True) as acceptance,
+        ):
+            acceptance.call.return_value = entry
+            self.assertEqual(harness.create_release(pair), entry)
+            acceptance.call.assert_called_once_with(
+                'POST', '/cvm/stack-releases', {'node_id': 'compute-a', 'pair_id': pair['id']}, expected=(200, 201, 202)
+            )
+            for deadline in (None, now + 14400, now + 21600, (now + 18000) * 1000):
+                with self.subTest(deadline=deadline):
+                    acceptance.call.return_value = {**entry, 'start_deadline_at': deadline}
+                    with self.assertRaisesRegex(RuntimeError, 'five-hour server-assigned start deadline'):
+                        harness.create_release(pair)
+
+
 class StackSignatureTests(unittest.TestCase):
     def test_catalog_signs_source_free_install_for_bundle_a_with_the_same_key(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            args = SimpleNamespace(output=root / 'catalog', valid_hours=24)
+            args = SimpleNamespace(output=root / 'catalog')
             manifests = []
             for role, marker in (('source', 'a'), ('target', 'b')):
                 archive = root / role
@@ -260,6 +309,7 @@ class StackSignatureTests(unittest.TestCase):
             with patch.object(cvm_stack, 'inspect_archive', side_effect=manifests):
                 make_catalog(args)
             catalog = json.loads((args.output / 'lab-catalog.json').read_text())
+            self.assertEqual(set(catalog), {'public', 'source', 'target', 'pairs'})
             self.assertEqual(set(catalog['pairs']), {'forward', 'reverse', 'first-install'})
             public = root / 'public.der'
             public.write_bytes(bytes.fromhex('302a300506032b6570032100' + catalog['public']))
@@ -284,28 +334,27 @@ class StackSignatureTests(unittest.TestCase):
                     str(signature),
                 )
                 payload = json.loads(wire.read_bytes())
-                if label == 'first-install':
-                    self.assertEqual(
-                        payload,
-                        {
-                            'contract': 'brocade-cvm-stack-fresh-install-v1',
-                            'architecture': 'x86_64',
-                            'storage_backend': 'plain',
-                            'target_sha256': args.source_sha256,
-                            'target_bytes': 1,
-                            'target_cubelet_sha256': 'a' * 64,
-                            'target_shim_sha256': 'a' * 64,
-                            'expires_at': catalog['expires_at'],
-                        },
+                target, target_marker = (args.target_sha256, 'b') if label == 'forward' else (args.source_sha256, 'a')
+                expected = {
+                    'contract': 'brocade-cvm-stack-fresh-install-v1',
+                    'architecture': 'x86_64',
+                    'storage_backend': 'plain',
+                    'target_sha256': target,
+                    'target_bytes': 1,
+                    'target_cubelet_sha256': target_marker * 64,
+                    'target_shim_sha256': target_marker * 64,
+                }
+                if label != 'first-install':
+                    source, source_marker = (
+                        (args.source_sha256, 'a') if label == 'forward' else (args.target_sha256, 'b')
                     )
-                else:
-                    source, target = (
-                        (args.source_sha256, args.target_sha256)
-                        if label == 'forward'
-                        else (args.target_sha256, args.source_sha256)
+                    expected.update(
+                        contract='brocade-cvm-stack-cold-pair-v1',
+                        source_sha256=source,
+                        source_cubelet_sha256=source_marker * 64,
+                        source_shim_sha256=source_marker * 64,
                     )
-                    self.assertEqual(payload['contract'], 'brocade-cvm-stack-cold-pair-v1')
-                    self.assertEqual((payload['source_sha256'], payload['target_sha256']), (source, target))
+                self.assertEqual(payload, expected)
 
     def test_empty_receipt_requires_flat_positive_observation_from_owned_compute(self):
         receipt = {'node_id': 'compute-a', 'observed_at': 42, 'installable': 'plain'}

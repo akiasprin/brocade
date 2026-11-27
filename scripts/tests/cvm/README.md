@@ -74,13 +74,15 @@ python3 "$CVM/release_stack_acceptance.py" run --lab-output "$RUN" --late-receip
 
 `prepare` 保留原 ext4 backing image 和 Agent 执行记录，仅在本轮计算 VM 内将旧实验 Agent 转换为可重启的 `brocade-agent.service`，启用持久存储挂载，配置 Console 与 Agent 的本轮签名信任。已有实验可选择同一个 compute 上已登记的运行 Guest 与停机 Guest，省略 `--seed-missing`；计算 VM 不得有其他实例。未准备现有停机 Guest 时，脚本只在已确认归属的实验中创建并停机。运行前不要让其他脚本并发修改该实验，且两 VM 时钟须与当前维护窗口一致。
 
-完整顺序为 `bad-hash`、`bad-size`、`cancel`、`activation-failure`、`manager-death`、`success`、`rollback`，可用重复的 `--case` 显式选取子集；哈希／长度故障先于任何合法暂存目标，回滚先有真实目标成功。默认检查独立 provider/client 私有 LAN；若已部署现有发行网络探针和 TCP 业务网卡，可额外指定 `--provider-echo` 验证真实跨宿主业务 TCP。`--late-receipt` 只拒绝目标节点和发布单的最终 Stack HTTP 回执，直到真实 Agent 重启后重报；不声称测试全控制面断网。
+完整顺序为 `bad-hash`、`bad-size`、`cancel`、`activation-failure`、`manager-death`、`success`、`rollback`。可用重复的 `--case` 显式选取子集。哈希和长度故障须先于任何合法目标暂存，回滚须先有真实目标成功。默认检查独立 provider/client 私有 LAN。若已部署现有发行网络探针和 TCP 业务网卡，可额外指定 `--provider-echo` 验证真实跨宿主业务 TCP。
+
+夹具只提交宿主与清单 ID，核验服务器以 Unix 秒返回创建后五小时的开始截止时间。代理在认领前暂时拒绝来自实验计算节点的真实 Stack HTTP 认领请求，使用其根摘要核对 `ready` 预检证据和独立宿主观测。`cancel` 在认领送达 Console 前取消，并核验 Cubelet 进程和原盘。其他用例布置好对应故障后放行自动认领。`success` 在拦截真实终态回执时核验 `applying` 的取消请求返回冲突。加上 `--late-receipt` 会保持该拦截直到实际重启 Agent 并核验本地回执仍在，再放行重报。其他 HTTP 请求和控制面通道继续可用。
 
 保留 `$RUN/stack-acceptance/state.json` 和隔离日志。出错不删除实例、盘、虚拟机和待恢复记录，也不补造回执。全部完成或人工收集失败现场后，可用 `python3 "$CVM/release_kvm_lab.py" stop --output "$RUN/lab-3"` 停止本轮拥有的外层 VM。此基线不代表 XFS、PVM 或其他架构已验收。
 
 ### Cube Stack B 空机首装
 
-在另一套独占的 KVM 实验与空数据库中，只为计算 VM 接入 CVM Agent，保留准备好的 ext4 `plain` 存储。`catalog` 也会生成签向真实源包 `A` 的独立首装清单。复用它时确认清单未过期；`FRESH_RUN` 使用新的绝对路径。
+在另一套独占的 KVM 实验与空数据库中，只为计算 VM 接入 CVM Agent，保留准备好的 ext4 `plain` 存储。`catalog` 也会生成签向真实源包 `A` 的独立首装清单，供两套实验复用。清单沿用 v1 标签，载荷使用当前签名字段。`FRESH_RUN` 使用新的绝对路径。
 
 ```sh
 install -d -m 0700 "$FRESH_RUN"
@@ -94,7 +96,7 @@ python3 "$CVM/release_stack_acceptance.py" first-install \
   --lab-output "$FRESH_RUN" --catalog "$RUN/catalog"
 ```
 
-脚本核验 Agent 自行部署安装器并上报正向空机证据。篡改下载归档后，确认预检失败、存储身份与 Agent 进程均保持原样。合法归档须再走预检和人工审批接口，核验目标组件、持久安装回执、空盘摘要和首个真实 KVM Guest。证据保存在 `$FRESH_RUN/stack-acceptance/first-install.json`，失败时保留本轮环境。使用 `release_kvm_lab.py stop --output "$FRESH_RUN/lab-3"` 停止本轮实验。
+脚本核验 Agent 自行部署安装器并上报正向空机证据。篡改下载归档后，确认预检失败，存储身份与 Agent 进程保持原样。使用合法归档时，脚本先拦截真实认领请求，核验预检给出的空盘摘要和宿主状态，再放行自动安装。最后核验目标组件、持久安装回执和首个真实 KVM Guest。证据保存在 `$FRESH_RUN/stack-acceptance/first-install.json`，失败时保留本轮环境。使用 `release_kvm_lab.py stop --output "$FRESH_RUN/lab-3"` 停止本轮实验。
 
 `release_chain_acceptance.py` 在发行路径实验状态上逐阶段执行：`prepare` 校验并上传 `chain_probe.go`
 构建的独立端点；执行 `chain_icmp` 时，另将同源 `attachment_probe.go` 产物作为 `prepare` 的第二个文件参数，

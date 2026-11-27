@@ -2,7 +2,6 @@ use super::*;
 use brocade_deployment::cvm::stack::*;
 use brocade_store::cvm::stack::VerifiedStackPair;
 use ring::signature::KeyPair;
-use std::time::SystemTime;
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
@@ -37,7 +36,6 @@ async fn cvm_stack_claim_fences_power_and_replays_after_expiry() {
         .cvm_record_report("n1", evidence(&current))
         .await
         .unwrap();
-    let deadline = deadline();
     let pair = StackPair {
         contract: "brocade-cvm-stack-cold-pair-v1".into(),
         architecture: "x86_64".into(),
@@ -49,7 +47,6 @@ async fn cvm_stack_claim_fences_power_and_replays_after_expiry() {
         source_shim_sha256: Some("d".repeat(64)),
         target_cubelet_sha256: "e".repeat(64),
         target_shim_sha256: "f".repeat(64),
-        expires_at: deadline,
     };
     let verified = || sign(&pair);
     let source = pair.source();
@@ -66,7 +63,7 @@ async fn cvm_stack_claim_fences_power_and_replays_after_expiry() {
         .unwrap();
     assert!(matches!(
         db.store
-            .create_cvm_stack_release(&admin, "n1", verified(), deadline)
+            .create_cvm_stack_release(&admin, "n1", verified())
             .await,
         Err(StoreError::Conflict(_))
     ));
@@ -98,7 +95,7 @@ async fn cvm_stack_claim_fences_power_and_replays_after_expiry() {
     );
     assert!(matches!(
         db.store
-            .create_cvm_stack_release(&scoped, "n1", verified(), deadline)
+            .create_cvm_stack_release(&scoped, "n1", verified())
             .await,
         Err(StoreError::Forbidden(_))
     ));
@@ -106,9 +103,18 @@ async fn cvm_stack_claim_fences_power_and_replays_after_expiry() {
     assert!(overview.0.is_empty() && overview.1.is_empty());
     let release = db
         .store
-        .create_cvm_stack_release(&admin, "n1", verified(), deadline)
+        .create_cvm_stack_release(&admin, "n1", verified())
         .await
         .unwrap();
+    let deadline_from_creation: i64 = sqlx::query_scalar(
+        "SELECT start_deadline_at-floor(extract(epoch FROM created_at))::bigint
+         FROM cvm_stack_releases WHERE id=$1",
+    )
+    .bind(release.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(deadline_from_creation, 5 * 3600);
     let roots = "1".repeat(64);
     let report = |status, roots: &str| StackReport {
         id: release.id,
@@ -165,24 +171,23 @@ async fn cvm_stack_claim_fences_power_and_replays_after_expiry() {
         .await
         .is_err());
 
+    let claim = StackClaim {
+        roots_sha256: roots.clone(),
+    };
     sqlx::query("UPDATE node_agent_state SET xray_upgrade='{}' WHERE node_id='n1'")
         .execute(db.pool())
         .await
         .unwrap();
     assert!(matches!(
-        db.store.approve_cvm_stack_release(&admin, release.id).await,
+        db.store
+            .claim_cvm_stack_release("n1", release.id, claim.clone())
+            .await,
         Err(StoreError::Conflict(_))
     ));
     sqlx::query("UPDATE node_agent_state SET xray_upgrade=NULL WHERE node_id='n1'")
         .execute(db.pool())
         .await
         .unwrap();
-    let approved = db
-        .store
-        .approve_cvm_stack_release(&admin, release.id)
-        .await
-        .unwrap();
-    assert_eq!(approved.status, StackReleaseStatus::Approved);
     let start = CvmCommand {
         request_id: "stack-existing-start-01".into(),
         expected_generation: stopped.desired.generation,
@@ -194,9 +199,6 @@ async fn cvm_stack_claim_fences_power_and_replays_after_expiry() {
             .await,
         Err(StoreError::Conflict(_))
     ));
-    let claim = StackClaim {
-        roots_sha256: roots.clone(),
-    };
     assert!(db
         .store
         .claim_cvm_stack_release("n2", release.id, claim.clone())
@@ -208,7 +210,7 @@ async fn cvm_stack_claim_fences_power_and_replays_after_expiry() {
         .await
         .unwrap();
     assert_eq!(applying.status, StackReleaseStatus::Applying);
-    sqlx::query("UPDATE cvm_stack_releases SET expires_at=1 WHERE id=$1")
+    sqlx::query("UPDATE cvm_stack_releases SET start_deadline_at=1 WHERE id=$1")
         .bind(release.id)
         .execute(db.pool())
         .await
@@ -291,21 +293,14 @@ async fn cvm_stack_claim_fences_power_and_replays_after_expiry() {
     .unwrap();
     assert_eq!(
         audit,
-        [
-            "preparing",
-            "ready",
-            "approved",
-            "applying",
-            "blocked",
-            "recovered"
-        ]
+        ["preparing", "ready", "applying", "blocked", "recovered"]
     );
     let expiring = db
         .store
-        .create_cvm_stack_release(&admin, "n1", verified(), deadline)
+        .create_cvm_stack_release(&admin, "n1", verified())
         .await
         .unwrap();
-    sqlx::query("UPDATE cvm_stack_releases SET expires_at=1 WHERE id=$1")
+    sqlx::query("UPDATE cvm_stack_releases SET start_deadline_at=1 WHERE id=$1")
         .bind(expiring.id)
         .execute(db.pool())
         .await
@@ -337,10 +332,7 @@ async fn cvm_stack_first_install_requires_fresh_evidence_and_recovers_only_to_ta
     let storage = Some(pair.storage_backend);
     let roots = pair.storage_backend.empty_roots_sha256();
     let wrong_roots = StackStorage::Xfs.empty_roots_sha256();
-    let create = || {
-        db.store
-            .create_cvm_stack_release(&admin, "n1", sign(&pair), pair.expires_at)
-    };
+    let create = || db.store.create_cvm_stack_release(&admin, "n1", sign(&pair));
     let poll = |installed, installable, report| {
         db.store.poll_cvm_stack_release(
             "n1",
@@ -414,10 +406,6 @@ async fn cvm_stack_first_install_requires_fresh_evidence_and_recovers_only_to_ta
     .unwrap()
     .unwrap();
     assert_eq!(offer.status, StackReleaseStatus::Ready);
-    db.store
-        .approve_cvm_stack_release(&admin, release.id)
-        .await
-        .unwrap();
     let claim = || {
         db.store.claim_cvm_stack_release(
             "n1",
@@ -529,24 +517,10 @@ async fn cvm_stack_first_install_rechecks_baremetal_assignments() {
             },
         )
     };
-    let create = || {
-        db.store
-            .create_cvm_stack_release(&admin, "n1", sign(&pair), pair.expires_at)
-    };
+    let create = || db.store.create_cvm_stack_release(&admin, "n1", sign(&pair));
     poll(None).await.unwrap();
     let release = create().await.unwrap();
     let roots = pair.storage_backend.empty_roots_sha256();
-    let offer = poll(Some(StackReport {
-        id: release.id,
-        status: StackReleaseStatus::Ready,
-        roots_sha256: Some(roots),
-        error: None,
-    }))
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(offer.status, StackReleaseStatus::Ready);
-
     let capabilities = baremetal_tests::native_catalogue();
     let identity = capabilities
         .host_system
@@ -582,29 +556,146 @@ async fn cvm_stack_first_install_rechecks_baremetal_assignments() {
         .await
         .unwrap();
     assert!(!instance.desired.spec.execution.is_cube());
+    assert!(poll(Some(StackReport {
+        id: release.id,
+        status: StackReleaseStatus::Ready,
+        roots_sha256: Some(roots),
+        error: None,
+    }))
+    .await
+    .unwrap()
+    .is_none());
+    let history = db.store.cvm_stack_history(&admin).await.unwrap();
+    assert_eq!(history[0].status, StackReleaseStatus::Failed);
+    assert!(matches!(create().await, Err(StoreError::Conflict(_))));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_stack_cancel_and_claim_are_exclusive_and_only_proven_unstarted_work_expires() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    settle_agent(&db).await;
+    let admin = system_admin();
+    let pair = install_pair();
+    let roots = pair.storage_backend.empty_roots_sha256();
+    let poll = |report| {
+        db.store.poll_cvm_stack_release(
+            "n1",
+            StackPoll {
+                installed: None,
+                installable: Some(pair.storage_backend),
+                report,
+            },
+        )
+    };
+    let create = || db.store.create_cvm_stack_release(&admin, "n1", sign(&pair));
+    let claim = |id| {
+        db.store.claim_cvm_stack_release(
+            "n1",
+            id,
+            StackClaim {
+                roots_sha256: roots.clone(),
+            },
+        )
+    };
+    let receipt = |id, status| {
+        Some(StackReport {
+            id,
+            status,
+            roots_sha256: Some(roots.clone()),
+            error: None,
+        })
+    };
+    poll(None).await.unwrap();
+    let race = create().await.unwrap();
+    assert_eq!(
+        poll(receipt(race.id, StackReleaseStatus::Ready))
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        StackReleaseStatus::Ready
+    );
+    let (cancelled, claimed) = tokio::join!(
+        db.store.cancel_cvm_stack_release(&admin, race.id),
+        claim(race.id)
+    );
+    match (cancelled, claimed) {
+        (Ok(record), Err(StoreError::Conflict(_))) => {
+            assert_eq!(record.status, StackReleaseStatus::Cancelled)
+        }
+        (Err(StoreError::Conflict(_)), Ok(offer)) => {
+            assert_eq!(offer.status, StackReleaseStatus::Applying);
+            assert_eq!(
+                poll(receipt(race.id, StackReleaseStatus::Cancelled))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                StackReleaseStatus::Applying
+            );
+            sqlx::query("UPDATE cvm_stack_releases SET start_deadline_at=floor(extract(epoch FROM clock_timestamp()))::bigint WHERE id=$1")
+                .bind(race.id).execute(db.pool()).await.unwrap();
+            assert_eq!(
+                poll(None).await.unwrap().unwrap().status,
+                StackReleaseStatus::Applying
+            );
+            assert!(poll(receipt(race.id, StackReleaseStatus::Cancelled))
+                .await
+                .unwrap()
+                .is_none());
+        }
+        outcome => panic!("expected exactly one successful lease mutation: {outcome:?}"),
+    }
+    assert_eq!(
+        db.store.cvm_stack_history(&admin).await.unwrap()[0].status,
+        StackReleaseStatus::Cancelled
+    );
+    let expiring = create().await.unwrap();
+    assert_eq!(
+        poll(receipt(expiring.id, StackReleaseStatus::Ready))
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        StackReleaseStatus::Ready
+    );
+    sqlx::query("UPDATE cvm_stack_releases SET start_deadline_at=floor(extract(epoch FROM clock_timestamp()))::bigint WHERE id=$1")
+        .bind(expiring.id).execute(db.pool()).await.unwrap();
     assert!(matches!(
-        db.store.approve_cvm_stack_release(&admin, release.id).await,
+        claim(expiring.id).await,
         Err(StoreError::Conflict(_))
     ));
-    db.store
-        .cancel_cvm_stack_release(&admin, release.id)
+    assert!(poll(receipt(expiring.id, StackReleaseStatus::Succeeded))
         .await
-        .unwrap();
-    assert!(matches!(create().await, Err(StoreError::Conflict(_))));
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        db.store.cvm_stack_history(&admin).await.unwrap()[0].id,
+        expiring.id
+    );
+    let scoped = AdminContext::new(
+        "outside",
+        AdminRole::SystemAdmin,
+        Some("other-tenant".into()),
+    );
+    assert!(db
+        .store
+        .cvm_stack_history(&scoped)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(create().await.is_ok());
 }
 
 async fn settle_agent(db: &TestPg) {
     db.store.issue_node_token("n1").await.unwrap();
     sqlx::query("UPDATE node_agent_state SET last_poll_at=now(),runtime_reported_at=now(),agent_protocol_version=$1 WHERE node_id='n1'")
         .bind(brocade_deployment::protocol::AGENT_PROTOCOL_VERSION as i32).execute(db.pool()).await.unwrap();
-}
-
-fn deadline() -> u64 {
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 3600
 }
 
 fn install_pair() -> StackPair {
@@ -619,7 +710,6 @@ fn install_pair() -> StackPair {
         source_shim_sha256: None,
         target_cubelet_sha256: "e".repeat(64),
         target_shim_sha256: "f".repeat(64),
-        expires_at: deadline(),
     }
 }
 

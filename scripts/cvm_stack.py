@@ -35,6 +35,8 @@ import threading
 
 
 CONTRACT = 'brocade-cvm-stack-v2'
+FRESH_INSTALL_CONTRACT = 'brocade-cvm-stack-fresh-install-v1'
+STACK_BUNDLE_MAX_BYTES = 8 * 1024**3
 INSPECTION_ADDRESS = '127.0.0.1:18080'
 INSPECTION_URL = f'http://{INSPECTION_ADDRESS}/v1/network/taps'
 CUBELET_SOCKET = '/run/cubelet/cubelet.sock'
@@ -1792,22 +1794,22 @@ class Installation:
         phase = marker.get('phase')
         # Agent verifies the signature and publishes the root-owned claimed marker.
         # Bind Python's eventual mutations to the same signed intent and job.
+        expected = {
+            'contract': FRESH_INSTALL_CONTRACT,
+            'architecture': 'x86_64',
+            'target_sha256': target['bundle_sha256'],
+            'target_cubelet_sha256': target['cubelet_sha256'],
+            'target_shim_sha256': target['shim_sha256'],
+            'storage_backend': target['storage_backend'],
+        }
+        source_fields = ('source_sha256', 'source_cubelet_sha256', 'source_shim_sha256')
         if (
             not isinstance(signed, dict)
-            or signed.get('contract') != 'brocade-cvm-stack-fresh-install-v1'
-            or signed.get('architecture') != 'x86_64'
-            or any(
-                signed.get(key) is not None for key in ('source_sha256', 'source_cubelet_sha256', 'source_shim_sha256')
-            )
-            or any(
-                signed.get(key) != target[field]
-                for key, field in (
-                    ('target_sha256', 'bundle_sha256'),
-                    ('target_cubelet_sha256', 'cubelet_sha256'),
-                    ('target_shim_sha256', 'shim_sha256'),
-                    ('storage_backend', 'storage_backend'),
-                )
-            )
+            or signed.keys() - expected.keys() - {'target_bytes', *source_fields}
+            or any(signed.get(key) is not None for key in source_fields)
+            or any(signed.get(key) != value for key, value in expected.items())
+            or type(signed.get('target_bytes')) is not int
+            or not 1 <= signed['target_bytes'] <= STACK_BUNDLE_MAX_BYTES
             or type(offer.get('id')) is not int
             or offer['id'] <= 0
             or offer.get('status') != 'applying'

@@ -6,13 +6,12 @@ export const STACK_COLD_PAIR_CONTRACT = 'brocade-cvm-stack-cold-pair-v1';
 export const STACK_FRESH_INSTALL_CONTRACT = 'brocade-cvm-stack-fresh-install-v1';
 
 export type StackReleaseStatus =
-  'preparing' | 'ready' | 'approved' | 'applying' | 'succeeded' | 'failed' | 'recovered' | 'blocked' | 'cancelled';
+  'preparing' | 'ready' | 'applying' | 'succeeded' | 'failed' | 'recovered' | 'blocked' | 'cancelled';
 
 export type StackReleasePair = {
   id: string;
   target_sha256: string;
   storage_backend: StackStorageBackend;
-  expires_at: number;
 } & (
   | {
       contract: typeof STACK_COLD_PAIR_CONTRACT;
@@ -48,7 +47,7 @@ export interface StackRelease {
   source_sha256: string | null;
   target_sha256: string;
   status: StackReleaseStatus;
-  expires_at: number;
+  start_deadline_at: number;
   error?: string | null;
   roots_sha256?: string | null;
 }
@@ -62,13 +61,13 @@ export interface StackReleaseView {
 export interface CreateStackRelease {
   node_id: string;
   pair_id: string;
-  expires_at: number;
 }
 
 const path = '/cvm/stack-releases';
 
 export const fetchStackReleases = (signal?: AbortSignal) => api<StackReleaseView>(path, '', { signal });
+export const fetchStackReleaseHistory = (signal?: AbortSignal) =>
+  api<StackRelease[]>(`${path}/history`, '', { signal });
 export const createStackRelease = (request: CreateStackRelease) =>
   api<StackRelease>(path, '', { method: 'POST', body: JSON.stringify(request) });
-export const approveStackRelease = (id: number) => api<StackRelease>(`${path}/${id}/approve`, '', { method: 'POST' });
 export const cancelStackRelease = (id: number) => api<StackRelease>(`${path}/${id}/cancel`, '', { method: 'POST' });

@@ -103,8 +103,8 @@ async fn ensure_no_cvm_release(
     if stack_table {
         let stack_open: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM cvm_stack_releases WHERE ($1::text IS NULL OR node_id=$1)
-              AND (status IN ('applying','blocked') OR (status IN ('preparing','ready','approved')
-                AND expires_at > floor(extract(epoch FROM clock_timestamp())))))",
+              AND (status IN ('applying','blocked') OR (status IN ('preparing','ready')
+                AND start_deadline_at > floor(extract(epoch FROM clock_timestamp())))))",
         )
         .bind(node)
         .fetch_one(&mut **tx)

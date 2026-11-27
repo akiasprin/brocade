@@ -483,7 +483,7 @@ class FirstInstallTests(unittest.TestCase):
     def stage(self):
         self.install.stack_install_stage(self.archive, self.target)
 
-    def claim(self, *, id=21, phase='started'):
+    def claim(self, *, id=21, phase='started', **fields):
         payload = {
             'contract': 'brocade-cvm-stack-fresh-install-v1',
             'architecture': 'x86_64',
@@ -491,6 +491,8 @@ class FirstInstallTests(unittest.TestCase):
             'target_cubelet_sha256': self.target['cubelet_sha256'],
             'target_shim_sha256': self.target['shim_sha256'],
             'storage_backend': self.target['storage_backend'],
+            'target_bytes': self.archive.stat().st_size,
+            **fields,
         }
         stack.atomic_json(
             self.marker,
@@ -710,6 +712,11 @@ class FirstInstallTests(unittest.TestCase):
         self.stage()
         with self.assertRaisesRegex(stack.StackError, 'marker is required'):
             self.apply()
+        for fields in ({'expires_at': 3600}, {'target_bytes': True}, {'target_bytes': 0}):
+            with self.subTest(fields=fields):
+                self.claim(**fields)
+                with self.assertRaisesRegex(stack.StackError, 'authorized Agent job'):
+                    self.apply()
         self.claim()
         with self.assertRaisesRegex(stack.StackError, 'canonical empty roots'):
             self.install.stack_install_activate(self.target, '0' * 64)

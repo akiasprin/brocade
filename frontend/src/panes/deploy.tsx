@@ -75,6 +75,7 @@ import {
   type LoadingVariant,
 } from '../ui/bits';
 import { Icon, PanelTitle, type IconName } from '../ui/icons';
+import { WovenMark } from '../ui/branding';
 import { useNodeCountries, useNodeNames } from '../ui/node-name';
 import { observeClockText, observeDurationText } from '../ui/observe-range';
 import { randomKey } from '../ui/platform';
@@ -478,12 +479,12 @@ function FlowGroup({
 
 type DeployTab = 'config' | 'agent' | 'xray' | 'cube-stack';
 
-const DEPLOY_TABS: { key: DeployTab; label: string; icon: IconName }[] = [
-  { key: 'config', label: '配置', icon: 'config' },
-  { key: 'agent', label: 'Agent', icon: 'agent' },
+const DEPLOY_TABS: { key: DeployTab; label: string; icon: IconName | 'woven' }[] = [
+  { key: 'config', label: '配置', icon: 'settings' },
+  { key: 'agent', label: 'Agent', icon: 'woven' },
   { key: 'xray', label: 'Xray', icon: 'xray' },
 ];
-const CUBE_STACK_TAB = { key: 'cube-stack', label: 'Cube 运行栈', icon: 'host' } as const;
+const CUBE_STACK_TAB = { key: 'cube-stack', label: 'Cube', icon: 'artifacts' } as const;
 const CubeStackReleaseTab = CVM_ENABLED ? lazy(() => import('./cvm/stack-release')) : null;
 
 type TabBadge = { tone: 'run' | 'gold'; text: string } | null;
@@ -495,6 +496,7 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
   const tabs = showCubeStack ? [...DEPLOY_TABS, CUBE_STACK_TAB] : DEPLOY_TABS;
   const tab = selectedTab === 'cube-stack' && !showCubeStack ? 'config' : selectedTab;
   const [editing, setEditing] = useState<'agent' | 'xray' | null>(null);
+  const [cubeTitleHost, setCubeTitleHost] = useState<HTMLElement | null>(null);
   const tabIdBase = useId();
   useSyncExternalStore(draft.subscribe, draft.version);
 
@@ -659,7 +661,7 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
   return (
     <div className="nd-sheet nd-page cgc-page">
       <div className="fg-sheet nd-paper">
-        <header className="nd-page-head">
+        <header className="nd-page-head" ref={tab === 'cube-stack' ? setCubeTitleHost : undefined}>
           <div className="nd-page-identity">
             <span className="cg-plate">
               <Icon of="deploy" size={18} />
@@ -687,7 +689,11 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
                     onKeyDown={event => moveTab(event, item.key)}
                     onClick={() => selectTab(item.key)}
                   >
-                    <Icon of={item.icon} size={14} className="nd-tab-ic" />
+                    {item.icon === 'woven' ? (
+                      <WovenMark size={14} className="ui-icon nd-tab-ic" />
+                    ) : (
+                      <Icon of={item.icon} size={14} className="nd-tab-ic" />
+                    )}
                     {item.label}
                     {/* 金色数字是待处理数，主题色是正在自行升级的进度。零时不画。 */}
                     {badge && (
@@ -729,7 +735,7 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
                     </div>
                   }
                 >
-                  <CubeStackReleaseTab />
+                  <CubeStackReleaseTab titleHost={cubeTitleHost} fleet={fleet} />
                 </Suspense>
               )
             ) : (

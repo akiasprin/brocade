@@ -38,7 +38,8 @@ CUBELET_UNIT = 'brocade-cvm-cubelet.service'
 AGENT_UNIT = 'brocade-agent.service'
 AGENT_BIN = '/usr/local/bin/brocade-agent'
 MANAGER = '/usr/local/lib/brocade/cvm-stack.py'
-FIRST_INSTALL = 'brocade-cvm-stack-fresh-install-v1'
+COLD_PAIR = 'brocade-cvm-stack-cold-pair-v1'
+MAINTENANCE_WINDOW_SECONDS = 5 * 60 * 60
 DROPIN = '/etc/systemd/system/brocade-cvm-cubelet.service.d/99-brocade-stack-acceptance.conf'
 SCENARIOS = ('bad-hash', 'bad-size', 'cancel', 'activation-failure', 'manager-death', 'success', 'rollback')
 TERMINAL = {'failed', 'recovered', 'blocked', 'succeeded', 'cancelled'}
@@ -143,14 +144,13 @@ def step(name):
 
 
 def make_catalog(args):
-    require(1 <= args.valid_hours <= 168, 'catalogue validity must be 1 to 168 hours')
     pairs = {}
     manifests = []
     executables = []
     shims = []
     for path, sha in ((args.source, args.source_sha256), (args.target, args.target_sha256)):
         require(DIGEST.fullmatch(sha), 'each bundle needs an explicit lowercase SHA-256 pin')
-        require(0 < path.stat().st_size <= 8 * 1024**3, 'bundle outside the Stack B size limit')
+        require(0 < path.stat().st_size <= cvm_stack.STACK_BUNDLE_MAX_BYTES, 'bundle outside the Stack B size limit')
         # The production verifier checks every archive member without extracting/executing input code.
         manifest = cvm_stack.inspect_archive(path, sha)
         require(manifest['architecture'] == 'x86_64' and 'plain' in manifest['storage_backends'], 'not x86_64/plain')
@@ -166,7 +166,6 @@ def make_catalog(args):
     )
     out = args.output.resolve()
     out.mkdir(mode=0o700, exist_ok=False)
-    expires = int(time.time()) + args.valid_hours * 3600
     with tempfile.TemporaryDirectory(dir=out) as temporary:
         key = Path(temporary) / 'signing.key'
         openssl('genpkey', '-algorithm', 'ED25519', '-out', str(key))
@@ -179,11 +178,10 @@ def make_catalog(args):
             bundle.chmod(0o600)
             require(digest(bundle) == target['bundle_sha256'], 'bundle changed while copying')
             payload = {
-                'contract': 'brocade-cvm-stack-cold-pair-v1',
+                'contract': COLD_PAIR,
                 'architecture': 'x86_64',
                 'storage_backend': 'plain',
                 'target_bytes': bundle.stat().st_size,
-                'expires_at': expires,
                 **{
                     prefix + '_' + key: value[key]
                     for prefix, value in (('source', source), ('target', target))
@@ -196,10 +194,8 @@ def make_catalog(args):
             if label == 'reverse':
                 # First install targets the same verified A bytes, but authorizes no source.
                 fresh = {key: value for key, value in payload.items() if not key.startswith('source_')}
-                pairs['first-install'] = sign_pair(out, key, {**fresh, 'contract': FIRST_INSTALL})
-    atom_json(
-        out / 'lab-catalog.json', {'public': public, 'source': a, 'target': b, 'pairs': pairs, 'expires_at': expires}
-    )
+                pairs['first-install'] = sign_pair(out, key, {**fresh, 'contract': cvm_stack.FRESH_INSTALL_CONTRACT})
+    atom_json(out / 'lab-catalog.json', {'public': public, 'source': a, 'target': b, 'pairs': pairs})
 
 
 # All mutations occur in the verified compute VM. Preserve the existing ext4
@@ -267,10 +263,16 @@ put(owner,task+'\n',0o600)
 EMPTY_HOST_PROOF = r"""
 import json,os,stat,subprocess,sys
 from pathlib import Path
-prefix,base,state,storage,manager,agent,unit,initial=json.load(sys.stdin)
+prefix,base,state,storage,manager,agent,unit,initial,claim_id=json.load(sys.stdin)
 def run(*args):
  return subprocess.check_output(args,text=True,stderr=subprocess.DEVNULL,timeout=10).strip()
-absent=[Path(base)/name for name in ('current','installation.json','stack-maintenance','stack-install.json')]
+absent=[Path(base)/name for name in ('current','installation.json','stack-install.json')]
+marker=Path(base)/'stack-maintenance'
+if claim_id is None:
+ absent.append(marker)
+else:
+ job=json.loads(marker.read_text())
+ assert job['offer']['id']==claim_id and job['offer']['status']=='ready' and job['phase']=='claiming'
 absent += [Path(state),Path('/etc/brocade/cvm-cube.json'),Path('/etc/systemd/system/brocade-cvm-cubelet.service')]
 if initial:
  absent += [Path(manager),Path('/etc/brocade/cvm-stack-update.pub')]
@@ -432,13 +434,32 @@ class StackAcceptance:
 
         return self.wait('real Agent reports installed stack identity', lambda: match(self.view()))
 
+    def guest_host_inventory(self):
+        return next((h for h in self.acceptance.call('GET', '/cvm')['hosts'] if h['node_id'] == NODE), None)
+
     def guest_host_ready(self):
         # The maintenance receipt can arrive before the separate CVM inventory refresh.
         return self.wait(
             'fresh Cube host inventory before starting a Guest',
-            lambda: next((h for h in self.acceptance.call('GET', '/cvm')['hosts'] if h['node_id'] == NODE), None),
+            self.guest_host_inventory,
             lambda h: h and h['fresh'] and not h.get('error') and h['capabilities'].get('artifact_compiler'),
         )
+
+    def verify_inventory_while_claiming(self, release_id):
+        host = self.guest_host_inventory()
+        require(host and host['observed_at'], 'missing Cube inventory before claim')
+        # Force a real inventory round while the local mark fences ordinary CVM work.
+        updated = self.wait(
+            'new Cube inventory while the claim is held',
+            self.guest_host_inventory,
+            lambda observed: observed and observed['observed_at'] != host['observed_at'],
+            timeout=150,
+        )
+        require(
+            updated['fresh'] and not updated.get('error') and updated['capabilities'].get('backend') == 'cube-kvm-v1',
+            'pending claim replaced healthy Cube inventory with a maintenance error',
+        )
+        require(self.release(release_id)['status'] == 'ready', 'claim moved during the held inventory check')
 
     def owned_guests(self, active, idle, allow_missing=False):
         instances = self.acceptance.state['instances']
@@ -455,14 +476,14 @@ class StackAcceptance:
     def read_catalog(self, catalog_path):
         private_directory(catalog_path)
         catalog = json.loads((catalog_path / 'lab-catalog.json').read_text())
+        require(set(catalog) == {'public', 'source', 'target', 'pairs'}, 'unexpected fixture catalogue fields')
+        require(set(catalog['pairs']) == {'forward', 'reverse', 'first-install'}, 'unexpected fixture catalogue pairs')
         ids = [catalog['public'], *catalog['pairs'].values()]
         for label in ('source', 'target'):
             identity = catalog[label]
             ids.extend(identity[key] for key in ('bundle_sha256', 'cubelet_sha256', 'shim_sha256'))
             require(identity['storage_backend'] == 'plain', 'catalogue requires plain storage')
         require(all(DIGEST.fullmatch(i) for i in ids), 'invalid catalogue file identities')
-        clock = int(self.remote('date', '+%s').stdout)
-        require(catalog['expires_at'] > clock + 7200, 'catalogue expired or lab clock is not current')
         require(self.remote('uname', '-m').stdout.strip() == b'x86_64', 'stack acceptance requires x86_64')
         return catalog
 
@@ -506,6 +527,7 @@ class StackAcceptance:
         )
         overview = self.view()
         require({p['id'] for p in overview['pairs']} == set(pairs), 'Console did not verify the signed catalogue')
+        require(all('expires_at' not in p for p in overview['pairs']), 'Console advertised a catalogue expiration')
         return overview
 
     def prepare(self, catalog_path, active, idle, seed_missing):
@@ -545,9 +567,9 @@ class StackAcceptance:
         self.assert_idle()
         self.save()
 
-    def empty_host(self, *, initial=False):
+    def empty_host(self, *, initial=False, claim_id=None):
         return self.remote_json(
-            EMPTY_HOST_PROOF, [self.prefix, BASE, STATE, STORAGE, MANAGER, AGENT_BIN, AGENT_UNIT, initial]
+            EMPTY_HOST_PROOF, [self.prefix, BASE, STATE, STORAGE, MANAGER, AGENT_BIN, AGENT_UNIT, initial, claim_id]
         )
 
     def first_install(self, catalog_path, guest_name):
@@ -580,11 +602,10 @@ class StackAcceptance:
             (pair,) = overview['pairs']
             require(
                 pair['id'] == catalog['pairs']['first-install']
-                and pair['contract'] == FIRST_INSTALL
+                and pair['contract'] == cvm_stack.FRESH_INSTALL_CONTRACT
                 and pair['source_sha256'] is None
                 and pair['target_sha256'] == target['bundle_sha256']
-                and pair['storage_backend'] == 'plain'
-                and pair['expires_at'] == catalog['expires_at'],
+                and pair['storage_backend'] == 'plain',
                 'unexpected first-install pair overview',
             )
             evidence['empty_observation'] = self.wait(
@@ -592,23 +613,6 @@ class StackAcceptance:
             )
             self.require_input('cvm_stack.py', MANAGER)
             atom_json(evidence_path, evidence)
-
-        def create():
-            expiry = min(int(self.remote('date', '+%s').stdout) + 3600, pair['expires_at'])
-            entry = self.acceptance.call(
-                'POST', API, {'node_id': NODE, 'pair_id': pair['id'], 'expires_at': expiry}, expected=(200, 201, 202)
-            )
-            release_id = entry['id']
-            require(
-                type(release_id) is int
-                and release_id > 0
-                and entry['status'] == 'preparing'
-                and entry['node_id'] == NODE
-                and entry['source_sha256'] is None
-                and entry['target_sha256'] == pair['target_sha256'],
-                'unexpected created first-install release',
-            )
-            return release_id
 
         with step('reject corrupt first-install download without installing Cube'):
             self.ensure_owner()
@@ -619,14 +623,15 @@ class StackAcceptance:
             self.remote('test', '!', '-e', target_path)
             self.acceptance.gate(restart=False, stack_download={'node': NODE, 'sha256': sha, 'mode': 'hash'})
             try:
-                release_id = create()
+                entry = self.create_release(pair)
+                release_id = entry['id']
                 evidence['failed_release_id'] = release_id
                 atom_json(evidence_path, evidence)
                 terminal = self.wait_release(release_id, 'failed')
                 proof = self.read_remote_json(download_path)
                 route = '/agent/v1/cvm/stack-bundles/' + sha
                 require(proof and proof['mode'] == 'hash' and proof['path'] == route, 'no corrupted download observed')
-                require(terminal['roots_sha256'] is None and terminal['error'], 'fault did not fail before approval')
+                require(terminal['roots_sha256'] is None and terminal['error'], 'fault did not fail during preflight')
                 self.remote('test', '!', '-e', target_path)
                 require(self.empty_host() == initial, 'failed download changed empty storage or restarted Agent')
                 evidence['download_fault'] = proof
@@ -634,15 +639,17 @@ class StackAcceptance:
             finally:
                 self.acceptance.gate(restart=False, stack_download=None)
 
-        with step('prepare and explicitly approve cold first install of Cube A'):
-            release_id = create()
-            evidence['release_id'] = release_id
+        with step('preflight and automatically claim first install of Cube A'):
+            self.hold_claim()
+            entry = self.create_release(pair)
+            release_id = entry['id']
+            evidence.update(release_id=release_id, start_deadline_at=entry['start_deadline_at'])
             atom_json(evidence_path, evidence)
-            empty_roots = hashlib.sha256(b'["brocade-cvm-cold-roots-v1","plain",[]]').hexdigest()
-            ready = self.wait_release(release_id, 'ready')
-            require(ready['roots_sha256'] == empty_roots, 'ready receipt lacks canonical empty roots')
-            require(self.empty_host() == initial, 'first install activated before approval')
-            self.acceptance.call('POST', f'{API}/{release_id}/approve', expected=(200, 202))
+            empty_roots = cvm_stack.empty_roots_digest('plain')
+            evidence['claim'] = self.wait_claim(release_id, empty_roots)
+            require(self.empty_host(claim_id=release_id) == initial, 'first install changed the host before claim')
+            atom_json(evidence_path, evidence)
+            self.allow_claim()
             terminal = self.wait_release(release_id, 'succeeded')
             require(terminal['roots_sha256'] == empty_roots, 'terminal receipt lacks canonical empty roots')
             self.wait(
@@ -802,6 +809,50 @@ class StackAcceptance:
     def read_remote_json(self, path):
         result = self.remote('cat', path, check=False)
         return json.loads(result.stdout) if result.returncode == 0 else None
+
+    def create_release(self, pair):
+        # PostgreSQL and Console run on the compute VM; bracket creation with that VM's clock.
+        earliest = int(self.remote('date', '+%s').stdout)
+        entry = self.acceptance.call('POST', API, {'node_id': NODE, 'pair_id': pair['id']}, expected=(200, 201, 202))
+        latest = int(self.remote('date', '+%s').stdout)
+        require(
+            type(entry['id']) is int
+            and entry['id'] > 0
+            and entry['status'] == 'preparing'
+            and entry['node_id'] == NODE
+            and entry['source_sha256'] == pair['source_sha256']
+            and entry['target_sha256'] == pair['target_sha256'],
+            'unexpected created stack release',
+        )
+        deadline = entry.get('start_deadline_at')
+        require(
+            type(deadline) is int
+            and earliest + MAINTENANCE_WINDOW_SECONDS <= deadline <= latest + MAINTENANCE_WINDOW_SECONDS,
+            'release does not have a five-hour server-assigned start deadline in Unix seconds',
+        )
+        return entry
+
+    def claim_proof_path(self):
+        return self.prefix + '/gate/' + NODE + '-stack-claim.summary.json'
+
+    def hold_claim(self):
+        self.remote('rm', '-f', '--', self.claim_proof_path())
+        self.acceptance.gate(restart=False, hold_stack_claim=[NODE])
+
+    def allow_claim(self):
+        self.acceptance.gate(restart=False, hold_stack_claim=[])
+
+    def wait_claim(self, release_id, roots):
+        ready = self.wait_release(release_id, 'ready')
+        require(ready['roots_sha256'] == roots, 'ready receipt does not match independent cold proof')
+        proof = self.wait('real Agent claim delayed', lambda: self.read_remote_json(self.claim_proof_path()))
+        require(
+            proof['id'] == release_id
+            and proof['roots_sha256'] == roots
+            and self.release(release_id)['status'] == 'ready',
+            'proxy did not hold the matching Agent claim before activation',
+        )
+        return proof
 
     def release(self, release_id):
         require(type(release_id) is int and release_id > 0, 'invalid stack release ID')
@@ -982,12 +1033,12 @@ class StackAcceptance:
         pair_id = catalog['pairs']['reverse' if reverse else 'forward']
         pair = next(p for p in self.view()['pairs'] if p['id'] == pair_id)
         require(
-            pair['source_sha256'] == source['bundle_sha256']
+            pair['contract'] == COLD_PAIR
+            and pair['source_sha256'] == source['bundle_sha256']
             and pair['target_sha256'] == target['bundle_sha256']
             and pair['storage_backend'] == 'plain',
             'Console advertised unexpected signed pair',
         )
-        expiry = min(int(self.remote('date', '+%s').stdout) + 3600, pair['expires_at'])
         download_path = self.prefix + '/gate/' + NODE + '-stack-download.summary.json'
         report_path = self.prefix + '/gate/' + NODE + '-stack-report.summary.json'
         self.remote('rm', '-f', '--', download_path, report_path)
@@ -998,15 +1049,18 @@ class StackAcceptance:
             self.acceptance.gate(
                 restart=False, stack_download={'node': NODE, 'sha256': target['bundle_sha256'], 'mode': corrupt}
             )
+        else:
+            self.hold_claim()
+        hold_report = name == 'success'
         try:
-            entry = self.acceptance.call(
-                'POST', API, {'node_id': NODE, 'pair_id': pair_id, 'expires_at': expiry}, expected=(200, 201, 202)
-            )
+            entry = self.create_release(pair)
             release_id = entry['id']
-            require(
-                type(release_id) is int and release_id > 0 and entry['status'] == 'preparing', 'invalid created release'
-            )
-            evidence = {'release_id': release_id, 'roots_sha256': roots, 'before': first}
+            evidence = {
+                'release_id': release_id,
+                'start_deadline_at': entry['start_deadline_at'],
+                'roots_sha256': roots,
+                'before': first,
+            }
             self.state['cases'][name] = evidence
             self.save()
             if corrupt:
@@ -1019,43 +1073,50 @@ class StackAcceptance:
                 )
                 require(
                     not terminal.get('roots_sha256') and terminal.get('error'),
-                    'download failure did not remain before approval',
+                    'download failure did not remain in preflight',
                 )
                 self.remote('test', '!', '-e', target_path)
                 evidence['download_fault'] = proof
             else:
-                ready = self.wait_release(release_id, 'ready')
-                require(ready['roots_sha256'] == roots, 'ready receipt does not match independent cold proof')
+                evidence['claim'] = self.wait_claim(release_id, roots)
+                self.save()
                 if name == 'cancel':
                     self.acceptance.call('POST', f'{API}/{release_id}/cancel', expected=(200, 202))
                     terminal = self.wait_release(release_id, 'cancelled')
+                    self.allow_claim()
                 else:
+                    if name == 'activation-failure':
+                        self.verify_inventory_while_claiming(release_id)
                     with self.fault(name, release_id, target['bundle_sha256']):
-                        if late_receipt:
+                        if hold_report:
                             self.acceptance.gate(
                                 restart=False, hold_stack_report={'node': NODE, 'id': release_id, 'status': 'succeeded'}
                             )
-                        self.acceptance.call('POST', f'{API}/{release_id}/approve', expected=(200, 202))
+                        self.allow_claim()
                         if name == 'manager-death':
                             evidence['manager_death'] = self.interrupt_manager(release_id, target, roots)
-                        if late_receipt:
+                        if hold_report:
                             held = self.wait(
                                 'real terminal report delayed', lambda: self.read_remote_json(report_path), timeout=900
                             )
                             require(
                                 held['roots_sha256'] == roots and self.release(release_id)['status'] == 'applying',
-                                'Console was not waiting for an actual late receipt',
+                                'Console was not waiting for an actual terminal receipt',
                             )
-                            job = self.read_remote_json(BASE + '/stack-maintenance')
-                            require(
-                                job['phase']['done']['id'] == release_id, 'terminal receipt was not persisted offline'
-                            )
-                            self.remote('systemctl', 'restart', AGENT_UNIT)
-                            require(
-                                self.read_remote_json(BASE + '/stack-maintenance') == job,
-                                'late receipt did not survive Agent restart',
-                            )
-                            evidence['late_receipt'] = held
+                            self.acceptance.call('POST', f'{API}/{release_id}/cancel', expected=409)
+                            evidence['cancel_after_claim_rejected'] = True
+                            if late_receipt:
+                                job = self.read_remote_json(BASE + '/stack-maintenance')
+                                require(
+                                    job['phase']['done']['id'] == release_id,
+                                    'terminal receipt was not persisted offline',
+                                )
+                                self.remote('systemctl', 'restart', AGENT_UNIT)
+                                require(
+                                    self.read_remote_json(BASE + '/stack-maintenance') == job,
+                                    'late receipt did not survive Agent restart',
+                                )
+                                evidence['late_receipt'] = held
                             self.acceptance.gate(restart=False, hold_stack_report=None)
                         status = 'recovered' if name in ('activation-failure', 'manager-death') else 'succeeded'
                         terminal = self.wait_release(release_id, status)
@@ -1078,7 +1139,7 @@ class StackAcceptance:
                 'installer did not commit a settled stack identity',
             )
             if corrupt or name == 'cancel':
-                require(first['cubelet'] == cold_runtime['cubelet'], 'pre-approval operation restarted Cubelet')
+                require(first['cubelet'] == cold_runtime['cubelet'], 'operation before claim restarted Cubelet')
             elif terminal['status'] == 'recovered':
                 require(installation['action'] == 'stack-recover', 'no durable rollback commit')
             else:
@@ -1089,7 +1150,7 @@ class StackAcceptance:
             evidence['verified'] = True
             self.save()
         finally:
-            if corrupt or late_receipt:
+            if corrupt or hold_report:
                 self.acceptance.gate(restart=False, stack_download=None, hold_stack_report=None)
 
     def ensure_owner(self):
@@ -1112,7 +1173,6 @@ def main():
     for role in ('source', 'target'):
         catalogue.add_argument('--' + role, required=True, type=Path)
         catalogue.add_argument('--' + role + '-sha256', required=True)
-    catalogue.add_argument('--valid-hours', type=int, default=24)
     prepare = sub.add_parser('prepare')
     prepare.add_argument('--lab-output', required=True, type=Path)
     prepare.add_argument('--catalog', required=True, type=Path)

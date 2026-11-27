@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DeploymentListItem, BinaryRelease } from '../src/api';
+import { CVM_ENABLED } from '../src/product';
 import type { Win } from '../src/wm/store';
 
 window.matchMedia = ((media: string) => ({
@@ -217,7 +218,7 @@ describe('发布页', () => {
       view.container.querySelector('.nd-sheet.nd-page.cgc-page > .fg-sheet.nd-paper > .nd-page-head'),
     ).toBeTruthy();
     const tabs = screen.getAllByRole('tab');
-    expect(tabs.map(tab => tab.textContent)).toEqual(['配置', 'Agent', 'Xray1']);
+    expect(tabs.map(tab => tab.textContent)).toEqual(['配置', 'Agent', 'Xray1', ...(CVM_ENABLED ? ['Cube'] : [])]);
     expect(tabs[0].getAttribute('aria-selected')).toBe('true');
 
     // 修订号领先配置发布不等于机器欠配置；没有实际差异时保持已一致，也不列“待发布”修订。

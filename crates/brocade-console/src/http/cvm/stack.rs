@@ -1,4 +1,4 @@
-//! Private discovery, operator approval, and authenticated bundle delivery for cold stack work.
+//! Private discovery and authenticated delivery for Cube stack maintenance.
 use super::*;
 use brocade_deployment::cvm::stack::*;
 use brocade_store::cvm::stack::VerifiedStackPair;
@@ -25,7 +25,6 @@ struct PairView {
     source_shim_sha256: Option<String>,
     target_sha256: String,
     storage_backend: StackStorage,
-    expires_at: u64,
 }
 
 impl Catalog {
@@ -87,7 +86,6 @@ impl Catalog {
                     source_shim_sha256: pair.source_shim_sha256.clone(),
                     target_sha256: pair.target_sha256.clone(),
                     storage_backend: pair.storage_backend,
-                    expires_at: pair.expires_at,
                 });
             }
         }
@@ -117,11 +115,7 @@ impl Catalog {
         let verified = VerifiedStackPair::verify(artifact, &self.public_key)
             .map_err(|_| unavailable_item())?;
         let pair = verified.pair();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| catalog_unavailable())?
-            .as_secs();
-        if verified.id() != id || pair.expires_at <= timestamp {
+        if verified.id() != id {
             return Err(unavailable_item());
         }
         self.bundle(&pair.target_sha256, pair.target_bytes).await?;
@@ -175,7 +169,6 @@ fn unavailable_item() -> ApiError {
 pub(in crate::http) struct Create {
     node_id: String,
     pair_id: String,
-    expires_at: u64,
 }
 
 pub(in crate::http) async fn overview(
@@ -205,20 +198,17 @@ pub(in crate::http) async fn create(
         .map_err(|_| catalog_unavailable())??;
     let release = state
         .store
-        .create_cvm_stack_release(&actor, &request.node_id, verified, request.expires_at)
+        .create_cvm_stack_release(&actor, &request.node_id, verified)
         .await?;
     Ok(private(Json(release)))
 }
 
-pub(in crate::http) async fn approve(
+pub(in crate::http) async fn history(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
 ) -> ApiResult<Response> {
     let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
-    Ok(private(Json(
-        state.store.approve_cvm_stack_release(&actor, id).await?,
-    )))
+    Ok(private(Json(state.store.cvm_stack_history(&actor).await?)))
 }
 
 pub(in crate::http) async fn cancel(
@@ -300,14 +290,14 @@ mod tests {
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     #[tokio::test]
-    async fn catalog_lists_only_verified_named_unexpired_pairs_with_exact_bundle_size() {
+    async fn catalog_lists_only_current_verified_named_pairs_with_exact_bundle_size() {
         let dir = tempfile::tempdir().unwrap();
         let signer = Ed25519KeyPair::from_seed_unchecked(&[8; 32]).unwrap();
         let catalog = Catalog {
             directory: dir.path().into(),
             public_key: signer.public_key().as_ref().try_into().unwrap(),
         };
-        let mut pair = StackPair {
+        let pair = StackPair {
             contract: "brocade-cvm-stack-cold-pair-v1".into(),
             architecture: "x86_64".into(),
             storage_backend: StackStorage::Xfs,
@@ -318,14 +308,8 @@ mod tests {
             source_shim_sha256: Some("d".repeat(64)),
             target_cubelet_sha256: "e".repeat(64),
             target_shim_sha256: "f".repeat(64),
-            expires_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + 600,
         };
-        let sign = |pair: &StackPair| {
-            let payload = serde_json::to_string(pair).unwrap();
+        let sign = |payload: String| {
             let signature = hex_lower(signer.sign(payload.as_bytes()).as_ref());
             let id = sha256_hex(payload.as_bytes());
             (
@@ -333,7 +317,7 @@ mod tests {
                 serde_json::to_vec(&SignedStackPair { payload, signature }).unwrap(),
             )
         };
-        let (id, signed) = sign(&pair);
+        let (id, signed) = sign(serde_json::to_string(&pair).unwrap());
         let archive = dir.path().join(format!("{}.tar.gz", pair.target_sha256));
         std::fs::write(&archive, b"fake archive").unwrap();
         std::fs::write(dir.path().join(format!("{id}.json")), &signed).unwrap();
@@ -345,11 +329,13 @@ mod tests {
             source_shim_sha256: None,
             ..pair.clone()
         };
-        let (fresh_id, fresh_signed) = sign(&fresh);
+        let (fresh_id, fresh_signed) = sign(serde_json::to_string(&fresh).unwrap());
         std::fs::write(dir.path().join(format!("{fresh_id}.json")), fresh_signed).unwrap();
-        pair.expires_at = 1;
-        let (elapsed, expired) = sign(&pair);
-        std::fs::write(dir.path().join(format!("{elapsed}.json")), expired).unwrap();
+        let mut old = serde_json::to_value(&pair).unwrap();
+        old["expires_at"] = json!(u64::MAX);
+        let (legacy_id, legacy) = sign(old.to_string());
+        std::fs::write(dir.path().join(format!("{legacy_id}.json")), legacy).unwrap();
+        assert!(catalog.read_pair(&legacy_id).await.is_err());
         let pairs = catalog
             .pairs()
             .await
@@ -382,11 +368,24 @@ mod tests {
     }
 
     #[test]
+    fn stack_creation_does_not_accept_a_client_deadline() {
+        assert!(
+            serde_json::from_value::<Create>(json!({ "node_id": "node", "pair_id": "pair" }))
+                .is_ok()
+        );
+        for field in ["expires_at", "start_deadline_at"] {
+            let mut old = json!({ "node_id": "node", "pair_id": "pair" });
+            old[field] = json!(60);
+            assert!(serde_json::from_value::<Create>(old).is_err());
+        }
+    }
+
+    #[test]
     fn stack_workflow_is_not_a_public_or_self_route() {
         for (method, path) in [
             (Method::GET, "/cvm/stack-releases"),
             (Method::POST, "/cvm/stack-releases"),
-            (Method::POST, "/cvm/stack-releases/1/approve"),
+            (Method::GET, "/cvm/stack-releases/history"),
             (Method::POST, "/cvm/stack-releases/1/cancel"),
         ] {
             assert!(!user_may(&method, path));

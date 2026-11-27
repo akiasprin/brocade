@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useId, type ReactNode } from 'react';
 import type { NodeAgentStateItem } from '../api';
 import { Ago, ErrorBox } from '../ui/bits';
 import { Icon, type IconName } from '../ui/icons';
@@ -37,6 +37,7 @@ export function ReleaseLedger({
   period,
   parts,
   facts,
+  className = '',
 }: {
   label: string;
   value: ReactNode;
@@ -44,11 +45,12 @@ export function ReleaseLedger({
   period: ReactNode;
   parts: LedgerPart[];
   facts: [string, ReactNode][];
+  className?: string;
 }) {
   const total = parts.reduce((sum, part) => sum + (part.count ?? 0), 0);
   const share = (count: number | null) => (count != null && total > 0 ? `${((count / total) * 100).toFixed(1)}%` : '—');
   return (
-    <section className="usage-ledger cgc-ledger" aria-label={label}>
+    <section className={`usage-ledger cgc-ledger${className ? ` ${className}` : ''}`} aria-label={label}>
       <div className="usage-hero">
         <span className="usage-hero-label">{label}</span>
         <strong className="usage-hero-value">
@@ -91,42 +93,51 @@ export function ReleaseLedger({
 }
 
 export interface MachineRow {
-  node: NodeAgentStateItem;
+  node: Pick<NodeAgentStateItem, 'node_id' | 'name' | 'public_ipv4_country' | 'last_poll_at'>;
   tone: ReleaseTone;
   status: string;
   /** 运行中的版本或构建；没有上报时为 null。 */
   current: string | null;
   /** 要升级到的版本；已是新版或不能升级时为 null。 */
   target: string | null;
+  currentTitle?: string;
+  targetTitle?: string;
   /** 不能升级或升级失败的原因，写在机器名下。 */
   reason?: string | null;
+  note?: ReactNode;
   /** 状态格里附带的操作，例如失败目标的重试。 */
   action?: ReactNode;
-  /** 编辑升级范围时这一行的勾选框。 */
-  pick?: { checked: boolean; disabled: boolean; onChange: () => void };
+  /** 编辑范围时这一行的选择框。 */
+  pick?: { checked: boolean; disabled: boolean; onChange: () => void; label?: string };
 }
 
 export interface MachineGroup {
   key: string;
-  label: string;
+  label?: string;
   rows: MachineRow[];
 }
 
-/** 逐台机器表：机器 │ 当前 │ 目标 │ 状态 │ 上次来拉，按状态分组。编辑升级范围时前面多一列勾选，
- *  工具条贴在列头之上，内容边缘与配置页签保持一致。 */
+/** 逐台机器表，可按状态分组。编辑范围时，工具条和选择列紧贴机器列表。 */
 export function MachineTable({
   label,
   groups,
   editing,
   toolbar,
   pickAll,
+  pickType = 'checkbox',
+  observationLabel = '上次来拉',
+  noObservation = '从未来拉',
 }: {
   label: string;
   groups: MachineGroup[];
   editing: boolean;
   toolbar?: ReactNode;
   pickAll?: ReactNode;
+  pickType?: 'checkbox' | 'radio';
+  observationLabel?: string;
+  noObservation?: string;
 }) {
+  const radioName = useId();
   const visible = groups.filter(group => group.rows.length > 0);
   const columns = editing ? 6 : 5;
   return (
@@ -143,18 +154,26 @@ export function MachineTable({
           <span role="columnheader">当前</span>
           <span role="columnheader">目标</span>
           <span role="columnheader">状态</span>
-          <span role="columnheader">上次来拉</span>
+          <span role="columnheader">{observationLabel}</span>
         </div>
         {visible.map(group => (
           <div key={group.key} className="cgc-group" role="rowgroup">
-            <div className="cgc-tg" role="row">
-              <span role="cell" aria-colspan={columns}>
-                {group.label}
-                <b>{group.rows.length}</b>
-              </span>
-            </div>
+            {group.label && (
+              <div className="cgc-tg" role="row">
+                <span role="cell" aria-colspan={columns}>
+                  {group.label}
+                  <b>{group.rows.length}</b>
+                </span>
+              </div>
+            )}
             {group.rows.map(row => (
-              <MachineTableRow key={row.node.node_id} row={row} editing={editing} />
+              <MachineTableRow
+                key={row.node.node_id}
+                row={row}
+                editing={editing}
+                radioName={pickType === 'radio' ? radioName : undefined}
+                noObservation={noObservation}
+              />
             ))}
           </div>
         ))}
@@ -163,7 +182,17 @@ export function MachineTable({
   );
 }
 
-function MachineTableRow({ row, editing }: { row: MachineRow; editing: boolean }) {
+function MachineTableRow({
+  row,
+  editing,
+  radioName,
+  noObservation,
+}: {
+  row: MachineRow;
+  editing: boolean;
+  radioName?: string;
+  noObservation: string;
+}) {
   const { node } = row;
   const name = node.name || node.node_id;
   return (
@@ -172,8 +201,9 @@ function MachineTableRow({ row, editing }: { row: MachineRow; editing: boolean }
         <span className="cgc-pick" role="cell">
           {row.pick && (
             <input
-              type="checkbox"
-              aria-label={`升级 ${name}`}
+              type={radioName ? 'radio' : 'checkbox'}
+              name={radioName}
+              aria-label={row.pick.label ?? `升级 ${name}`}
               checked={row.pick.checked}
               disabled={row.pick.disabled}
               onChange={row.pick.onChange}
@@ -188,12 +218,13 @@ function MachineTableRow({ row, editing }: { row: MachineRow; editing: boolean }
         <span>
           <b>{name}</b>
           {row.reason && <small title={row.reason}>{row.reason}</small>}
+          {row.note}
         </span>
       </span>
-      <span className="cgc-ver" role="cell">
+      <span className="cgc-ver" role="cell" title={row.currentTitle}>
         {row.current ?? '—'}
       </span>
-      <span className="cgc-ver to" role="cell">
+      <span className="cgc-ver to" role="cell" title={row.targetTitle}>
         {row.target ? `→ ${row.target}` : ''}
       </span>
       <span className="cgc-st" role="cell">
@@ -204,18 +235,28 @@ function MachineTableRow({ row, editing }: { row: MachineRow; editing: boolean }
         {row.action}
       </span>
       <span className="cgc-poll" role="cell">
-        {node.last_poll_at ? <Ago at={node.last_poll_at} /> : '从未来拉'}
+        {node.last_poll_at ? <Ago at={node.last_poll_at} /> : noObservation}
       </span>
     </div>
   );
 }
 
 /** 编辑时贴在机器表列头之上的工具条：第一行是范围与提交，第二行是批准后会发生什么。 */
-export function ScopeToolbar({ children, note, error }: { children: ReactNode; note: ReactNode; error?: ReactNode }) {
+export function ScopeToolbar({
+  children,
+  note,
+  error,
+  label = '升级范围',
+}: {
+  children: ReactNode;
+  note: ReactNode;
+  error?: ReactNode;
+  label?: string;
+}) {
   return (
-    <div className="cgc-tbar" role="group" aria-label="升级范围">
+    <div className="cgc-tbar" role="group" aria-label={label}>
       <div className="cgc-tbar-row">
-        <span className="cgc-tbar-label">升级范围</span>
+        <span className="cgc-tbar-label">{label}</span>
         {children}
       </div>
       <p className="cgc-tbar-note">{note}</p>

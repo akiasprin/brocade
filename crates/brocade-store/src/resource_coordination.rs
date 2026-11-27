@@ -12,7 +12,7 @@ pub(crate) async fn lock(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
 
 /// This table lock conflicts with lease mutations, but not reads by other resource writers.
 /// Take it before the first snapshot in a repeatable-read claim transaction. It also allows
-/// binary release claims to synchronize with stack approval without nesting their own mutex
+/// binary release claims to synchronize with stack readiness without nesting their own mutex
 /// under the ordinary resource lock.
 pub(crate) async fn synchronize_stack_claim(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     sqlx::query("LOCK TABLE cvm_stack_releases IN ROW SHARE MODE")
@@ -21,8 +21,8 @@ pub(crate) async fn synchronize_stack_claim(tx: &mut Transaction<'_, Postgres>) 
     Ok(())
 }
 
-/// Called under the resource lock or claim table lock. Elapsed, unclaimed approval cannot block ordinary work,
-/// while an applying or blocked attempt keeps the fence until its state is proven.
+/// Called under the resource lock or claim table lock. A ready attempt fences the host
+/// only until its start deadline; applying or blocked work stays fenced until verified.
 pub(crate) async fn stack_busy<N: AsRef<str>>(
     tx: &mut Transaction<'_, Postgres>,
     nodes: &[N],
@@ -33,8 +33,8 @@ pub(crate) async fn stack_busy<N: AsRef<str>>(
     let ids: Vec<&str> = nodes.iter().map(AsRef::as_ref).collect();
     Ok(sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM cvm_stack_releases WHERE node_id=ANY($1)
-          AND status IN ('approved','applying','blocked')
-          AND (status <> 'approved' OR expires_at > floor(extract(epoch FROM clock_timestamp()))))",
+          AND status IN ('ready','applying','blocked')
+          AND (status <> 'ready' OR start_deadline_at > floor(extract(epoch FROM clock_timestamp()))))",
     )
     .bind(ids)
     .fetch_one(&mut **tx)

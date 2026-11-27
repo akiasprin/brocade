@@ -1057,6 +1057,53 @@ CVM 数据，保留机器、用户、普通配置及其它非 CVM 数据。该�
 旧 CVM 数据需要取证时读取升级前备份，不把整库备份覆盖升级后的新写入。回退构建必须理解目标
 `0009`，不能恢复旧 checksum 或旧外键。
 
+#### Cube Stack 签名包有效期退役
+
+这是独立于上文两组外键转换的前向路径。仅接受 `a4b3ef9f61102b30d3f71b0fbeb302b1dce6cd5d`
+中的 `0001`–`0009`，其中旧 `0009` 的 SHA-384 为
+`c5bc5772a129de7a2af045c469bb0542584b744c6981e67295af6db6d5adc693e7987d15854b5427691cd6b51032d949`。
+本地夹具只能证明该源码基线，不能证明目标数据库已安装这组字节。未知旧回执或结构、已正式发布的 0009、
+以及未经恢复演练的目标均不得套用此工具，也不得串联上文的历史转换。无旧 0009 的兼容环境使用普通迁移。
+
+1. 使用旧构建的只读 `database-check` 及数据库回执确认目标基线，并比较实际结构与该基线的全新数据库。
+   人工撤下旧签名清单以暂停新发布，按既有流程取消未认领任务，等待执行中或阻断的任务、本地作业标记及待回执任务
+   收口。不得通过 SQL 强制结束任务。先逐台更新参与 Cube Stack 发布的 CVM Agent 与同源安装器，核对实际生效及
+   普通 CVM 正常；离线、备用或回退节点不得以旧 Agent 重返这轮 Stack 环境。混合阶段不启用 Stack 发布，
+   无额外的运行时版本开关。准备切换 Console 时再停止所有写入者，包含 socket 自动激活入口。
+2. 留存停写时的完整 `pg_dump --format=custom` 归档、原回执与旧构建。将归档恢复到隔离库，核对可恢复性、
+   源结构和数据后再准备 SQL。生成器要求可列出表数据的归档及操作者的恢复核验确认；只验证归档目录不能
+   证明目标身份或恢复成功。生成结果记录归档 SHA-256，不写入旧载荷或凭据。保留归档作原签名字节的取证来源。
+3. 从与候选二进制一致的源码生成 SQL；本地 Git 必须可读取上述固定提交。下列命令先用于停写备份的隔离恢复库。
+   只有具备明确生产授权且隔离演练通过后，才保持目标停写，在实际迁移对象的 owner 角色下执行同一份 SQL。
+
+   ```sh
+   umask 077
+   python3 scripts/prepare-cvm-stack-0009-compat.py \
+     --backup <release-dir>/pre-cvm-stack.dump --backup-verified \
+     --output <release-dir>/convert-cvm-stack-0009.sql
+   psql -X -v ON_ERROR_STOP=1 -d <database> \
+     -f <release-dir>/convert-cvm-stack-0009.sql > <release-dir>/convert-cvm-stack-0009.log 2>&1
+   ```
+
+4. 转换以同一事务锁定回执和 Stack 表，核验全部旧回执及相关表结构，拒绝包括 `blocked` 在内的所有非终态记录。
+   保留发布编号、状态、维护截止、历史审计与序列。`created_at` 回填首条准备事件的时间；旧 `artifact` 只保留
+   原 UTF-8 签名载荷的 SHA-256 `pair_id` 以及源／目标栈身份，不能再作为 Agent offer。旧宿主观测全部清除。
+   核对目标结构及转换数据之后，只更新第 9 条回执的 checksum；任一步失败均整体回滚。
+5. 隔离演练须比较与候选迁移的新装结构，并验证旧签名字符串已不在在线行中、普通 CVM 数据和审计完整。
+   执行后以候选的普通 `database-check` 核对回执并沿标准前向部署流程切换 Console。Agent 的 Stack 路由和签名清单
+   契约标识仍为 v1，但新签名载荷不含包有效期；启用新目录前须重新签发清单。确认已更新的 Agent 重新提交
+   新鲜观测后，再人工开放 Stack 发布。新任务从数据库记录的 `created_at` 起有 5 小时开始窗口，旧历史截止不重算。
+
+该转换不加入 Console 或安装器的产品兼容分支。成功提交后不能直接运行旧构建；优先使用理解新结构的前向修复。
+整库恢复需要单独评估并授权数据损失，不能覆盖转换后新写入。活动表中删除旧字节并非对旧归档、WAL 或磁盘页面的擦除。
+
+源码演练使用独立临时 PostgreSQL，安装好的 `initdb`、`pg_ctl`、`psql`、`pg_dump` 与 `pg_restore` 必须来自同一套工具：
+
+```sh
+BROCADE_PG_BIN=<absolute-postgres-bin-dir> python3 -m unittest discover \
+  -s scripts/tests -p test_prepare_cvm_stack_0009_compat.py
+```
+
 ## 上传与原子替换
 
 生产 Console 应由 `brocade-console.socket` 持有监听端口，service 的 `[Unit]` 同时包含

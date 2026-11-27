@@ -1354,10 +1354,7 @@ fn cvm_admin_routes() -> Router<AppState> {
                 .post(cvm::stack::create)
                 .layer(DefaultBodyLimit::max(8192)),
         )
-        .route(
-            "/cvm/stack-releases/{id}/approve",
-            post(cvm::stack::approve),
-        )
+        .route("/cvm/stack-releases/history", get(cvm::stack::history))
         .route("/cvm/stack-releases/{id}/cancel", post(cvm::stack::cancel))
         .route("/cvm/adopt", post(cvm::adopt))
         .route("/cvm/readings", get(cvm::readings))

@@ -129,18 +129,19 @@ CREATE TABLE cvm_stack_releases (
     tenant_id TEXT NOT NULL,
     artifact JSONB NOT NULL CHECK (jsonb_typeof(artifact) = 'object'),
     status TEXT NOT NULL CHECK (status IN (
-        'preparing', 'ready', 'approved', 'applying', 'succeeded', 'failed',
+        'preparing', 'ready', 'applying', 'succeeded', 'failed',
         'recovered', 'blocked', 'cancelled'
     )),
-    expires_at BIGINT NOT NULL CHECK (expires_at > 0),
+    start_deadline_at BIGINT NOT NULL CHECK (start_deadline_at > 0),
     roots_sha256 TEXT CHECK (roots_sha256 ~ '^[0-9a-f]{64}$'),
     error TEXT CHECK (length(error) <= 128),
-    CHECK (status NOT IN ('ready', 'approved', 'applying', 'succeeded', 'recovered', 'blocked')
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (status NOT IN ('ready', 'applying', 'succeeded', 'recovered', 'blocked')
         OR roots_sha256 IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX cvm_stack_releases_open_host ON cvm_stack_releases(node_id)
-WHERE status IN ('preparing', 'ready', 'approved', 'applying', 'blocked');
+WHERE status IN ('preparing', 'ready', 'applying', 'blocked');
 
 CREATE TABLE cvm_stack_release_events (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

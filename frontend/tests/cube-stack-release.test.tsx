@@ -1,11 +1,12 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AdminRole } from '../src/api';
 import {
   STACK_COLD_PAIR_CONTRACT,
   STACK_FRESH_INSTALL_CONTRACT,
   type StackRelease,
+  type StackReleaseHost,
   type StackReleaseView,
 } from '../src/api/cvm-stack-releases';
 import { CVM_ENABLED } from '../src/product';
@@ -31,32 +32,27 @@ const coldSource = {
   source_shim_sha256: shim,
   target_sha256: target,
 } as const;
+const installed = (now: number) =>
+  ({
+    node_id: 'fresh',
+    bundle_sha256: source,
+    cubelet_sha256: cubelet,
+    shim_sha256: shim,
+    storage_backend: 'xfs',
+    observed_at: now - 30,
+  }) as const;
+const empty = (now: number, backend: 'plain' | 'xfs'): StackReleaseHost => ({
+  node_id: `empty-${backend}`,
+  observed_at: now - 30,
+  installable: backend,
+});
 const view = (now: number): StackReleaseView => ({
   pairs: [
-    { ...coldSource, id: 'upgrade-xfs', storage_backend: 'xfs', expires_at: now + 7_200 },
-    { ...coldSource, id: 'upgrade-plain', storage_backend: 'plain', expires_at: now + 7_200 },
-    { ...coldSource, id: 'old-pair', storage_backend: 'xfs', expires_at: now - 1 },
-    {
-      ...coldSource,
-      id: 'wrong-cubelet',
-      source_cubelet_sha256: '1'.repeat(64),
-      storage_backend: 'xfs',
-      expires_at: now + 7_200,
-    },
-    {
-      ...coldSource,
-      id: 'wrong-shim',
-      source_shim_sha256: '2'.repeat(64),
-      storage_backend: 'xfs',
-      expires_at: now + 7_200,
-    },
-    {
-      id: 'install-xfs',
-      contract: STACK_FRESH_INSTALL_CONTRACT,
-      target_sha256: target,
-      storage_backend: 'xfs',
-      expires_at: now + 7_200,
-    },
+    { ...coldSource, id: 'upgrade-xfs', storage_backend: 'xfs' },
+    { ...coldSource, id: 'upgrade-plain', storage_backend: 'plain' },
+    { ...coldSource, id: 'wrong-cubelet', source_cubelet_sha256: '1'.repeat(64), storage_backend: 'xfs' },
+    { ...coldSource, id: 'wrong-shim', source_shim_sha256: '2'.repeat(64), storage_backend: 'xfs' },
+    { id: 'install-xfs', contract: STACK_FRESH_INSTALL_CONTRACT, target_sha256: target, storage_backend: 'xfs' },
     {
       id: 'install-plain',
       contract: STACK_FRESH_INSTALL_CONTRACT,
@@ -65,39 +61,21 @@ const view = (now: number): StackReleaseView => ({
       source_shim_sha256: null,
       target_sha256: target,
       storage_backend: 'plain',
-      expires_at: now + 7_200,
     },
   ],
-  hosts: [
-    {
-      node_id: 'fresh',
-      bundle_sha256: source,
-      cubelet_sha256: cubelet,
-      shim_sha256: shim,
-      storage_backend: 'xfs',
-      observed_at: now - 30,
-    },
-    {
-      node_id: 'stale',
-      bundle_sha256: source,
-      cubelet_sha256: cubelet,
-      shim_sha256: shim,
-      storage_backend: 'xfs',
-      observed_at: now - 151,
-    },
-  ],
+  hosts: [installed(now), { ...installed(now), node_id: 'stale', observed_at: now - 151 }],
   releases: [],
 });
-
 const release = (now: number, overrides: Partial<StackRelease> = {}): StackRelease => ({
   id: 17,
   node_id: 'fresh',
   source_sha256: source,
   target_sha256: target,
   status: 'ready',
-  expires_at: now + 1_200,
+  start_deadline_at: now + 18_000,
   ...overrides,
 });
+const currentTime = () => Math.floor(Date.now() / 1_000);
 
 const ordinaryResponses: Record<string, unknown> = {
   '/deployments?limit=50': { deployments: [] },
@@ -106,20 +84,20 @@ const ordinaryResponses: Record<string, unknown> = {
   '/binary-releases/agent': { current: null },
   '/binary-releases/xray': { current: null },
   '/deployment-settings': {},
-  '/nodes/agent-state': {
-    nodes: [
-      { node_id: 'fresh', name: '宿主甲' },
-      { node_id: 'stale', name: '宿主乙' },
-    ],
-  },
 };
+const nodeEntries = [
+  { node_id: 'fresh', name: '宿主甲' },
+  { node_id: 'stale', name: '宿主乙' },
+];
 
 function mount(
   role: AdminRole,
-  stack: (url: string, init?: RequestInit) => Response = () => Response.json(view(Date.now() / 1_000)),
+  stack: (url: string, init?: RequestInit) => Response = () => Response.json(view(currentTime())),
+  extraNodes: object[] = [],
 ) {
   const fetch = vi.fn(async (url: string, init?: RequestInit) => {
     if (url.startsWith(path)) return stack(url, init);
+    if (url === '/nodes/agent-state') return Response.json({ nodes: [...nodeEntries, ...extraNodes] });
     if (url in ordinaryResponses) return Response.json(ordinaryResponses[url]);
     throw new Error(`Unexpected API request ${url}`);
   });
@@ -152,18 +130,38 @@ function mount(
     </QueryClientProvider>,
   );
   const stackRequests = () => fetch.mock.calls.filter(([url]) => url.startsWith(path));
-  return { client, stackRequests };
+  return {
+    stackRequests,
+    posts: () => stackRequests().filter(([, init]) => init?.method === 'POST'),
+    refetch: () =>
+      act(async () => {
+        await client.refetchQueries({ queryKey: ['cvm-stack-releases'] });
+      }),
+  };
 }
 
 async function openTab() {
-  fireEvent.click(await screen.findByRole('tab', { name: 'Cube 运行栈' }));
-  await screen.findByRole('region', { name: '运行栈发布记录' });
+  fireEvent.click(await screen.findByRole('tab', { name: 'Cube' }));
+  await screen.findByRole('region', { name: 'Cube 宿主' });
 }
 
-function deadlineInput(seconds: number) {
-  const date = new Date(seconds * 1_000);
-  date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
-  return date.toISOString().slice(0, 16);
+const row = (name: string) =>
+  within(screen.getByRole('rowheader', { name: new RegExp(name) }).closest('[role="row"]') as HTMLElement);
+const button = (name: string) => screen.getByRole<HTMLButtonElement>('button', { name });
+const scope = (label: string) => within(screen.getByRole('group', { name: label }));
+
+function expectPost(posts: ReturnType<ReturnType<typeof mount>['posts']>, node: string, pair: string) {
+  expect(posts).toEqual([
+    [
+      path,
+      expect.objectContaining({
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ node_id: node, pair_id: pair }),
+      }),
+    ],
+  ]);
 }
 
 afterEach(() => {
@@ -177,11 +175,11 @@ describe('Cube 运行栈发布契约', () => {
     async role => {
       const { stackRequests } = mount(role);
       const config = await screen.findByRole('tab', { name: '配置' });
-      expect(screen.queryByRole('tab', { name: 'Cube 运行栈' }) !== null).toBe(CVM_ENABLED && role === 'system-admin');
+      expect(screen.queryByRole('tab', { name: 'Cube' }) !== null).toBe(CVM_ENABLED && role === 'system-admin');
       expect(stackRequests()).toEqual([]);
       fireEvent.keyDown(config, { key: 'End' });
       if (CVM_ENABLED && role === 'system-admin') {
-        await screen.findByRole('region', { name: '准备冷窗口' });
+        await screen.findByRole('region', { name: 'Cube 宿主' });
         expect(stackRequests()).toEqual([[path, expect.objectContaining({ credentials: 'same-origin' })]]);
       } else {
         expect(screen.getByRole('tab', { name: 'Xray' }).getAttribute('aria-selected')).toBe('true');
@@ -190,230 +188,251 @@ describe('Cube 运行栈发布契约', () => {
     },
   );
 
-  it.runIf(CVM_ENABLED)('仅提交匹配的单宿主和有效运行包对，窗口截止使用 Unix 秒', async () => {
-    const now = Math.floor(Date.now() / 1_000);
+  it.runIf(CVM_ENABLED)('无宿主上报时保留配置提示，禁用原因可聚焦，历史按需加载', async () => {
+    const { stackRequests } = mount('system-admin', url =>
+      Response.json(url === path ? { pairs: [], hosts: [], releases: [] } : []),
+    );
+    await openTab();
+    expect(screen.getByText(/暂无有效的宿主运行栈上报/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '前往容器电源操作' })).toBeNull();
+    for (const name of ['安装 Cube', '升级 Cube']) {
+      const entry = button(name);
+      expect(entry.getAttribute('aria-disabled')).toBe('true');
+      expect(entry.disabled).toBe(false);
+      expect(document.getElementById(entry.getAttribute('aria-describedby')!)?.textContent).toMatch(/暂无可.*的宿主/);
+      entry.focus();
+      expect(document.activeElement).toBe(entry);
+      fireEvent.click(entry);
+    }
+    expect(screen.queryByRole('radio')).toBeNull();
+    expect(stackRequests().map(([url]) => url)).toEqual([path]);
+    fireEvent.click(button('发布历史'));
+    expect(await screen.findByText('暂无运行栈发布记录。')).toBeTruthy();
+    expect(stackRequests().map(([url]) => url)).toEqual([path, `${path}/history`]);
+  });
+
+  it.runIf(CVM_ENABLED)('活跃 CVM 节点缺少观测时仍显示为未知且不可选', async () => {
+    const data = view(currentTime());
+    mount('system-admin', () => Response.json(data), [
+      { node_id: 'missing', name: '无观测宿主', lifecycle_phase: 'active', runtime_versions: { agent_flavor: 'cvm' } },
+      { node_id: 'base', name: '基础版节点', lifecycle_phase: 'active', runtime_versions: { agent_flavor: 'base' } },
+      { node_id: 'retired', name: '退役节点', lifecycle_phase: 'retired', runtime_versions: { agent_flavor: 'cvm' } },
+    ]);
+    await openTab();
+    expect(row('无观测宿主').getByText('状态未知')).toBeTruthy();
+    expect(screen.queryByRole('rowheader', { name: /基础版节点|退役节点/ })).toBeNull();
+    fireEvent.click(button('升级 Cube'));
+    expect(screen.getAllByRole('radio').map(radio => radio.getAttribute('aria-label'))).toEqual(['升级 宿主甲']);
+  });
+
+  it.runIf(CVM_ENABLED)('有宿主上报但没有签名包时提示检查发布目录', async () => {
+    mount('system-admin', () => Response.json({ ...view(currentTime()), pairs: [] }));
+    await openTab();
+    expect(screen.getByText(/暂无可用的签名运行包/)).toBeTruthy();
+    expect(row('宿主甲').getByText('不可升级')).toBeTruthy();
+    expect(button('升级 Cube').getAttribute('aria-disabled')).toBe('true');
+  });
+
+  it.runIf(CVM_ENABLED)('混合宿主分开选择，匹配存储和三项来源摘要，提交后显示服务端截止', async () => {
+    const now = currentTime();
     const data = view(now);
-    const { stackRequests } = mount('system-admin', (_url, init) => {
+    data.hosts.push(empty(now, 'xfs'), { ...installed(now), node_id: 'future', observed_at: now + 300 });
+    data.pairs.push({ ...coldSource, id: 'second-xfs', target_sha256: 'e'.repeat(64), storage_backend: 'xfs' });
+    const deadline = now + 18_180;
+    const { posts } = mount('system-admin', (_url, init) => {
       if (init?.method !== 'POST') return Response.json(data);
-      const request = JSON.parse(String(init.body));
-      const created = release(now, { status: 'preparing', expires_at: request.expires_at });
+      const created = release(now, { status: 'preparing', start_deadline_at: deadline });
       data.releases = [created];
       return Response.json(created);
     });
     await openTab();
-    const host = screen.getByLabelText('目标宿主');
-    const pair = screen.getByLabelText('兼容运行包对') as HTMLSelectElement;
-    const create = screen.getByRole<HTMLButtonElement>('button', { name: '创建准备单' });
-    fireEvent.change(host, { target: { value: 'stale' } });
-    expect(screen.getByText('证据已过期，当前状态未知')).toBeTruthy();
-    expect(pair.disabled).toBe(true);
-    expect(create.disabled).toBe(true);
-    fireEvent.change(host, { target: { value: 'fresh' } });
-    expect(screen.getByText('宿主安装证据有效')).toBeTruthy();
-    expect(Array.from(pair.options, option => option.value)).toEqual(['', 'upgrade-xfs', 'old-pair']);
-    expect(within(pair).getByRole<HTMLOptionElement>('option', { name: /old-pair/ }).disabled).toBe(true);
+    expect(button('升级 Cube').classList.contains('primary')).toBe(true);
+    expect(button('安装 Cube').classList.contains('primary')).toBe(false);
+    expect(row('宿主乙').getByText('证据已过期，当前状态未知')).toBeTruthy();
+    expect(row('future').getByText('状态未知')).toBeTruthy();
+    fireEvent.click(button('升级 Cube'));
+    const toolbar = scope('升级范围');
+    expect(toolbar.getByText(/停止该宿主上正在运行的虚拟机并等待回执/)).toBeTruthy();
+    expect(toolbar.getByText(/维护窗口 5 小时，预计/)).toBeTruthy();
+    expect(toolbar.getByRole<HTMLButtonElement>('button', { name: '升级' }).disabled).toBe(true);
+    expect(screen.getAllByRole('radio').map(radio => radio.getAttribute('aria-label'))).toEqual(['升级 宿主甲']);
+    fireEvent.click(screen.getByRole('radio', { name: '升级 宿主甲' }));
+    const pair = toolbar.getByLabelText<HTMLSelectElement>('兼容运行包对');
+    expect(Array.from(pair.options, option => option.value)).toEqual(['', 'upgrade-xfs', 'second-xfs']);
     fireEvent.change(pair, { target: { value: 'upgrade-xfs' } });
-    const deadline = screen.getByLabelText('窗口截止（本地时间）');
-    fireEvent.change(deadline, { target: { value: deadlineInput(now + 8_000) } });
-    expect(create.disabled).toBe(true);
-    const validDeadline = deadlineInput(now + 1_200);
-    fireEvent.change(deadline, { target: { value: validDeadline } });
-    fireEvent.click(create);
+    fireEvent.click(toolbar.getByRole('button', { name: '升级' }));
     await screen.findByText('准备中');
-    expect(stackRequests().filter(([, init]) => init?.method === 'POST')).toEqual([
-      [
-        path,
-        expect.objectContaining({
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            node_id: 'fresh',
-            pair_id: 'upgrade-xfs',
-            expires_at: Date.parse(validDeadline) / 1_000,
-          }),
-        }),
-      ],
-    ]);
+    const submitted = screen.getByRole('status');
+    expect(submitted.textContent).toContain('维护窗口 5 小时');
+    expect(submitted.textContent).not.toContain('预计');
+    expect(submitted.querySelector('time')?.dateTime).toBe(new Date(deadline * 1_000).toISOString());
+    expectPost(posts(), 'fresh', 'upgrade-xfs');
   });
 
-  it.runIf(CVM_ENABLED)('首次安装仅使用匹配存储的安装包，明确批准并核对目标包观测', async () => {
-    const now = Math.floor(Date.now() / 1_000);
+  it.runIf(CVM_ENABLED)('全未安装时主入口为安装，只有兼容空机可选，首次安装自动执行', async () => {
+    const now = currentTime();
     const data = view(now);
-    const plainHost = { node_id: 'empty-plain', observed_at: now - 30, installable: 'plain' } as const;
-    data.hosts.push(plainHost, { node_id: 'empty-xfs', observed_at: now - 30, installable: 'xfs' });
-    const installation = release(now, { node_id: plainHost.node_id, source_sha256: null });
-    const { client, stackRequests } = mount('system-admin', (url, init) => {
+    data.hosts = [empty(now, 'plain'), empty(now, 'xfs')];
+    const { posts, refetch } = mount('system-admin', (_url, init) => {
       if (init?.method !== 'POST') return Response.json(data);
-      const updated = {
-        ...installation,
-        status: url === path ? 'preparing' : 'approved',
-        expires_at: url === path ? JSON.parse(String(init.body)).expires_at : data.releases[0].expires_at,
-      } as const;
-      data.releases = [updated];
-      return Response.json(updated);
+      const created = release(now, { node_id: 'empty-plain', source_sha256: null, status: 'preparing' });
+      data.releases = [created];
+      return Response.json(created);
     });
-
     await openTab();
-    const history = within(screen.getByRole('region', { name: '运行栈发布记录' }));
-    const host = screen.getByLabelText('目标宿主');
-    fireEvent.change(host, { target: { value: 'empty-xfs' } });
-    const form = within(screen.getByRole('region', { name: '准备首次安装' }));
-    const pair = form.getByLabelText<HTMLSelectElement>('首次安装包');
-    expect(Array.from(pair.options, option => option.value)).toEqual(['', 'install-xfs']);
-    fireEvent.change(pair, { target: { value: 'install-xfs' } });
-    fireEvent.change(host, { target: { value: plainHost.node_id } });
-    expect(pair.value).toBe('');
-    expect(Array.from(pair.options, option => option.value)).toEqual(['', 'install-plain']);
-    expect(form.getByText('已确认宿主符合首次安装条件')).toBeTruthy();
-    expect(form.queryByText('已安装 Shim SHA-256')).toBeNull();
+    expect(screen.getByRole('region', { name: '已安装' }).textContent).toContain('0 / 2 台');
+    expect(button('安装 Cube').classList.contains('primary')).toBe(true);
+    expect(button('升级 Cube').getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(button('安装 Cube'));
+    fireEvent.click(screen.getByRole('radio', { name: '安装 empty-xfs' }));
+    fireEvent.click(screen.getByRole('radio', { name: '安装 empty-plain' }));
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: '安装 empty-xfs' }).checked).toBe(false);
+    const toolbar = scope('安装范围');
+    expect(toolbar.queryByRole('combobox')).toBeNull();
+    expect(toolbar.queryByText(/停机|停止/)).toBeNull();
+    expect(toolbar.queryByRole('button', { name: '前往容器电源操作' })).toBeNull();
+    fireEvent.click(toolbar.getByRole('button', { name: '安装' }));
+    await screen.findByText('准备中');
+    const update = async (status: StackRelease['status']) => {
+      data.releases = [{ ...data.releases[0], status }];
+      await refetch();
+    };
+    await update('ready');
+    expect(row('empty-plain').getByText('准备中')).toBeTruthy();
+    expect(row('empty-plain').getByRole('button', { name: '取消发布 #17' })).toBeTruthy();
+    await update('applying');
+    await screen.findByText('安装中');
+    expect(screen.queryByRole('button', { name: /取消发布/ })).toBeNull();
+    await update('succeeded');
+    await screen.findByText('当前观测尚未确认安装包摘要与目标包一致。');
+    data.hosts = [
+      empty(now, 'xfs'),
+      { ...installed(now), node_id: 'empty-plain', bundle_sha256: target, storage_backend: 'plain' },
+    ];
+    await refetch();
+    await waitFor(() => expect(row('empty-plain').getByText('已一致')).toBeTruthy());
     expect(screen.queryByRole('button', { name: '前往容器电源操作' })).toBeNull();
-
-    fireEvent.change(pair, { target: { value: 'install-plain' } });
-    const validDeadline = deadlineInput(now + 1_200);
-    fireEvent.change(form.getByLabelText('窗口截止（本地时间）'), { target: { value: validDeadline } });
-    fireEvent.click(form.getByRole('button', { name: '创建首次安装准备单' }));
-    await history.findByText('准备中');
-    expect(history.getByText(/#17.*首次安装/)).toBeTruthy();
-    expect(history.queryByText('来源包 SHA-256')).toBeNull();
-
-    data.releases = [{ ...data.releases[0], status: 'ready' }];
-    data.hosts = data.hosts.map(item =>
-      item.node_id === plainHost.node_id ? { ...plainHost, observed_at: now - 151 } : item,
-    );
-    const refetch = () => client.refetchQueries({ queryKey: ['cvm-stack-releases'] });
-    await refetch();
-    const approve = await history.findByRole<HTMLButtonElement>('button', { name: '批准首次安装' });
-    expect(approve.disabled).toBe(true);
-    data.hosts = data.hosts.map(item => (item.node_id === plainHost.node_id ? plainHost : item));
-    await refetch();
-    await waitFor(() => expect(approve.disabled).toBe(false));
-    fireEvent.click(approve);
-    const dialog = within(screen.getByRole('dialog', { name: '批准首次安装 #17' }));
-    const confirm = dialog.getByRole<HTMLButtonElement>('button', { name: '确认批准' });
-    expect(dialog.getByText(target)).toBeTruthy();
-    expect(dialog.queryByText(/停机|已停止/)).toBeNull();
-    expect(confirm.disabled).toBe(true);
-    fireEvent.click(dialog.getByRole('checkbox', { name: /我已核对目标宿主、安装包和窗口/ }));
-    fireEvent.click(confirm);
-    await history.findByText('已批准');
-    expect(stackRequests().filter(([, init]) => init?.method === 'POST')).toEqual([
-      [
-        path,
-        expect.objectContaining({
-          body: JSON.stringify({
-            node_id: plainHost.node_id,
-            pair_id: 'install-plain',
-            expires_at: Date.parse(validDeadline) / 1_000,
-          }),
-        }),
-      ],
-      [`${path}/17/approve`, { method: 'POST', credentials: 'same-origin', headers: {} }],
-    ]);
-
-    data.releases = [{ ...data.releases[0], status: 'applying' }];
-    await refetch();
-    await history.findByText('正在首次安装');
-    expect(history.queryByRole('button', { name: '取消发布' })).toBeNull();
-    data.releases = [{ ...data.releases[0], status: 'succeeded' }];
-    await refetch();
-    await history.findByText('宿主运行栈首次安装成功');
-    expect(history.getByText('当前观测尚未确认安装包摘要与目标包一致。')).toBeTruthy();
-
-    data.hosts = data.hosts.map(item =>
-      item.node_id !== plainHost.node_id
-        ? item
-        : {
-            node_id: plainHost.node_id,
-            observed_at: now,
-            bundle_sha256: target,
-            cubelet_sha256: cubelet,
-            shim_sha256: shim,
-            storage_backend: 'plain',
-          },
-    );
-    await refetch();
-    await history.findByText('当前安装包摘要与目标包一致。');
-    expect(history.getByText('已安装 Shim SHA-256')).toBeTruthy();
-    expect(history.queryByText('已确认宿主符合首次安装条件')).toBeNull();
-    expect(history.queryByText('VM Shim 仍待冷启动验证。')).toBeNull();
-    expect(screen.getByRole('region', { name: '准备冷窗口' })).toBeTruthy();
+    expectPost(posts(), 'empty-plain', 'install-plain');
   });
 
-  it.runIf(CVM_ENABLED)('必须明确批准冷切换，开始切换后不再提供取消，成功仅指宿主', async () => {
-    const now = Math.floor(Date.now() / 1_000);
+  it.runIf(CVM_ENABLED)('失败后可重试，拒绝提交时保留宿主和清单选择，阻断须恢复', async () => {
+    const now = currentTime();
     const data = view(now);
-    data.releases = [release(now, { roots_sha256: 'e'.repeat(64) })];
-    const { client, stackRequests } = mount('system-admin', (_url, init) => {
-      if (init?.method !== 'POST') return Response.json(data);
-      const updated = { ...data.releases[0], status: 'approved' } as const;
-      data.releases = [updated];
-      return Response.json(updated);
-    });
+    data.hosts.push({ ...installed(now), node_id: 'blocked' });
+    const alternate = { ...coldSource, id: 'alternate', storage_backend: 'xfs' } as const;
+    data.pairs.push(alternate);
+    data.releases = [
+      release(now, { status: 'recovered', error: '已恢复来源包' }),
+      release(now, { id: 16, node_id: 'blocked', status: 'blocked' }),
+    ];
+    const { posts } = mount('system-admin', (_url, init) =>
+      init?.method === 'POST' ? Response.json({ error: '虚拟机尚未停止' }, { status: 409 }) : Response.json(data),
+    );
     await openTab();
-    fireEvent.click(screen.getByRole('button', { name: '批准冷切换' }));
-    const dialog = within(screen.getByRole('dialog', { name: '批准冷切换 #17' }));
-    const confirm = dialog.getByRole<HTMLButtonElement>('button', { name: '确认批准' });
-    expect(dialog.getByText(/批准后 Agent 可立即开始切换宿主运行栈/)).toBeTruthy();
-    expect(confirm.disabled).toBe(true);
-    expect(stackRequests().some(([, init]) => init?.method === 'POST')).toBe(false);
-    fireEvent.click(dialog.getByRole('checkbox'));
-    expect(confirm.disabled).toBe(false);
-    fireEvent.click(confirm);
-    await screen.findByText('已批准');
-    expect(stackRequests().filter(([, init]) => init?.method === 'POST')).toEqual([
-      [`${path}/17/approve`, { method: 'POST', credentials: 'same-origin', headers: {} }],
-    ]);
-    data.releases = [release(now, { status: 'applying' })];
-    await client.refetchQueries({ queryKey: ['cvm-stack-releases'] });
-    await screen.findByText('正在切换');
-    expect(screen.queryByRole('button', { name: '取消发布' })).toBeNull();
-    data.releases = [release(now, { status: 'succeeded' })];
-    await client.refetchQueries({ queryKey: ['cvm-stack-releases'] });
-    expect(await screen.findByText('宿主运行栈切换成功')).toBeTruthy();
-    expect(screen.getByText('VM Shim 仍待冷启动验证。')).toBeTruthy();
-    expect(screen.getByText(/Guest OS 不会升级/)).toBeTruthy();
-    expect(screen.getByText(/原先已停止的虚拟机保持停止/)).toBeTruthy();
-    expect(screen.getByRole('button', { name: '前往容器电源操作' })).toBeTruthy();
+    expect(row('blocked').getByText('已阻断 · 待恢复')).toBeTruthy();
+    expect(row('宿主甲').getByText('已恢复来源包')).toBeTruthy();
+    fireEvent.click(button('升级 Cube'));
+    expect(screen.queryByRole('radio', { name: '升级 blocked' })).toBeNull();
+    const radio = screen.getByRole<HTMLInputElement>('radio', { name: '升级 宿主甲' });
+    fireEvent.click(radio);
+    const toolbar = scope('升级范围');
+    const pair = toolbar.getByLabelText<HTMLSelectElement>('兼容运行包对');
+    fireEvent.change(pair, { target: { value: alternate.id } });
+    const upgrade = toolbar.getByRole<HTMLButtonElement>('button', { name: '升级' });
+    fireEvent.click(upgrade);
+    expect((await toolbar.findByRole('alert')).textContent).toBe('虚拟机尚未停止');
+    await waitFor(() => expect(upgrade.disabled).toBe(false));
+    expect(radio.checked).toBe(true);
+    expect(pair.value).toBe(alternate.id);
+    expectPost(posts(), 'fresh', alternate.id);
   });
 
-  it.runIf(CVM_ENABLED)('取消未执行的发布，缺少宿主证据时不批准', async () => {
-    const now = Math.floor(Date.now() / 1_000);
+  it.each(['preparing', 'ready'] as const)('从 %s 行直接取消，之后按最新观测恢复入口', async status => {
+    if (!CVM_ENABLED) return;
+    const now = currentTime();
     const data = view(now);
-    data.releases = [release(now, { node_id: 'no-evidence' })];
-    const { stackRequests } = mount('system-admin', (_url, init) => {
+    data.releases = [release(now, { status })];
+    const { posts } = mount('system-admin', (_url, init) => {
       if (init?.method !== 'POST') return Response.json(data);
       const cancelled = { ...data.releases[0], status: 'cancelled' } as const;
       data.releases = [cancelled];
       return Response.json(cancelled);
     });
     await openTab();
-    expect(screen.getByText('宿主安装状态未知')).toBeTruthy();
-    expect(screen.getByRole<HTMLButtonElement>('button', { name: '批准冷切换' }).disabled).toBe(true);
-    fireEvent.click(screen.getByRole('button', { name: '取消发布' }));
-    fireEvent.click(
-      within(screen.getByRole('dialog', { name: '取消发布 #17' })).getByRole('button', { name: '确认取消发布' }),
-    );
-    await screen.findByText('已取消');
-    expect(stackRequests().filter(([, init]) => init?.method === 'POST')).toEqual([
-      [`${path}/17/cancel`, { method: 'POST', credentials: 'same-origin', headers: {} }],
-    ]);
+    expect(row('宿主甲').getByText('准备中')).toBeTruthy();
+    expect(button('升级 Cube').getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(button('取消发布 #17'));
+    await screen.findByText('#17 已取消');
+    expect(button('升级 Cube').getAttribute('aria-disabled')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(posts()).toEqual([[`${path}/17/cancel`, { method: 'POST', credentials: 'same-origin', headers: {} }]]);
   });
 
-  it.runIf(CVM_ENABLED)('服务端拒绝后隐藏缓存的发布证据和写操作', async () => {
-    const now = Math.floor(Date.now() / 1_000);
+  it.runIf(CVM_ENABLED)('运行中无取消入口，冷切换后须观测确认目标才能提示恢复电源', async () => {
+    const now = currentTime();
+    const data = view(now);
+    data.releases = [
+      release(now, { status: 'applying' }),
+      release(now, { id: 16, node_id: 'no-evidence', status: 'preparing' }),
+    ];
+    const { refetch } = mount('system-admin', () => Response.json(data));
+    await openTab();
+    expect(row('宿主甲').getByText('切换中')).toBeTruthy();
+    expect(row('宿主甲').queryByRole('button', { name: /取消发布/ })).toBeNull();
+    expect(row('no-evidence').getByText('宿主安装状态未知')).toBeTruthy();
+    data.releases[0] = release(now, { status: 'succeeded' });
+    await refetch();
+    await screen.findByText('当前观测尚未确认安装包摘要与目标包一致。');
+    expect(screen.queryByRole('button', { name: '前往容器电源操作' })).toBeNull();
+    data.hosts[0] = { ...installed(now), bundle_sha256: target };
+    await refetch();
+    await screen.findByText('仅启动维护前运行的虚拟机，逐台验证 VM Shim 冷启动。');
+    expect(row('宿主甲').getByText('已一致')).toBeTruthy();
+    expect(button('前往容器电源操作')).toBeTruthy();
+  });
+
+  it.runIf(CVM_ENABLED)('历史展开后才读取终态摘要，保留顺序且不随后台概览读取', async () => {
+    const now = currentTime();
+    const data = view(now);
+    data.releases = [release(now)];
+    const records = [
+      release(now, { id: 16, status: 'recovered', roots_sha256: shim, error: '卷根校验失败' }),
+      release(now, { id: 15, status: 'succeeded', source_sha256: null, node_id: 'empty-xfs' }),
+    ];
+    const { refetch, stackRequests } = mount('system-admin', url => Response.json(url === path ? data : records));
+    await openTab();
+    expect(stackRequests().map(([url]) => url)).toEqual([path]);
+    fireEvent.click(button('发布历史'));
+    const history = within(screen.getByRole('region', { name: '运行栈发布记录' }));
+    await history.findByRole('button', { name: /#16/ });
+    expect(history.getAllByRole('listitem').map(item => item.textContent?.match(/#\d+/)?.[0])).toEqual(['#16', '#15']);
+    fireEvent.click(history.getByRole('button', { name: /#16/ }));
+    expect(history.getByText('目标包 SHA-256')).toBeTruthy();
+    expect(history.getByText(target)).toBeTruthy();
+    expect(history.getByText(shim)).toBeTruthy();
+    expect(history.getByText('卷根校验失败')).toBeTruthy();
+    expect(history.queryByRole('button', { name: /取消发布/ })).toBeNull();
+    await refetch();
+    expect(stackRequests().map(([url]) => url)).toEqual([path, `${path}/history`, path]);
+    fireEvent.click(button('收起发布历史'));
+    expect(history.queryByRole('button', { name: /#16/ })).toBeNull();
+  });
+
+  it.runIf(CVM_ENABLED)('服务端拒绝后隐藏缓存的发布证据、历史和写入口', async () => {
+    const now = currentTime();
     const data = view(now);
     data.releases = [release(now)];
     let allowed = true;
-    const { client } = mount('system-admin', () =>
+    const { refetch } = mount('system-admin', () =>
       allowed ? Response.json(data) : Response.json({ error: 'forbidden' }, { status: 403 }),
     );
     await openTab();
-    expect(screen.getByText('待批准')).toBeTruthy();
+    expect(screen.getByText('准备中')).toBeTruthy();
     allowed = false;
-    await client.refetchQueries({ queryKey: ['cvm-stack-releases'] });
+    await refetch();
     await waitFor(() => expect(screen.getByRole('alert').textContent).toBe('当前账号不能查看这项内容'));
-    expect(screen.queryByText('待批准')).toBeNull();
-    expect(screen.queryByRole('button', { name: '批准冷切换' })).toBeNull();
+    expect(screen.queryByText('准备中')).toBeNull();
+    expect(screen.queryByRole('button', { name: '发布历史' })).toBeNull();
+    expect(button('升级 Cube').getAttribute('aria-disabled')).toBe('true');
   });
 });

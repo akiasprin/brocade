@@ -39,13 +39,28 @@ pub struct StackHost {
     pub observed_at: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalArtifact {
+    pair_id: String,
+    source: Option<StackInstalled>,
+    target: StackInstalled,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredArtifact {
+    Signed(SignedStackPair),
+    History(HistoricalArtifact),
+}
+
 struct Attempt {
     id: i64,
     node_id: String,
     tenant_id: String,
-    artifact: sqlx::types::Json<SignedStackPair>,
+    artifact: sqlx::types::Json<StoredArtifact>,
     status: String,
-    expires_at: i64,
+    start_deadline_at: i64,
     roots_sha256: Option<String>,
     error: Option<String>,
 }
@@ -58,7 +73,7 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for Attempt {
             tenant_id: row.try_get("tenant_id")?,
             artifact: row.try_get("artifact")?,
             status: row.try_get("status")?,
-            expires_at: row.try_get("expires_at")?,
+            start_deadline_at: row.try_get("start_deadline_at")?,
             roots_sha256: row.try_get("roots_sha256")?,
             error: row.try_get("error")?,
         })
@@ -70,32 +85,76 @@ impl Attempt {
         Ok(serde_json::from_value(self.status.clone().into())?)
     }
 
+    fn signed(&self) -> Result<&SignedStackPair> {
+        match &self.artifact.0 {
+            StoredArtifact::Signed(artifact) => Ok(artifact),
+            StoredArtifact::History(_) => {
+                Err(invalid("historical Cube stack releases cannot execute"))
+            }
+        }
+    }
+
     fn pair(&self) -> Result<StackPair> {
         // The immutable document was verified against the operator's trust key at admission.
-        let pair: StackPair = serde_json::from_str(&self.artifact.payload)?;
+        let pair: StackPair = serde_json::from_str(&self.signed()?.payload)?;
         pair.validate().map_err(invalid)?;
         Ok(pair)
     }
 
+    fn deadline(&self) -> Result<u64> {
+        u64::try_from(self.start_deadline_at)
+            .map_err(|_| invalid("invalid Cube stack start deadline"))
+    }
+
     fn offer(&self) -> Result<StackOffer> {
+        self.pair()?;
         Ok(StackOffer {
             id: self.id,
-            expires_at: self.expires_at as u64,
+            start_deadline_at: self.deadline()?,
             status: self.status()?,
             roots_sha256: self.roots_sha256.clone(),
-            artifact: self.artifact.0.clone(),
+            artifact: self.signed()?.clone(),
         })
     }
 
     fn release(&self) -> Result<StackRelease> {
-        let pair = self.pair()?;
+        let (pair_id, source_sha256, target_sha256) = match &self.artifact.0 {
+            StoredArtifact::Signed(artifact) => {
+                let pair = self.pair()?;
+                (
+                    sha256_hex(artifact.payload.as_bytes()),
+                    pair.source_sha256,
+                    pair.target_sha256,
+                )
+            }
+            StoredArtifact::History(history) => {
+                if !valid_digest(&history.pair_id)
+                    || !history.target.valid()
+                    || history
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| !source.valid())
+                {
+                    return Err(invalid("invalid historical Cube stack identity"));
+                }
+                (
+                    history.pair_id.clone(),
+                    history
+                        .source
+                        .as_ref()
+                        .map(|source| source.bundle_sha256.clone()),
+                    history.target.bundle_sha256.clone(),
+                )
+            }
+        };
         Ok(StackRelease {
             id: self.id,
             node_id: self.node_id.clone(),
-            source_sha256: pair.source_sha256,
-            target_sha256: pair.target_sha256,
+            pair_id,
+            source_sha256,
+            target_sha256,
             status: self.status()?,
-            expires_at: self.expires_at as u64,
+            start_deadline_at: self.deadline()?,
             error: self.error.clone(),
             roots_sha256: self.roots_sha256.clone(),
         })
@@ -110,12 +169,16 @@ impl PgStore {
         require_admin(actor)?;
         let mut tx = begin(self).await?;
         sqlx::query(
-            "WITH expired AS (
+            "WITH scoped AS (
+                SELECT r.id FROM cvm_stack_releases r LEFT JOIN nodes n ON n.id=r.node_id
+                WHERE r.status IN ('preparing','ready')
+                  AND ($1::text IS NULL OR coalesce(n.tenant_id,r.tenant_id)=$1
+                                         OR coalesce(n.tenant_id,r.tenant_id) LIKE $2)
+            ), expired AS (
                 UPDATE cvm_stack_releases r SET status='cancelled', error=$3
-                WHERE r.expires_at <= floor(extract(epoch FROM clock_timestamp()))
-                  AND r.status IN ('preparing','ready','approved')
-                  AND ($1::text IS NULL OR r.tenant_id=$1 OR r.tenant_id LIKE $2)
-                RETURNING id, roots_sha256
+                FROM scoped s WHERE r.id=s.id
+                  AND r.start_deadline_at <= floor(extract(epoch FROM clock_timestamp()))
+                RETURNING r.id, r.roots_sha256
             ) INSERT INTO cvm_stack_release_events(release_id,actor_kind,actor_id,status,roots_sha256,error)
               SELECT id,'system','expiry','cancelled',roots_sha256,$3 FROM expired",
         )
@@ -134,10 +197,11 @@ impl PgStore {
             "SELECT o.node_id, o.installed, o.installable, floor(extract(epoch FROM o.observed_at))::bigint
              FROM cvm_stack_observations o JOIN nodes n ON n.id=o.node_id
              JOIN node_lifecycle_state l ON l.node_id=n.id AND l.phase='active'
-             LEFT JOIN node_agent_state a ON a.node_id=n.id
+             JOIN node_agent_state a ON a.node_id=n.id
              WHERE n.retired_at IS NULL
                AND o.observed_at >= clock_timestamp()-$3*interval '1 second'
-               AND (o.installable IS NULL OR o.observed_at >= a.token_created_at)
+               AND o.observed_at >= a.token_created_at
+               AND a.token_hash IS NOT NULL AND a.token_revoked_at IS NULL
                AND ($1::text IS NULL OR n.tenant_id=$1 OR n.tenant_id LIKE $2)
              ORDER BY o.node_id",
         )
@@ -147,11 +211,11 @@ impl PgStore {
         .fetch_all(&mut *tx)
         .await?;
         let attempts = sqlx::query_as::<_, Attempt>(
-            "SELECT r.* FROM cvm_stack_releases r LEFT JOIN nodes n ON n.id=r.node_id
+            "SELECT DISTINCT ON (r.node_id) r.* FROM cvm_stack_releases r LEFT JOIN nodes n ON n.id=r.node_id
              WHERE ($1::text IS NULL OR coalesce(n.tenant_id,r.tenant_id)=$1
                                      OR coalesce(n.tenant_id,r.tenant_id) LIKE $2)
-             ORDER BY (r.status IN ('preparing','ready','approved','applying','blocked')) DESC, r.id DESC
-             LIMIT 256",
+               AND (n.retired_at IS NULL AND n.id IS NOT NULL OR r.status IN ('preparing','ready','applying','blocked'))
+             ORDER BY r.node_id, r.id DESC",
         )
         .bind(actor.tenant_scope())
         .bind(actor.tenant_scope_like_pattern())
@@ -175,13 +239,28 @@ impl PgStore {
         ))
     }
 
+    pub async fn cvm_stack_history(&self, actor: &AdminContext) -> Result<Vec<StackRelease>> {
+        require_admin(actor)?;
+        let attempts = sqlx::query_as::<_, Attempt>(
+            "SELECT r.* FROM cvm_stack_releases r LEFT JOIN nodes n ON n.id=r.node_id
+             WHERE ($1::text IS NULL OR coalesce(n.tenant_id,r.tenant_id)=$1
+                                     OR coalesce(n.tenant_id,r.tenant_id) LIKE $2)
+               AND r.status IN ('succeeded','failed','recovered','cancelled')
+             ORDER BY r.id DESC LIMIT 256",
+        )
+        .bind(actor.tenant_scope())
+        .bind(actor.tenant_scope_like_pattern())
+        .fetch_all(&self.pool)
+        .await?;
+        attempts.iter().map(Attempt::release).collect()
+    }
+
     /// Called only with an Ed25519 document verified by Console. The offer keeps its exact bytes.
     pub async fn create_cvm_stack_release(
         &self,
         actor: &AdminContext,
         node: &str,
         verified: VerifiedStackPair,
-        expires_at: u64,
     ) -> Result<StackRelease> {
         require_admin(actor)?;
         if node.is_empty() || node.len() > 150 {
@@ -191,26 +270,20 @@ impl PgStore {
         let mut tx = begin(self).await?;
         let tenant = host(&mut tx, node).await?;
         require_scope(actor, &tenant)?;
-        let now = now(&mut tx).await?;
-        if !(now < expires_at
-            && expires_at <= now + MAX_STACK_WINDOW_SECS
-            && expires_at <= pair.expires_at)
-        {
-            return Err(invalid("invalid Cube stack maintenance window"));
-        }
         expire_node(&mut tx, node).await?;
         if open_attempt(&mut tx, node).await?.is_some() {
             return Err(conflict("the host already has an open Cube stack release"));
         }
         check_claimable(&mut tx, node, &pair).await?;
         let entry = sqlx::query_as::<_, Attempt>(
-            "INSERT INTO cvm_stack_releases(node_id,tenant_id,artifact,status,expires_at)
-             VALUES($1,$2,$3,'preparing',$4) RETURNING *",
+            "INSERT INTO cvm_stack_releases(node_id,tenant_id,artifact,status,created_at,start_deadline_at)
+             SELECT $1,$2,$3,'preparing',instant,floor(extract(epoch FROM instant))::bigint+$4
+             FROM (SELECT clock_timestamp() AS instant) AS created RETURNING *",
         )
         .bind(node)
         .bind(tenant)
         .bind(sqlx::types::Json(artifact))
-        .bind(expires_at as i64)
+        .bind(STACK_MAINTENANCE_WINDOW_SECS as i64)
         .fetch_one(&mut *tx)
         .await?;
         audit(&mut tx, &entry, "admin", actor.operator_id()).await?;
@@ -218,27 +291,10 @@ impl PgStore {
         entry.release()
     }
 
-    pub async fn approve_cvm_stack_release(
-        &self,
-        actor: &AdminContext,
-        id: i64,
-    ) -> Result<StackRelease> {
-        self.edit_cvm_stack_release(actor, id, true).await
-    }
-
     pub async fn cancel_cvm_stack_release(
         &self,
         actor: &AdminContext,
         id: i64,
-    ) -> Result<StackRelease> {
-        self.edit_cvm_stack_release(actor, id, false).await
-    }
-
-    async fn edit_cvm_stack_release(
-        &self,
-        actor: &AdminContext,
-        id: i64,
-        approve: bool,
     ) -> Result<StackRelease> {
         require_admin(actor)?;
         let mut tx = begin(self).await?;
@@ -252,32 +308,10 @@ impl PgStore {
             entry = attempt(&mut tx, id).await?;
         }
         let status = entry.status()?;
-        let deadline = entry.expires_at as u64;
-        if approve && status == StackReleaseStatus::Ready {
-            check_claimable(&mut tx, &entry.node_id, &entry.pair()?).await?;
-            if deadline <= now(&mut tx).await? {
-                expire_node(&mut tx, &entry.node_id).await?;
-                tx.commit().await?;
-                return Err(conflict(EXPIRED));
-            }
-            entry = transition(
-                &mut tx,
-                &entry,
-                "approved",
-                entry.roots_sha256.as_deref(),
-                None,
-                "admin",
-                actor.operator_id(),
-            )
-            .await?;
-        } else if !approve
-            && matches!(
-                status,
-                StackReleaseStatus::Preparing
-                    | StackReleaseStatus::Ready
-                    | StackReleaseStatus::Approved
-            )
-        {
+        if matches!(
+            status,
+            StackReleaseStatus::Preparing | StackReleaseStatus::Ready
+        ) {
             entry = transition(
                 &mut tx,
                 &entry,
@@ -288,10 +322,7 @@ impl PgStore {
                 actor.operator_id(),
             )
             .await?;
-        } else if !matches!(
-            (approve, status),
-            (true, StackReleaseStatus::Approved) | (false, StackReleaseStatus::Cancelled)
-        ) {
+        } else if status != StackReleaseStatus::Cancelled {
             tx.commit().await?;
             return Err(conflict(
                 "the Cube stack release is not in the required state",
@@ -335,11 +366,31 @@ impl PgStore {
         expire_node(&mut tx, node).await?;
         let mut entry = open_attempt(&mut tx, node).await?;
         if let (Some(current), Some(report)) = (&entry, &poll.report) {
-            if let Some((status, roots, error)) =
+            if let Some((mut status, mut roots, mut error)) =
                 report_transition(current, report, poll.installed.as_ref(), installable)?
             {
-                entry =
-                    Some(transition(&mut tx, current, status, roots, error, "agent", node).await?);
+                if status == "ready" {
+                    // Don't set the fence if another operation got in while the Agent was staging.
+                    match check_claimable(&mut tx, node, &current.pair()?).await {
+                        Ok(()) => {}
+                        Err(StoreError::Conflict(_) | StoreError::NotFound(_)) => {
+                            status = "failed";
+                            roots = None;
+                            error = Some("Cube stack host changed during preflight");
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    if current.deadline()? <= now(&mut tx).await? {
+                        expire_node(&mut tx, node).await?;
+                        tx.commit().await?;
+                        return Ok(None);
+                    }
+                }
+                if status != "cancelled" || current.deadline()? <= now(&mut tx).await? {
+                    entry = Some(
+                        transition(&mut tx, current, status, roots, error, "agent", node).await?,
+                    );
+                }
             }
         }
         let offer = match &entry {
@@ -348,7 +399,6 @@ impl PgStore {
                     entry.status()?,
                     StackReleaseStatus::Preparing
                         | StackReleaseStatus::Ready
-                        | StackReleaseStatus::Approved
                         | StackReleaseStatus::Applying
                         | StackReleaseStatus::Blocked
                 ) =>
@@ -381,18 +431,18 @@ impl PgStore {
         let status = entry.status()?;
         if !matches!(
             status,
-            StackReleaseStatus::Approved | StackReleaseStatus::Applying
+            StackReleaseStatus::Ready | StackReleaseStatus::Applying
         ) || entry.roots_sha256.as_deref() != Some(&claim.roots_sha256)
         {
             tx.commit().await?;
             return Err(conflict(
-                "the Cube stack release is not approved for these roots",
+                "the Cube stack release is not ready for these roots",
             ));
         }
         // Never expire or reacquire an in-flight lease. A lost response replays the same offer.
-        if status == StackReleaseStatus::Approved {
+        if status == StackReleaseStatus::Ready {
             check_claimable(&mut tx, node, &entry.pair()?).await?;
-            if entry.expires_at as u64 <= now(&mut tx).await? {
+            if entry.deadline()? <= now(&mut tx).await? {
                 expire_node(&mut tx, node).await?;
                 tx.commit().await?;
                 return Err(conflict(EXPIRED));
@@ -421,7 +471,7 @@ impl PgStore {
         let pair = entry.pair()?;
         if entry.status()? != StackReleaseStatus::Preparing
             || pair.target_sha256 != digest
-            || entry.expires_at as u64 <= now(&mut tx).await?
+            || entry.deadline()? <= now(&mut tx).await?
         {
             return Err(missing());
         }
@@ -499,7 +549,7 @@ async fn attempt(tx: &mut Transaction<'_, Postgres>, id: i64) -> Result<Attempt>
 
 async fn open_attempt(tx: &mut Transaction<'_, Postgres>, node: &str) -> Result<Option<Attempt>> {
     Ok(sqlx::query_as::<_, Attempt>(
-        "SELECT * FROM cvm_stack_releases WHERE node_id=$1 AND status IN ('preparing','ready','approved','applying','blocked')",
+        "SELECT * FROM cvm_stack_releases WHERE node_id=$1 AND status IN ('preparing','ready','applying','blocked')",
     )
     .bind(node)
     .fetch_optional(&mut **tx)
@@ -510,8 +560,8 @@ async fn expire_node(tx: &mut Transaction<'_, Postgres>, node: &str) -> Result<b
     Ok(sqlx::query(
         "WITH expired AS (
             UPDATE cvm_stack_releases SET status='cancelled', error=$2
-            WHERE node_id=$1 AND expires_at <= floor(extract(epoch FROM clock_timestamp()))
-               AND status IN ('preparing','ready','approved')
+            WHERE node_id=$1 AND start_deadline_at <= floor(extract(epoch FROM clock_timestamp()))
+               AND status IN ('preparing','ready')
             RETURNING id, roots_sha256
          ) INSERT INTO cvm_stack_release_events(release_id,actor_kind,actor_id,status,roots_sha256,error)
            SELECT id,'system','expiry','cancelled',roots_sha256,$2 FROM expired",
@@ -597,6 +647,20 @@ fn report_transition<'a>(
             ("ready", roots, None)
         }
         (Preparing, Failed) => ("failed", None, Some("Cube stack preparation failed")),
+        (Ready, Failed) if claimed_roots => (
+            "failed",
+            roots,
+            Some("Cube stack preflight evidence changed"),
+        ),
+        (Applying, Cancelled)
+            if claimed_roots && matches_preflight(&pair, installed, installable) =>
+        {
+            (
+                "cancelled",
+                roots,
+                Some("Cube stack maintenance window expired before activation"),
+            )
+        }
         (Applying, Failed)
             if fresh && claimed_roots && matches_preflight(&pair, installed, installable) =>
         {
@@ -655,7 +719,7 @@ async fn check_observation(
             "SELECT o.installed,o.installable FROM cvm_stack_observations o
              JOIN node_agent_state a ON a.node_id=o.node_id
              WHERE o.node_id=$1 AND o.observed_at >= clock_timestamp()-$2*interval '1 second'
-               AND (NOT $3 OR o.observed_at >= a.token_created_at)",
+               AND o.observed_at >= a.token_created_at",
         )
         .bind(node)
         .bind(STACK_OBSERVATION_MAX_AGE_SECS as i64)
@@ -858,7 +922,6 @@ mod tests {
             source_shim_sha256: Some("d".repeat(64)),
             target_cubelet_sha256: "e".repeat(64),
             target_shim_sha256: "f".repeat(64),
-            expires_at: 100,
         };
         let roots = "1".repeat(64);
         let mut entry = attempt_from(&pair, "applying", Some(roots.clone()));
@@ -1006,7 +1069,6 @@ mod tests {
             source_shim_sha256: None,
             target_cubelet_sha256: "e".repeat(64),
             target_shim_sha256: "f".repeat(64),
-            expires_at: 100,
         }
     }
 
@@ -1047,17 +1109,33 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn converted_history_is_visible_but_never_executable() {
+        let pair = install_pair();
+        let mut attempt = attempt_from(&pair, "succeeded", None);
+        let pair_id = "a".repeat(64);
+        attempt.artifact.0 = serde_json::from_value(serde_json::json!({
+            "pair_id": pair_id, "source": null, "target": pair.target(),
+        }))
+        .unwrap();
+        let release = attempt.release().unwrap();
+        assert_eq!(release.pair_id, pair_id);
+        assert_eq!(release.target_sha256, pair.target_sha256);
+        assert!(attempt.offer().is_err());
+        assert!(attempt.pair().is_err());
+    }
+
     fn attempt_from(pair: &StackPair, status: &str, roots_sha256: Option<String>) -> Attempt {
         Attempt {
             id: 7,
             node_id: "host".into(),
             tenant_id: "tenant".into(),
             status: status.into(),
-            artifact: sqlx::types::Json(SignedStackPair {
+            artifact: sqlx::types::Json(StoredArtifact::Signed(SignedStackPair {
                 payload: serde_json::to_string(pair).unwrap(),
                 signature: String::new(),
-            }),
-            expires_at: 90,
+            })),
+            start_deadline_at: 90,
             roots_sha256,
             error: None,
         }

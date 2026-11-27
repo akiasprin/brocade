@@ -18,6 +18,8 @@ MAX_BODY = 16 * 1024 * 1024
 MAX_STACK_BUNDLE = 8 * 1024**3
 STACK_BUNDLE = re.compile(r'/agent/v1/cvm/stack-bundles/([a-f0-9]{64})')
 STACK_POLL = '/agent/v1/cvm/stack-releases/poll'
+STACK_CLAIM = re.compile(r'/agent/v1/cvm/stack-releases/([1-9][0-9]{0,18})/claim')
+STACK_ROOTS = re.compile(r'[a-f0-9]{64}')
 
 
 def main():
@@ -143,6 +145,17 @@ def main():
                 if node and bundle and stack_download.get('node') == node and stack_download.get('sha256') == bundle[1]:
                     if stack_download.get('mode') in ('hash', 'size'):
                         mode = stack_download['mode']
+                claim = STACK_CLAIM.fullmatch(self.path) if self.command == 'POST' else None
+                if claim and node and node in control.get('hold_stack_claim', []):
+                    try:
+                        request = json.loads(body)
+                    except ValueError:
+                        request = None
+                    roots = request.get('roots_sha256') if isinstance(request, dict) else None
+                    if isinstance(roots, str) and STACK_ROOTS.fullmatch(roots):
+                        proof = {'id': int(claim[1]), 'path': self.path, 'roots_sha256': roots}
+                        private(root / (node + '-stack-claim.summary.json'), json.dumps(proof).encode())
+                        return self.respond(503, b'owned lab stack claim unavailable')
                 receipt_gate = control.get('hold_stack_report') or {}
                 if self.command == 'POST' and self.path == STACK_POLL and node and receipt_gate.get('node') == node:
                     try:

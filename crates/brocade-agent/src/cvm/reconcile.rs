@@ -51,6 +51,13 @@ pub(super) fn round(options: &Options, cursor: &mut usize) -> Result<bool, Strin
     let client = HttpClient::new(&options.server)?;
     let configured = super::backend::configured()?;
     let backend = super::backend::get();
+    #[cfg(target_os = "linux")]
+    let inspect_claim = configured
+        && backend.is_err()
+        && !super::virtualization_pending()?
+        && super::stack::awaiting_claim()?;
+    #[cfg(not(target_os = "linux"))]
+    let inspect_claim = false;
     let mut inventory = InventoryReport {
         capabilities: Capabilities::default(),
         error: None,
@@ -74,6 +81,14 @@ pub(super) fn round(options: &Options, cursor: &mut usize) -> Result<bool, Strin
                 }
                 Err(error) => inventory.error = Some(error),
             },
+            Err(_) if inspect_claim => {
+                // Console rechecks live Cube health at claim. Observe it without
+                // opening the executor or allowing work past the local fence.
+                match super::backend::inspect(&super::backend::config_path()?) {
+                    Ok(capabilities) => inventory.capabilities = capabilities,
+                    Err(error) => inventory.error = Some(error),
+                }
+            }
             Err(error) if configured => inventory.error = Some(error.clone()),
             Err(_) => {}
         }
@@ -108,7 +123,7 @@ pub(super) fn round(options: &Options, cursor: &mut usize) -> Result<bool, Strin
             }
         }
     }
-    if options.apply_mode == ApplyMode::Linux && super::maintenance()? {
+    if options.apply_mode == ApplyMode::Linux && (inspect_claim || super::maintenance()?) {
         return Ok(false);
     }
     let quota_error = if inventory.error.is_none() && inventory.capabilities.network_quota.is_some()
