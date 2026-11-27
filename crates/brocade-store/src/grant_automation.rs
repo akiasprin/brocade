@@ -256,28 +256,28 @@ pub(crate) async fn cancel_revision_jobs_tx(
 /// whether a configuration release or another grants release is in front of it.  The timer retries
 /// it, while an HTTP-side wake makes the usual path immediate.
 pub async fn process_jobs(pool: &PgPool) -> Result<GrantAutomationOutcome> {
-    let mut guard = pool.begin().await?;
+    let mut tx = pool.begin().await?;
     let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
         .bind(WORKER_LOCK_KEY)
-        .fetch_one(&mut *guard)
+        .fetch_one(&mut *tx)
         .await?;
     if !locked {
-        guard.rollback().await?;
+        tx.rollback().await?;
         return Ok(GrantAutomationOutcome {
             waiting: Some("另一实例正在处理自动授权队列".to_owned()),
             ..Default::default()
         });
     }
 
-    // Keep the transaction (and therefore the cross-instance lock) open while planning and
-    // creating through the pool.  The production pool has spare connections; no model row is
-    // locked by this guard transaction.
-    let outcome = process_jobs_locked(pool).await;
-    guard.commit().await?;
-    outcome
+    // Keep the worker lock, deployment isolation, planning and outbox completion on this one
+    // connection. Holding either lock while asking the same bounded pool for another connection
+    // can exhaust the pool with every waiter preventing the lock owner from making progress.
+    let outcome = process_jobs_locked(&mut tx).await?;
+    tx.commit().await?;
+    Ok(outcome)
 }
 
-async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
+async fn process_jobs_locked(tx: &mut Transaction<'_, Postgres>) -> Result<GrantAutomationOutcome> {
     // A deadline controls when to try the queue, not which historical intent may be applied.
     // Include backed-off rows once any job is due: otherwise a newer edit can finish first and
     // a delayed older revision can later restore permissions the operator already revoked.
@@ -300,7 +300,7 @@ async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
          ORDER BY id",
     )
     .bind(JOB_KIND)
-    .fetch_all(pool)
+    .fetch_all(&mut **tx)
     .await?;
     if rows.is_empty() {
         return Ok(GrantAutomationOutcome::default());
@@ -343,8 +343,17 @@ async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
     } else {
         GRANTS_AUTOMATION_ACTOR
     });
+
+    // Match ordinary deployment lock order: synchronize with stack maintenance before deployment
+    // isolation. At Read Committed the planning statements below take their snapshots after these
+    // waits, avoiding the stale snapshot that Repeatable Read would establish while waiting.
+    crate::resource_coordination::synchronize_stack_claim(tx).await?;
+    deployment::lock_deployment_isolation_tx(tx).await?;
+    sqlx::query("SAVEPOINT grant_automation_create")
+        .execute(&mut **tx)
+        .await?;
     let prepared = match deployment::create_automatic_grants_deployment(
-        pool,
+        tx,
         &actor,
         revision_id,
         &note,
@@ -353,8 +362,14 @@ async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
     {
         Ok(prepared) => prepared,
         Err(error) => {
+            // A PostgreSQL statement error aborts the transaction until the savepoint is rolled
+            // back. Keep retry bookkeeping on this connection too; if the connection itself
+            // failed, this rollback fails and the outer transaction leaves the jobs untouched.
+            sqlx::query("ROLLBACK TO SAVEPOINT grant_automation_create")
+                .execute(&mut **tx)
+                .await?;
             let message = format!("创建自动授权单失败，稍后重试：{error}");
-            reschedule(pool, &job_ids, &message).await?;
+            reschedule(tx, &job_ids, &message).await?;
             return Ok(waiting_outcome(
                 job_ids.len(),
                 revision_id,
@@ -365,8 +380,13 @@ async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
     };
 
     if let Some(active) = prepared.blocked_by {
+        // Planning may have tentatively rebased pending configuration targets before discovering
+        // the blocker. Preserve the previous behavior: none of those writes survive a waiting run.
+        sqlx::query("ROLLBACK TO SAVEPOINT grant_automation_create")
+            .execute(&mut **tx)
+            .await?;
         let message = format!("等待授权单 #{active} 落地后再规划");
-        requeue_behind(pool, &job_ids, &message).await?;
+        requeue_behind(tx, &job_ids, &message).await?;
         return Ok(GrantAutomationOutcome {
             merged_jobs: job_ids.len(),
             revision_id: Some(revision_id),
@@ -377,11 +397,14 @@ async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
     }
 
     if !prepared.deferred.is_empty() {
+        sqlx::query("RELEASE SAVEPOINT grant_automation_create")
+            .execute(&mut **tx)
+            .await?;
         let message = format!(
             "权限与执行中的配置冲突，等待配置：{}",
             prepared.deferred.join("、")
         );
-        reschedule(pool, &job_ids, &message).await?;
+        reschedule(tx, &job_ids, &message).await?;
         return Ok(GrantAutomationOutcome {
             merged_jobs: job_ids.len(),
             revision_id: Some(revision_id),
@@ -391,7 +414,22 @@ async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
         });
     }
 
-    finish(pool, &job_ids, prepared.deployment_id, revision_id).await?;
+    if let Err(error) = finish(tx, &job_ids, prepared.deployment_id, revision_id).await {
+        sqlx::query("ROLLBACK TO SAVEPOINT grant_automation_create")
+            .execute(&mut **tx)
+            .await?;
+        let message = format!("完成自动授权单失败，稍后重试：{error}");
+        reschedule(tx, &job_ids, &message).await?;
+        return Ok(waiting_outcome(
+            job_ids.len(),
+            revision_id,
+            Vec::new(),
+            message,
+        ));
+    }
+    sqlx::query("RELEASE SAVEPOINT grant_automation_create")
+        .execute(&mut **tx)
+        .await?;
     Ok(GrantAutomationOutcome {
         merged_jobs: job_ids.len(),
         revision_id: Some(revision_id),
@@ -416,50 +454,57 @@ fn waiting_outcome(
     }
 }
 
-async fn reschedule(pool: &PgPool, job_ids: &[i64], error: &str) -> Result<()> {
+async fn reschedule(
+    tx: &mut Transaction<'_, Postgres>,
+    job_ids: &[i64],
+    error: &str,
+) -> Result<()> {
     sqlx::query(
         "UPDATE jobs
          SET status = 'queued',
              attempts = attempts + 1,
-             run_after = now() + $2::interval,
+             run_after = clock_timestamp() + $2::interval,
              last_error = $3,
-             updated_at = now()
+             updated_at = clock_timestamp()
          WHERE id = ANY($1)",
     )
     .bind(job_ids)
     .bind(RETRY_INTERVAL)
     .bind(error)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
 /// Put jobs back behind an unsettled grants deployment. That is ordering, not a failed attempt:
 /// `attempts` stays unchanged, so the status reads "pending" rather than "retrying".
-async fn requeue_behind(pool: &PgPool, job_ids: &[i64], reason: &str) -> Result<()> {
+async fn requeue_behind(
+    tx: &mut Transaction<'_, Postgres>,
+    job_ids: &[i64],
+    reason: &str,
+) -> Result<()> {
     sqlx::query(
         "UPDATE jobs
          SET status = 'queued',
-             run_after = now() + $2::interval,
+             run_after = clock_timestamp() + $2::interval,
              last_error = $3,
-             updated_at = now()
+             updated_at = clock_timestamp()
          WHERE id = ANY($1)",
     )
     .bind(job_ids)
     .bind(RETRY_INTERVAL)
     .bind(reason)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
 async fn finish(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     job_ids: &[i64],
     deployment_id: Option<i64>,
     revision_id: u64,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE jobs
          SET status = 'succeeded',
@@ -469,12 +514,12 @@ async fn finish(
                  WHEN $2::bigint IS NULL THEN payload
                  ELSE jsonb_set(payload, '{deployment_id}', to_jsonb($2::bigint), TRUE)
              END,
-             updated_at = now()
+             updated_at = clock_timestamp()
          WHERE id = ANY($1)",
     )
     .bind(job_ids)
     .bind(deployment_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     if let Some(deployment_id) = deployment_id {
         let activated = sqlx::query_scalar::<_, bool>(
@@ -484,15 +529,14 @@ async fn finish(
               FOR UPDATE",
         )
         .bind(deployment_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .unwrap_or(false);
         if activated {
-            crate::serving::activate_deployment_tx(&mut tx, deployment_id).await?;
+            crate::serving::activate_deployment_tx(tx, deployment_id).await?;
         }
     } else {
-        crate::serving::activate_permissions_revision_tx(&mut tx, revision_id).await?;
+        crate::serving::activate_permissions_revision_tx(tx, revision_id).await?;
     }
-    tx.commit().await?;
     Ok(())
 }

@@ -619,6 +619,52 @@ async fn create_from_plan_tx(
         });
     }
 
+    if request.kind == DeploymentKind::Config
+        && plan
+            .targets
+            .iter()
+            .any(|target| target.actions.contains(&PlannedAction::ApplyXray))
+    {
+        // A grants order may already be immutable but not yet activated. Lock its deployment row
+        // before the serving row, matching report completion, so a concurrent final report either
+        // finishes first or cannot advance permissions until this decision commits.
+        let active_permissions: Option<i64> = sqlx::query_scalar(
+            "SELECT revision_id
+               FROM deployments
+              WHERE kind = 'grants'
+                AND (
+                    active = TRUE
+                    OR (status = 'succeeded' AND activation_status = 'waiting')
+                )
+              ORDER BY id DESC
+              LIMIT 1
+              FOR SHARE",
+        )
+        .fetch_optional(&mut **tx)
+        .await?;
+        let serving_permissions: Option<i64> = sqlx::query_scalar(
+            "SELECT permissions_revision_id
+               FROM subscription_serving_state
+              WHERE id = TRUE
+              FOR SHARE",
+        )
+        .fetch_optional(&mut **tx)
+        .await?;
+        let requested_revision = revision_to_i64(request.revision_id)?;
+        let latest_permissions = active_permissions
+            .into_iter()
+            .chain(serving_permissions)
+            .max();
+        if let Some(latest_permissions) =
+            latest_permissions.filter(|revision| *revision > requested_revision)
+        {
+            return Err(StoreError::Conflict(format!(
+                "configuration plan revision {} predates active permissions revision {latest_permissions}; replan from the latest revision",
+                request.revision_id
+            )));
+        }
+    }
+
     let affected = plan
         .targets
         .iter()
@@ -1134,34 +1180,39 @@ async fn insert_lifecycle_deployment_tx(
 /// list back. Once a target has been dispatched its snapshot is immutable; an xray-changing target
 /// in that state is returned as a conflict and the durable job retries immediately after it lands.
 pub(crate) async fn create_automatic_grants_deployment(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     actor: &AdminContext,
     revision_id: u64,
     note: &str,
 ) -> Result<AutomaticGrantsDeploymentResult> {
-    // Holding this in a separate transaction is intentional. Taking the advisory lock as the
-    // first statement inside the Repeatable Read transaction would establish its snapshot before
-    // a concurrent isolator finished, so it could still miss the isolation after waiting.
-    let mut isolation_guard = pool.begin().await?;
-    lock_deployment_isolation_tx(&mut isolation_guard).await?;
-    let result = create_automatic_grants_deployment_locked(pool, actor, revision_id, note).await;
-    isolation_guard.commit().await?;
-    result
-}
+    // The caller already owns both the automation lock and deployment isolation on this
+    // transaction. Keep every read and write on that connection: acquiring another pooled
+    // connection while holding either lock can starve the lock owner itself.
+    //
+    // A different active grants order makes all planning provisional. Check it before compiling
+    // snapshots or locking configuration targets; the later check remains authoritative for crash
+    // recovery of an order created from this same revision.
+    if let Some(active) = sqlx::query(
+        "SELECT id, revision_id
+           FROM deployments
+          WHERE active = TRUE AND kind = 'grants'
+          LIMIT 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        let active_revision = revision_to_u64(active.try_get("revision_id")?)?;
+        if active_revision != revision_id {
+            return Ok(AutomaticGrantsDeploymentResult {
+                deployment_id: None,
+                deferred: Vec::new(),
+                blocked_by: Some(active.try_get("id")?),
+            });
+        }
+    }
 
-async fn create_automatic_grants_deployment_locked(
-    pool: &PgPool,
-    actor: &AdminContext,
-    revision_id: u64,
-    note: &str,
-) -> Result<AutomaticGrantsDeploymentResult> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-        .execute(&mut *tx)
-        .await?;
-
-    let latest = materialize::load_snapshot_tx(&mut tx, Some(revision_id)).await?;
-    let applied = load_applied_states(&mut *tx).await?;
+    let latest = materialize::load_snapshot_tx(tx, Some(revision_id)).await?;
+    let applied = load_applied_states(&mut **tx).await?;
     let applied_by_node = applied
         .iter()
         .map(|state| (state.node_id.clone(), state.clone()))
@@ -1192,7 +1243,7 @@ async fn create_automatic_grants_deployment_locked(
          WHERE s.xray_state = 'present'
          ORDER BY s.node_id, d.id DESC",
     )
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
     let running_revision_by_node = running_rows
         .into_iter()
@@ -1203,6 +1254,63 @@ async fn create_automatic_grants_deployment_locked(
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
+
+    // A dirty Xray digest cannot identify the running bytes. Recover the most recent successful
+    // topology and grants snapshots from this lifecycle, but only for nodes still in the effective
+    // serving fleet. This lets us distinguish a relevant uncertain revoke from unrelated drift.
+    let dirty_runtime_rows = sqlx::query(
+        "SELECT applied.node_id,
+                config.revision_id AS config_revision,
+                baseline.desired_grants AS baseline_grants
+           FROM node_applied_state applied
+           JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = applied.node_id
+           JOIN LATERAL (
+               SELECT deployment.revision_id
+                 FROM deployment_target_state state
+                 JOIN deployment_targets target
+                   ON target.deployment_id = state.deployment_id
+                  AND target.node_id = state.node_id
+                 JOIN deployments deployment ON deployment.id = state.deployment_id
+                WHERE state.node_id = applied.node_id
+                  AND state.lifecycle_epoch = lifecycle.lifecycle_epoch
+                  AND deployment.kind = 'config'
+                  AND (target.status = 'succeeded' OR state.cvm_machine_ready)
+                  AND state.desired_structure #>> '{xray,state}' = 'present'
+                ORDER BY deployment.id DESC
+                LIMIT 1
+           ) config ON TRUE
+           JOIN LATERAL (
+               SELECT state.desired_grants
+                 FROM deployment_target_state state
+                 JOIN deployment_targets target
+                   ON target.deployment_id = state.deployment_id
+                  AND target.node_id = state.node_id
+                WHERE state.node_id = applied.node_id
+                  AND state.lifecycle_epoch = lifecycle.lifecycle_epoch
+                  AND (target.status = 'succeeded' OR state.cvm_machine_ready)
+                  AND state.desired_grants->>'state' IN ('present', 'disabled')
+                ORDER BY state.deployment_id DESC
+                LIMIT 1
+           ) baseline ON TRUE
+           LEFT JOIN node_operational_isolations isolation
+             ON isolation.node_id = applied.node_id
+          WHERE applied.xray_state = 'dirty'
+            AND lifecycle.phase IN ('active', 'retiring')
+            AND isolation.node_id IS NULL
+          ORDER BY applied.node_id",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let dirty_runtime = dirty_runtime_rows
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("node_id")?,
+                revision_to_u64(row.try_get("config_revision")?)?,
+                serde_json::from_value::<DesiredGrants>(row.try_get("baseline_grants")?)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     // Lock every non-terminal configuration target before deciding whether it conflicts. Agent
     // claim takes the same target/state locks, so a row cannot cross from pending to dispatched
@@ -1235,7 +1343,7 @@ async fn create_automatic_grants_deployment_locked(
          ORDER BY dt.node_id
          FOR UPDATE OF dt, dts",
     )
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
 
     // An isolated configuration target is no longer active deployment work, but an unclaimed
@@ -1265,7 +1373,7 @@ async fn create_automatic_grants_deployment_locked(
           ORDER BY obligation.node_id
           FOR UPDATE OF obligation",
     )
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
 
     let mut revisions = running_revision_by_node
@@ -1278,6 +1386,9 @@ async fn create_automatic_grants_deployment_locked(
     for row in &config_obligations {
         revisions.insert(revision_to_u64(row.try_get("source_revision_id")?)?);
     }
+    for (_, base_revision, _) in &dirty_runtime {
+        revisions.insert(*base_revision);
+    }
 
     // Compile each distinct topology only once. The permission projection retains that revision's
     // nodes, listeners and Flow, replacing only users and grant relations with the latest ones.
@@ -1287,11 +1398,21 @@ async fn create_automatic_grants_deployment_locked(
         let base = if base_revision == revision_id {
             latest.clone()
         } else {
-            materialize::load_snapshot_tx(&mut tx, Some(base_revision)).await?
+            materialize::load_snapshot_tx(tx, Some(base_revision)).await?
         };
         let projected = crate::serving::permission_projection(base, &latest);
         projected_by_revision.insert(base_revision, projected_grants(projected.clone())?);
         snapshots_by_revision.insert(base_revision, projected);
+    }
+
+    let mut deferred = BTreeSet::new();
+    for (node_id, base_revision, baseline_grants) in dirty_runtime {
+        let desired = projected_by_revision
+            .get(&base_revision)
+            .and_then(|by_node| by_node.get(&node_id));
+        if desired != Some(&baseline_grants) {
+            deferred.insert(node_id);
+        }
     }
 
     let mut desired_now = BTreeMap::<String, DesiredGrants>::new();
@@ -1375,7 +1496,7 @@ async fn create_automatic_grants_deployment_locked(
         .bind(&structure)
         .bind(&future_value)
         .bind(desired_fingerprint)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if updated.rows_affected() != 1 {
             return Err(StoreError::Conflict(format!(
@@ -1397,10 +1518,10 @@ async fn create_automatic_grants_deployment_locked(
         .bind(&node_id)
         .bind(future_value)
         .bind(revision_to_i64(revision_id)?)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         let usage_generation_id = rebase_pending_config_usage_generation_tx(
-            &mut tx,
+            tx,
             source_deployment_id,
             &node_id,
             0,
@@ -1426,12 +1547,11 @@ async fn create_automatic_grants_deployment_locked(
             .bind(generation)
             .bind(source_deployment_id)
             .bind(usage_generation_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
     }
 
-    let mut deferred = BTreeSet::new();
     for row in config_rows {
         let deployment_id: i64 = row.try_get("deployment_id")?;
         let node_id: String = row.try_get("node_id")?;
@@ -1496,10 +1616,10 @@ async fn create_automatic_grants_deployment_locked(
         .bind(&node_id)
         .bind(&future_value)
         .bind(&rebased_structure)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         rebase_pending_config_usage_generation_tx(
-            &mut tx,
+            tx,
             deployment_id,
             &node_id,
             row.try_get("wave")?,
@@ -1510,6 +1630,15 @@ async fn create_automatic_grants_deployment_locked(
                 .expect("every projected revision retains its source snapshot"),
         )
         .await?;
+    }
+
+    // Stack maintenance and deployment claims share the table barrier acquired by the caller.
+    // Leave fenced hosts in the durable job instead of inserting an unclaimable grants target that
+    // would occupy the fleet-wide grants slot and delay healthy hosts.
+    for node_id in desired_now.keys() {
+        if crate::resource_coordination::stack_busy(tx, &[node_id]).await? {
+            deferred.insert(node_id.clone());
+        }
     }
 
     let desired = desired_now
@@ -1532,9 +1661,9 @@ async fn create_automatic_grants_deployment_locked(
         plan_desired_deployment(revision_id, desired, &applied, Vec::new()),
         DeploymentKind::Grants,
     );
-    let isolated = isolated_node_ids(&mut *tx).await?;
+    let isolated = isolated_node_ids(&mut **tx).await?;
     mark_isolated_targets(&mut plan, &isolated);
-    plan.base_revision_id = last_succeeded_revision(&mut *tx, DeploymentKind::Grants).await?;
+    plan.base_revision_id = last_succeeded_revision(&mut **tx, DeploymentKind::Grants).await?;
 
     let idempotency_key = if plan.summary.changed_targets == 0 {
         None
@@ -1543,11 +1672,10 @@ async fn create_automatic_grants_deployment_locked(
         let idempotency_key = format!("grants:auto:{revision_id}:{fingerprint}");
         if let Some(existing) = sqlx::query("SELECT id FROM deployments WHERE idempotency_key = $1")
             .bind(&idempotency_key)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
         {
             let deployment_id = existing.try_get("id")?;
-            tx.commit().await?;
             return Ok(AutomaticGrantsDeploymentResult {
                 deployment_id: Some(deployment_id),
                 deferred: deferred.into_iter().collect(),
@@ -1562,11 +1690,10 @@ async fn create_automatic_grants_deployment_locked(
     // the former would mark this revision serving and the older order would then land over it.
     if let Some(active) =
         sqlx::query("SELECT id FROM deployments WHERE active = TRUE AND kind = 'grants' LIMIT 1")
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
     {
         let blocked_by = active.try_get("id")?;
-        tx.rollback().await?;
         return Ok(AutomaticGrantsDeploymentResult {
             deployment_id: None,
             deferred: deferred.into_iter().collect(),
@@ -1575,7 +1702,6 @@ async fn create_automatic_grants_deployment_locked(
     }
 
     let Some(idempotency_key) = idempotency_key else {
-        tx.commit().await?;
         return Ok(AutomaticGrantsDeploymentResult {
             deployment_id: None,
             deferred: deferred.into_iter().collect(),
@@ -1596,22 +1722,21 @@ async fn create_automatic_grants_deployment_locked(
     .bind(serde_json::to_value(&plan.warnings)?)
     .bind(note)
     .bind(plan.base_revision_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     let deployment_id = row.try_get("id")?;
     for target in &plan.targets {
-        insert_target(&mut tx, deployment_id, target).await?;
+        insert_target(tx, deployment_id, target).await?;
     }
-    record_current_wave_entered_tx(&mut tx, deployment_id).await?;
+    record_current_wave_entered_tx(tx, deployment_id).await?;
     if !plan
         .targets
         .iter()
         .any(|target| target.status == PlannedTargetStatus::Pending)
     {
-        refresh_deployment_status(&mut tx, deployment_id, "deferred").await?;
+        refresh_deployment_status(tx, deployment_id, "deferred").await?;
     }
 
-    tx.commit().await?;
     Ok(AutomaticGrantsDeploymentResult {
         deployment_id: Some(deployment_id),
         deferred: deferred.into_iter().collect(),
@@ -8062,6 +8187,10 @@ pub async fn discard_pending_changes(
     let restore_snapshot = materialize::load_snapshot(pool, Some(base_revision)).await?;
 
     let mut tx = pool.begin().await?;
+    // The worker takes this lock before deployment/model locks. Match that order so a discard
+    // cannot hold control_state while waiting for a worker that needs control_state to freeze a
+    // target.
+    crate::grant_automation::lock_tx(&mut tx).await?;
     let current = console::lock_control_state(&mut tx).await?;
     if current != revision_id {
         return Err(StoreError::Unsupported(format!(
@@ -8074,7 +8203,6 @@ pub async fn discard_pending_changes(
     // create the order first (which then blocks this discard), or this transaction cancels the
     // queue first, but the revision can never be restored while its old permission order appears
     // afterwards.
-    crate::grant_automation::lock_tx(&mut tx).await?;
 
     // What has shipped cannot be discarded. The test is whether this span holds a deployment
     // that is not canceled — a canceled one means that release never took effect and should not

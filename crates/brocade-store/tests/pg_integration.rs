@@ -13268,6 +13268,280 @@ async fn permission_change_is_automatically_released_from_the_durable_queue() {
         .expect("the stable subscription must reopen after the changed target converges");
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn automatic_grants_finishes_with_a_single_connection_pool() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    db.store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "single-connection-grants-base"),
+        )
+        .await
+        .unwrap();
+    let base = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .report_target_result(applied_report(&base))
+        .await
+        .unwrap();
+    let revoked = db
+        .store
+        .upsert_grant(
+            &system_admin(),
+            CreateGrantRequest {
+                app_id: "app-main".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                user_id: "alice".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
+                enabled: false,
+                note: Some("single-connection revoke".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(1))
+        .connect(&db.url)
+        .await
+        .unwrap();
+    let single_connection_store = PgStore::from_pool(pool);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(3),
+        single_connection_store.process_grant_automation(),
+    )
+    .await
+    .expect("grant automation tried to acquire a second pool connection")
+    .unwrap();
+
+    assert_eq!(outcome.revision_id, Some(revoked.revision_id));
+    assert!(outcome.deployment_id.is_some());
+    assert!(outcome.waiting.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn stale_config_plan_cannot_restore_revoked_grants() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    db.store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "stale-config-grants-base"),
+        )
+        .await
+        .unwrap();
+    let base = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .report_target_result(applied_report(&base))
+        .await
+        .unwrap();
+
+    let revoked = db
+        .store
+        .upsert_grant(
+            &system_admin(),
+            CreateGrantRequest {
+                app_id: "app-main".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                user_id: "alice".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
+                enabled: false,
+                note: Some("revoke before stale config persistence".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let grants = db.store.process_grant_automation().await.unwrap();
+    sqlx::query(
+        "UPDATE node_applied_state
+            SET xray_state = 'dirty', xray_sha256 = NULL, observed_at = now()
+          WHERE node_id = 'n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let active_error = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "stale-config-while-revoke-active"),
+        )
+        .await
+        .expect_err("an active revoke order must fence an older configuration plan");
+    assert!(
+        matches!(&active_error, StoreError::Conflict(_)),
+        "unexpected active stale-plan error: {active_error}"
+    );
+    assert!(
+        active_error
+            .to_string()
+            .contains(&revoked.revision_id.to_string()),
+        "the conflict must identify the active permissions revision: {active_error}"
+    );
+
+    let grants_id = grants
+        .deployment_id
+        .expect("the revoke must create a grants deployment");
+    // Model the partial-deployment window: healthy targets have settled, but a deferred target
+    // keeps the durable job from activating the permission checkpoint yet.
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'succeeded', active = NULL, activation_status = 'waiting'
+          WHERE id = $1",
+    )
+    .bind(grants_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let waiting_error = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "stale-config-while-revoke-waits-activation"),
+        )
+        .await
+        .expect_err("a succeeded pending activation must fence an older configuration plan");
+    assert!(
+        matches!(&waiting_error, StoreError::Conflict(_)),
+        "unexpected waiting-activation stale-plan error: {waiting_error}"
+    );
+    sqlx::query("UPDATE deployments SET status = 'planned', active = TRUE WHERE id = $1")
+        .bind(grants_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let desired = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("the revoke must have a runtime grants target");
+    assert_eq!(Some(desired.deployment_id), grants.deployment_id);
+    db.store
+        .report_target_result(applied_report(&desired))
+        .await
+        .unwrap();
+
+    let serving_error = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "stale-config-after-revoke"),
+        )
+        .await
+        .expect_err("a completed revoke must fence an older configuration plan");
+    assert!(
+        matches!(&serving_error, StoreError::Conflict(_)),
+        "unexpected serving stale-plan error: {serving_error}"
+    );
+    assert!(
+        serving_error
+            .to_string()
+            .contains(&revoked.revision_id.to_string()),
+        "the conflict must identify the serving permissions revision: {serving_error}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn dirty_runtime_defers_only_while_the_changed_node_is_serving() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    db.store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "dirty-grants-base"),
+        )
+        .await
+        .unwrap();
+    let base = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .report_target_result(applied_report(&base))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE node_applied_state
+            SET xray_state = 'dirty', xray_sha256 = NULL, observed_at = now()
+          WHERE node_id = 'n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let revoked = db
+        .store
+        .upsert_grant(
+            &system_admin(),
+            CreateGrantRequest {
+                app_id: "app-main".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                user_id: "alice".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
+                enabled: false,
+                note: Some("dirty runtime revoke".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let deferred = db.store.process_grant_automation().await.unwrap();
+    assert_eq!(deferred.deferred, vec!["n1"]);
+    assert!(deferred.waiting.is_some());
+    assert!(deferred.deployment_id.is_none());
+
+    sqlx::query("INSERT INTO node_operational_isolations (node_id) VALUES ('n1')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE jobs
+            SET run_after = clock_timestamp()
+          WHERE kind = 'grants-deployment' AND status = 'queued'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let released = db.store.process_grant_automation().await.unwrap();
+    assert_eq!(released.revision_id, Some(revoked.revision_id));
+    assert!(released.deferred.is_empty());
+    assert!(released.waiting.is_none());
+    assert!(released.deployment_id.is_none());
+}
+
 // Flow is represented on grant accounts but owned by topology. A global Flow edit may still wake
 // the generic grants outbox, but it must produce no permission-only deployment; the configuration
 // plan is the only path allowed to apply it and must restart Xray before restoring grants.
