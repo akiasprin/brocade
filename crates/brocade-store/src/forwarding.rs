@@ -1260,25 +1260,101 @@ pub async fn record_usage(
         return Ok(result);
     }
 
-    let mut accepted = 0_u64;
-    let mut inserted = 0_u64;
-    let mut skipped = 0_u64;
-    for counter in request.counters {
-        let owner = sqlx::query(
-            "SELECT r.tenant_id, r.user_id,
+    struct ForwardingOwner {
+        tenant_id: String,
+        user_id: String,
+        active: bool,
+    }
+    struct ForwardingHead {
+        agent_instance_id: String,
+        sequence: Option<i64>,
+        has_gap: bool,
+        xray_epoch: String,
+        uplink_bytes: i64,
+        downlink_bytes: i64,
+        read_at: i64,
+    }
+
+    let mut owners = BTreeMap::<i64, ForwardingOwner>::new();
+    let mut heads = BTreeMap::<i64, ForwardingHead>::new();
+    if !request.counters.is_empty() {
+        let rule_ids: Vec<i64> = request
+            .counters
+            .iter()
+            .map(|counter| counter.rule_id)
+            .collect();
+        let owner_rows = sqlx::query(
+            "SELECT r.id, r.tenant_id, r.user_id,
                     (r.node_id = $2 AND r.enabled AND r.deleted_at IS NULL
                      AND EXISTS(SELECT 1 FROM forwarding_entitlements e
                        WHERE e.tenant_id=r.tenant_id AND e.user_id=r.user_id AND e.node_id=r.node_id AND e.enabled)
                      AND EXISTS(SELECT 1 FROM users u WHERE u.tenant_id=r.tenant_id AND u.id=r.user_id AND u.status='active')) AS active
                FROM forwarding_rules r
                LEFT JOIN forwarding_rule_nodes a ON a.rule_id = r.id AND a.node_id = $2
-              WHERE r.id = $1 AND (r.node_id = $2 OR a.node_id IS NOT NULL)",
+              WHERE r.id = ANY($1) AND (r.node_id = $2 OR a.node_id IS NOT NULL)",
         )
-        .bind(counter.rule_id)
+        .bind(&rule_ids)
         .bind(node_id)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-        let Some(owner) = owner else {
+        for row in owner_rows {
+            owners.insert(
+                row.try_get("id")?,
+                ForwardingOwner {
+                    tenant_id: row.try_get("tenant_id")?,
+                    user_id: row.try_get("user_id")?,
+                    active: row.try_get("active")?,
+                },
+            );
+        }
+
+        let head_rows = sqlx::query(
+            "SELECT rule_id, agent_instance_id, sequence, has_gap, xray_epoch, uplink_bytes, downlink_bytes,
+                    extract(epoch FROM read_at)::bigint AS read_at
+               FROM forwarding_usage_counter_heads
+              WHERE node_id = $1 AND rule_id = ANY($2)
+              ORDER BY rule_id
+              FOR UPDATE",
+        )
+        .bind(node_id)
+        .bind(&rule_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in head_rows {
+            heads.insert(
+                row.try_get("rule_id")?,
+                ForwardingHead {
+                    agent_instance_id: row.try_get("agent_instance_id")?,
+                    sequence: row.try_get("sequence")?,
+                    has_gap: row.try_get("has_gap")?,
+                    xray_epoch: row.try_get("xray_epoch")?,
+                    uplink_bytes: row.try_get("uplink_bytes")?,
+                    downlink_bytes: row.try_get("downlink_bytes")?,
+                    read_at: row.try_get("read_at")?,
+                },
+            );
+        }
+    }
+
+    let mut accepted = 0_u64;
+    let mut inserted = 0_u64;
+    let mut skipped = 0_u64;
+    let mut adv_rule_ids = Vec::with_capacity(request.counters.len());
+    let mut adv_uplinks = Vec::with_capacity(request.counters.len());
+    let mut adv_downlinks = Vec::with_capacity(request.counters.len());
+    let mut gap_only_rule_ids = Vec::new();
+    let mut sample_rule_ids = Vec::new();
+    let mut sample_tenants = Vec::new();
+    let mut sample_users = Vec::new();
+    let mut sample_ups = Vec::new();
+    let mut sample_downs = Vec::new();
+    let mut sample_starts = Vec::new();
+    let mut sample_bucket_ts = Vec::new();
+    let mut sample_gaps = Vec::new();
+    let mut window_totals = BTreeMap::<(String, i64), (i64, i64, bool)>::new();
+
+    for counter in request.counters {
+        let Some(owner) = owners.get(&counter.rule_id) else {
             skipped += 1;
             continue;
         };
@@ -1288,32 +1364,22 @@ pub async fn record_usage(
         let downlink = i64::try_from(counter.downlink_bytes).map_err(|_| {
             StoreError::InvalidData("forwarding downlink counter overflow".to_owned())
         })?;
-        let head = sqlx::query(
-            "SELECT agent_instance_id, sequence, has_gap, xray_epoch, uplink_bytes, downlink_bytes,
-                    extract(epoch FROM read_at)::bigint AS read_at
-               FROM forwarding_usage_counter_heads
-              WHERE node_id = $1 AND rule_id = $2 FOR UPDATE",
-        )
-        .bind(node_id)
-        .bind(counter.rule_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (start, delta_up, delta_down, has_gap, advance_head) = if let Some(head) = head {
-            let previous_at: i64 = head.try_get("read_at")?;
+        let (start, delta_up, delta_down, has_gap, advance_head) = if let Some(head) =
+            heads.get(&counter.rule_id)
+        {
+            let previous_at = head.read_at;
             if request.read_at_unix_secs < previous_at
-                || (head.try_get::<String, _>("agent_instance_id")? == request.agent_instance_id
-                    && head
-                        .try_get::<Option<i64>, _>("sequence")?
-                        .is_some_and(|previous| sequence <= previous))
+                || (head.agent_instance_id == request.agent_instance_id
+                    && head.sequence.is_some_and(|previous| sequence <= previous))
             {
                 skipped += 1;
                 continue;
             }
-            let old_up: i64 = head.try_get("uplink_bytes")?;
-            let old_down: i64 = head.try_get("downlink_bytes")?;
+            let old_up = head.uplink_bytes;
+            let old_down = head.downlink_bytes;
             // A durable counter identity survives Agent and controlled Xray restarts. The
             // reporting process identity only identifies receipts, not the lifetime of bytes.
-            let same_epoch = head.try_get::<String, _>("xray_epoch")? == request.xray_epoch;
+            let same_epoch = head.xray_epoch == request.xray_epoch;
             let continuous = same_epoch && uplink >= old_up && downlink >= old_down;
             if request.read_at_unix_secs == previous_at
                 && (!continuous || (uplink == old_up && downlink == old_down))
@@ -1322,7 +1388,7 @@ pub async fn record_usage(
                 continue;
             }
             if continuous {
-                let uncertain: bool = head.try_get("has_gap")?;
+                let uncertain = head.has_gap;
                 (
                     (request.read_at_unix_secs > previous_at && !uncertain).then_some(previous_at),
                     uplink - old_up,
@@ -1344,91 +1410,171 @@ pub async fn record_usage(
             // time, but never invent a one-second chart point or continuous coverage.
             (None, uplink, downlink, false, true)
         };
-        let tenant: String = owner.try_get("tenant_id")?;
-        let user: String = owner.try_get("user_id")?;
         if advance_head {
-            sqlx::query(
-                "INSERT INTO forwarding_usage_counter_heads (
-                 node_id, rule_id, agent_instance_id, xray_epoch,
-                 uplink_bytes, downlink_bytes, read_at, sequence, has_gap
-             ) VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7),$8,false)
-             ON CONFLICT (node_id, rule_id) DO UPDATE SET
-                 agent_instance_id = EXCLUDED.agent_instance_id,
-                 xray_epoch = EXCLUDED.xray_epoch,
-                 uplink_bytes = EXCLUDED.uplink_bytes,
-                 downlink_bytes = EXCLUDED.downlink_bytes,
-                 read_at = EXCLUDED.read_at, sequence = EXCLUDED.sequence, has_gap=false",
-            )
-            .bind(node_id)
-            .bind(counter.rule_id)
-            .bind(&request.agent_instance_id)
-            .bind(&request.xray_epoch)
-            .bind(uplink)
-            .bind(downlink)
-            .bind(request.read_at_unix_secs as f64)
-            .bind(sequence)
-            .execute(&mut *tx)
-            .await?;
+            adv_rule_ids.push(counter.rule_id);
+            adv_uplinks.push(uplink);
+            adv_downlinks.push(downlink);
         } else {
-            sqlx::query("UPDATE forwarding_usage_counter_heads SET has_gap=true WHERE node_id=$1 AND rule_id=$2")
-                .bind(node_id).bind(counter.rule_id).execute(&mut *tx).await?;
+            gap_only_rule_ids.push(counter.rule_id);
         }
         if delta_up > 0 || delta_down > 0 || has_gap {
-            sqlx::query(
-                "INSERT INTO forwarding_usage_samples (
-                     node_id, rule_id, tenant_id, user_id, read_at, uplink_bytes, downlink_bytes,
-                     window_start, has_gap
-                 ) VALUES ($1,$2,$3,$4,to_timestamp($5),$6,$7,to_timestamp($8),$9)",
-            )
-            .bind(node_id)
-            .bind(counter.rule_id)
-            .bind(&tenant)
-            .bind(&user)
-            .bind(request.read_at_unix_secs as f64)
-            .bind(delta_up)
-            .bind(delta_down)
-            .bind(start.map(|value| value as f64))
-            .bind(has_gap)
-            .execute(&mut *tx)
-            .await?;
+            sample_rule_ids.push(counter.rule_id);
+            sample_tenants.push(owner.tenant_id.as_str());
+            sample_users.push(owner.user_id.as_str());
+            sample_ups.push(delta_up);
+            sample_downs.push(delta_down);
+            sample_starts.push(start.map(|value| value as f64));
+            sample_bucket_ts.push(start.unwrap_or(request.read_at_unix_secs) as f64);
+            sample_gaps.push(has_gap);
             inserted += 1;
-            sqlx::query("INSERT INTO forwarding_usage_rollups
-                (period_start,node_id,tenant_id,user_id,rule_id,uplink_bytes,downlink_bytes,has_gap)
-                VALUES (date_trunc('day',to_timestamp($1) AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong',$2,$3,$4,$5,$6,$7,$8)
-                ON CONFLICT (period_start,node_id,tenant_id,user_id,rule_id) DO UPDATE SET
-                  uplink_bytes=forwarding_usage_rollups.uplink_bytes+EXCLUDED.uplink_bytes,
-                  downlink_bytes=forwarding_usage_rollups.downlink_bytes+EXCLUDED.downlink_bytes,
-                  has_gap=forwarding_usage_rollups.has_gap OR EXCLUDED.has_gap")
-                .bind(start.unwrap_or(request.read_at_unix_secs) as f64).bind(node_id).bind(&tenant).bind(&user).bind(counter.rule_id)
-                .bind(delta_up).bind(delta_down).bind(has_gap).execute(&mut *tx).await?;
         }
-        if let Some(start) = start
-            .filter(|_| owner.get::<bool, _>("active") || delta_up > 0 || delta_down > 0 || has_gap)
+        if let Some(start) =
+            start.filter(|_| owner.active || delta_up > 0 || delta_down > 0 || has_gap)
         {
-            sqlx::query(
-                "INSERT INTO forwarding_usage_windows
-                (node_id,tenant_id,window_start,window_end,uplink_bytes,downlink_bytes,has_gap)
-                VALUES ($1,$2,to_timestamp($3),to_timestamp($4),$5,$6,$7)
-                ON CONFLICT (node_id,tenant_id,window_start,window_end) DO UPDATE SET
-                  uplink_bytes=forwarding_usage_windows.uplink_bytes+EXCLUDED.uplink_bytes,
-                  downlink_bytes=forwarding_usage_windows.downlink_bytes+EXCLUDED.downlink_bytes,
-                  has_gap=forwarding_usage_windows.has_gap OR EXCLUDED.has_gap",
-            )
-            .bind(node_id)
-            .bind(&tenant)
-            .bind(start as f64)
-            .bind(request.read_at_unix_secs as f64)
-            .bind(delta_up)
-            .bind(delta_down)
-            .bind(has_gap)
-            .execute(&mut *tx)
-            .await?;
+            let entry = window_totals
+                .entry((owner.tenant_id.clone(), start))
+                .or_insert((0, 0, false));
+            entry.0 = entry.0.checked_add(delta_up).ok_or_else(|| {
+                StoreError::InvalidData("forwarding window uplink overflow".to_owned())
+            })?;
+            entry.1 = entry.1.checked_add(delta_down).ok_or_else(|| {
+                StoreError::InvalidData("forwarding window downlink overflow".to_owned())
+            })?;
+            entry.2 |= has_gap;
         }
         if advance_head {
             accepted += 1;
         } else {
             skipped += 1;
         }
+    }
+
+    if !adv_rule_ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO forwarding_usage_counter_heads (
+                 node_id, rule_id, agent_instance_id, xray_epoch,
+                 uplink_bytes, downlink_bytes, read_at, sequence, has_gap
+             )
+             SELECT $1, t.rule_id, $2, $3, t.uplink, t.downlink, to_timestamp($4), $5, false
+               FROM UNNEST($6::bigint[], $7::bigint[], $8::bigint[]) AS t(rule_id, uplink, downlink)
+              ORDER BY t.rule_id
+             ON CONFLICT (node_id, rule_id) DO UPDATE SET
+                 agent_instance_id = EXCLUDED.agent_instance_id,
+                 xray_epoch = EXCLUDED.xray_epoch,
+                 uplink_bytes = EXCLUDED.uplink_bytes,
+                 downlink_bytes = EXCLUDED.downlink_bytes,
+                 read_at = EXCLUDED.read_at, sequence = EXCLUDED.sequence, has_gap = false",
+        )
+        .bind(node_id)
+        .bind(&request.agent_instance_id)
+        .bind(&request.xray_epoch)
+        .bind(request.read_at_unix_secs as f64)
+        .bind(sequence)
+        .bind(adv_rule_ids)
+        .bind(adv_uplinks)
+        .bind(adv_downlinks)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if !gap_only_rule_ids.is_empty() {
+        sqlx::query(
+            "UPDATE forwarding_usage_counter_heads SET has_gap = true
+              WHERE node_id = $1 AND rule_id = ANY($2)",
+        )
+        .bind(node_id)
+        .bind(gap_only_rule_ids)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if !sample_rule_ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO forwarding_usage_samples (
+                 node_id, rule_id, tenant_id, user_id, read_at, uplink_bytes, downlink_bytes,
+                 window_start, has_gap
+             )
+             SELECT $1, t.rule_id, t.tenant_id, t.user_id, to_timestamp($2),
+                    t.uplink_bytes, t.downlink_bytes, to_timestamp(t.window_start), t.has_gap
+               FROM UNNEST(
+                 $3::bigint[], $4::text[], $5::text[], $6::bigint[], $7::bigint[],
+                 $8::double precision[], $9::boolean[]
+               ) AS t(rule_id, tenant_id, user_id, uplink_bytes, downlink_bytes, window_start, has_gap)",
+        )
+        .bind(node_id)
+        .bind(request.read_at_unix_secs as f64)
+        .bind(&sample_rule_ids)
+        .bind(&sample_tenants)
+        .bind(&sample_users)
+        .bind(&sample_ups)
+        .bind(&sample_downs)
+        .bind(&sample_starts)
+        .bind(&sample_gaps)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO forwarding_usage_rollups
+                (period_start, node_id, tenant_id, user_id, rule_id, uplink_bytes, downlink_bytes, has_gap)
+             SELECT date_trunc('day', to_timestamp(t.bucket_ts) AT TIME ZONE 'Asia/Hong_Kong')
+                        AT TIME ZONE 'Asia/Hong_Kong' AS period_start,
+                    $1, t.tenant_id, t.user_id, t.rule_id,
+                    sum(t.uplink_bytes)::bigint, sum(t.downlink_bytes)::bigint, bool_or(t.has_gap)
+               FROM UNNEST(
+                 $2::double precision[], $3::text[], $4::text[], $5::bigint[],
+                 $6::bigint[], $7::bigint[], $8::boolean[]
+               ) AS t(bucket_ts, tenant_id, user_id, rule_id, uplink_bytes, downlink_bytes, has_gap)
+              GROUP BY 1, 2, 3, 4, 5
+              ORDER BY 1, 2, 3, 4, 5
+             ON CONFLICT (period_start, node_id, tenant_id, user_id, rule_id) DO UPDATE SET
+               uplink_bytes = forwarding_usage_rollups.uplink_bytes + EXCLUDED.uplink_bytes,
+               downlink_bytes = forwarding_usage_rollups.downlink_bytes + EXCLUDED.downlink_bytes,
+               has_gap = forwarding_usage_rollups.has_gap OR EXCLUDED.has_gap",
+        )
+        .bind(node_id)
+        .bind(&sample_bucket_ts)
+        .bind(&sample_tenants)
+        .bind(&sample_users)
+        .bind(&sample_rule_ids)
+        .bind(&sample_ups)
+        .bind(&sample_downs)
+        .bind(&sample_gaps)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if !window_totals.is_empty() {
+        let mut win_tenants = Vec::with_capacity(window_totals.len());
+        let mut win_starts = Vec::with_capacity(window_totals.len());
+        let mut win_ups = Vec::with_capacity(window_totals.len());
+        let mut win_downs = Vec::with_capacity(window_totals.len());
+        let mut win_gaps = Vec::with_capacity(window_totals.len());
+        for ((tenant, start), (up, down, gap)) in window_totals {
+            win_tenants.push(tenant);
+            win_starts.push(start as f64);
+            win_ups.push(up);
+            win_downs.push(down);
+            win_gaps.push(gap);
+        }
+        sqlx::query(
+            "INSERT INTO forwarding_usage_windows
+                (node_id, tenant_id, window_start, window_end, uplink_bytes, downlink_bytes, has_gap)
+             SELECT $1, t.tenant_id, to_timestamp(t.window_start), to_timestamp($2),
+                    t.uplink_bytes, t.downlink_bytes, t.has_gap
+               FROM UNNEST(
+                 $3::text[], $4::double precision[], $5::bigint[], $6::bigint[], $7::boolean[]
+               ) AS t(tenant_id, window_start, uplink_bytes, downlink_bytes, has_gap)
+              ORDER BY t.tenant_id, t.window_start
+             ON CONFLICT (node_id, tenant_id, window_start, window_end) DO UPDATE SET
+               uplink_bytes = forwarding_usage_windows.uplink_bytes + EXCLUDED.uplink_bytes,
+               downlink_bytes = forwarding_usage_windows.downlink_bytes + EXCLUDED.downlink_bytes,
+               has_gap = forwarding_usage_windows.has_gap OR EXCLUDED.has_gap",
+        )
+        .bind(node_id)
+        .bind(request.read_at_unix_secs as f64)
+        .bind(win_tenants)
+        .bind(win_starts)
+        .bind(win_ups)
+        .bind(win_downs)
+        .bind(win_gaps)
+        .execute(&mut *tx)
+        .await?;
     }
     let result = ForwardingUsageReportResult {
         node_id: node_id.to_owned(),

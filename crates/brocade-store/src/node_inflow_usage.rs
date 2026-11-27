@@ -56,42 +56,102 @@ pub struct NodeInflowUser {
 }
 
 /// One accepted accounting window of one user on one ingress.
-pub(crate) struct IngressWindow<'a> {
-    pub(crate) node_id: &'a str,
-    pub(crate) tenant_id: &'a str,
-    pub(crate) user_id: &'a str,
-    pub(crate) ingress_id: &'a str,
-    pub(crate) app_id: &'a str,
+pub(crate) struct IngressWindow {
+    pub(crate) node_id: String,
+    pub(crate) tenant_id: String,
+    pub(crate) user_id: String,
+    pub(crate) ingress_id: String,
+    pub(crate) app_id: String,
     pub(crate) window_start_unix_secs: i64,
     pub(crate) uplink_bytes: i64,
     pub(crate) downlink_bytes: i64,
     pub(crate) has_gap: bool,
 }
 
-/// Must run in the transaction that accepted the window, so a retried report cannot count twice.
-pub(crate) async fn record(
+/// Must run in the transaction that accepted the windows, so a retried report cannot count twice.
+pub(crate) async fn record_batch(
     tx: &mut Transaction<'_, Postgres>,
-    window: IngressWindow<'_>,
+    windows: &[IngressWindow],
 ) -> Result<()> {
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let mut nodes = Vec::with_capacity(windows.len());
+    let mut starts = Vec::with_capacity(windows.len());
+    let mut tenants = Vec::with_capacity(windows.len());
+    let mut users = Vec::with_capacity(windows.len());
+    let mut ingresses = Vec::with_capacity(windows.len());
+    let mut apps = Vec::with_capacity(windows.len());
+    let mut uplinks = Vec::with_capacity(windows.len());
+    let mut downlinks = Vec::with_capacity(windows.len());
+    let mut gaps = Vec::with_capacity(windows.len());
+    for window in windows {
+        nodes.push(window.node_id.as_str());
+        starts.push(window.window_start_unix_secs as f64);
+        tenants.push(window.tenant_id.as_str());
+        users.push(window.user_id.as_str());
+        ingresses.push(window.ingress_id.as_str());
+        apps.push(window.app_id.as_str());
+        uplinks.push(window.uplink_bytes);
+        downlinks.push(window.downlink_bytes);
+        gaps.push(window.has_gap);
+    }
     // The day keeps the view and chain of its first window, like usage_samples.app_id.
-    sqlx::query("INSERT INTO usage_user_ingress_rollups (node_id,period_start,tenant_id,user_id,ingress_id,app_id,chain_id,uplink_bytes,downlink_bytes,has_gap)
-        VALUES ($1,date_trunc('day',to_timestamp($2) AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong',$3,$4,$5,$6,
-            (SELECT chain_id FROM ingresses WHERE id=$5),$7,$8,$9)
-        ON CONFLICT (node_id,period_start,tenant_id,user_id,ingress_id) DO UPDATE SET
-        uplink_bytes=usage_user_ingress_rollups.uplink_bytes+EXCLUDED.uplink_bytes,
-        downlink_bytes=usage_user_ingress_rollups.downlink_bytes+EXCLUDED.downlink_bytes,
-        has_gap=usage_user_ingress_rollups.has_gap OR EXCLUDED.has_gap")
-        .bind(window.node_id)
-        .bind(window.window_start_unix_secs as f64)
-        .bind(window.tenant_id)
-        .bind(window.user_id)
-        .bind(window.ingress_id)
-        .bind(window.app_id)
-        .bind(window.uplink_bytes)
-        .bind(window.downlink_bytes)
-        .bind(window.has_gap)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(
+        "WITH grouped AS (
+            SELECT
+                t.node_id,
+                date_trunc('day', to_timestamp(t.window_start) AT TIME ZONE 'Asia/Hong_Kong')
+                    AT TIME ZONE 'Asia/Hong_Kong' AS period_start,
+                t.tenant_id,
+                t.user_id,
+                t.ingress_id,
+                (array_agg(t.app_id ORDER BY t.ord))[1] AS app_id,
+                sum(t.uplink_bytes)::bigint AS uplink_bytes,
+                sum(t.downlink_bytes)::bigint AS downlink_bytes,
+                bool_or(t.has_gap) AS has_gap
+            FROM UNNEST(
+                $1::text[],
+                $2::double precision[],
+                $3::text[],
+                $4::text[],
+                $5::text[],
+                $6::text[],
+                $7::bigint[],
+                $8::bigint[],
+                $9::boolean[]
+            ) WITH ORDINALITY AS t(
+                node_id, window_start, tenant_id, user_id, ingress_id, app_id,
+                uplink_bytes, downlink_bytes, has_gap, ord
+            )
+            GROUP BY 1, 2, 3, 4, 5
+         )
+         INSERT INTO usage_user_ingress_rollups (
+            node_id, period_start, tenant_id, user_id, ingress_id, app_id, chain_id,
+            uplink_bytes, downlink_bytes, has_gap
+         )
+         SELECT
+            g.node_id, g.period_start, g.tenant_id, g.user_id, g.ingress_id, g.app_id,
+            i.chain_id, g.uplink_bytes, g.downlink_bytes, g.has_gap
+         FROM grouped g
+         LEFT JOIN ingresses i ON i.id = g.ingress_id
+         ORDER BY g.node_id, g.period_start, g.tenant_id, g.user_id, g.ingress_id
+         ON CONFLICT (node_id, period_start, tenant_id, user_id, ingress_id) DO UPDATE SET
+            uplink_bytes = usage_user_ingress_rollups.uplink_bytes + EXCLUDED.uplink_bytes,
+            downlink_bytes = usage_user_ingress_rollups.downlink_bytes + EXCLUDED.downlink_bytes,
+            has_gap = usage_user_ingress_rollups.has_gap OR EXCLUDED.has_gap",
+    )
+    .bind(&nodes)
+    .bind(&starts)
+    .bind(&tenants)
+    .bind(&users)
+    .bind(&ingresses)
+    .bind(&apps)
+    .bind(&uplinks)
+    .bind(&downlinks)
+    .bind(&gaps)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 

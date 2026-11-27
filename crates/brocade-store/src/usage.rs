@@ -1467,6 +1467,7 @@ pub async fn record_usage_report(
     let route = request.route.clone();
     request.counters.sort_by(|a, b| a.label.cmp(&b.label));
     let mut labels = BTreeSet::new();
+    let mut prepared_counters = Vec::with_capacity(request.counters.len());
     for counter in request.counters {
         let label = counter.label.trim().to_owned();
         if label.is_empty() {
@@ -1494,17 +1495,43 @@ pub async fn record_usage_report(
         if is_probe_label(&label) {
             continue;
         }
+        prepared_counters.push(PreparedUsageCounter {
+            label,
+            uplink_bytes,
+            downlink_bytes,
+            raw_uplink_bytes: counter.uplink_bytes,
+            raw_downlink_bytes: counter.downlink_bytes,
+        });
+    }
+
+    let query_labels: Vec<String> = prepared_counters
+        .iter()
+        .map(|counter| counter.label.clone())
+        .collect();
+    let previous_heads = usage_heads_for_update(&mut tx, node_id, &query_labels).await?;
+
+    let mut seen_canonical_labels = BTreeSet::new();
+    let mut reading_rows = Vec::with_capacity(prepared_counters.len());
+    let mut head_rows = Vec::with_capacity(prepared_counters.len());
+    let mut zero_user_samples = Vec::new();
+    let mut nonzero_user_samples = Vec::new();
+    let mut chain_samples = Vec::new();
+
+    for counter in prepared_counters {
+        let label = counter.label;
+        let uplink_bytes = counter.uplink_bytes;
+        let downlink_bytes = counter.downlink_bytes;
         let binding = generation.bindings.get(&label);
         let first_reading_policy = binding.map_or(
             FirstReadingPolicy::EstablishBaseline,
             FrozenBinding::first_reading_policy,
         );
-        let previous = usage_head_for_update(&mut tx, node_id, &label).await?;
+        let previous = previous_heads.get(&label);
         let mut resolved = binding
             .and_then(|binding| binding.to_counter_owner(&label))
             .map(|owner| (owner, generation.id, metadata));
         if resolved.is_none() {
-            if let Some(head) = previous.as_ref().filter(|head| {
+            if let Some(head) = previous.filter(|head| {
                 head.generation_id < generation.id
                     && head.xray_epoch == xray_epoch
                     && request.read_at_unix_secs >= head.read_at_unix_secs
@@ -1522,8 +1549,8 @@ pub async fn record_usage_report(
                 unknown_counters.push(UnknownCounterObservation {
                     fingerprint: unknown_counter_fingerprint(node_id, &label),
                     xray_epoch: xray_epoch.clone(),
-                    uplink_bytes: counter.uplink_bytes,
-                    downlink_bytes: counter.downlink_bytes,
+                    uplink_bytes: counter.raw_uplink_bytes,
+                    downlink_bytes: counter.raw_downlink_bytes,
                 });
                 continue;
             }
@@ -1531,7 +1558,7 @@ pub async fn record_usage_report(
             // this machine. An unchanged value in the same namespace is already accounted for;
             // it neither advances the head nor indicates foreign traffic. Only a proven relay
             // tail above may grow; revoked users and unproven namespaces still reject.
-            if previous.as_ref().is_some_and(|head| {
+            if previous.is_some_and(|head| {
                 request.read_at_unix_secs >= head.read_at_unix_secs
                     && xray_epoch == head.xray_epoch
                     && uplink_bytes == head.uplink_bytes
@@ -1544,9 +1571,7 @@ pub async fn record_usage_report(
             continue;
         };
         if let CounterOwner::ChainHop(hop) = &mut owner {
-            if !resolve_chain_owner_node(&mut tx, hop, accounting_generation, previous.as_ref())
-                .await?
-            {
+            if !resolve_chain_owner_node(&mut tx, hop, accounting_generation, previous).await? {
                 // A stale node ID in a frozen JSON binding must not roll back unrelated users
                 // and poison the durable queue with repeated FK failures. Keep this head intact
                 // so a later provable ownership map can recover the cumulative delta.
@@ -1555,33 +1580,23 @@ pub async fn record_usage_report(
             }
         }
         let canonical_label = match &owner {
-            CounterOwner::User(grant) => &grant.label,
-            CounterOwner::ChainHop(hop) => &hop.label,
+            CounterOwner::User(grant) => grant.label.clone(),
+            CounterOwner::ChainHop(hop) => hop.label.clone(),
         };
-
-        let inserted = insert_usage_reading(
-            &mut tx,
-            UsageReadingInsert {
-                node_id,
-                label: canonical_label,
-                agent_instance_id: &agent_instance_id,
-                sequence: sequence_i64,
-                generation_id: generation.id,
-                xray_epoch: &xray_epoch,
-                read_at_unix_secs: request.read_at_unix_secs,
-                xray_started_at_unix_secs: request.xray_started_at_unix_secs,
-                uplink_bytes,
-                downlink_bytes,
-            },
-        )
-        .await?;
-        if !inserted {
+        if !seen_canonical_labels.insert(canonical_label.clone()) {
             return Err(StoreError::InvalidData(format!(
                 "duplicate usage reading for {canonical_label}"
             )));
         }
+        reading_rows.push(UsageReadingBatchRow {
+            label: canonical_label.clone(),
+            uplink_bytes,
+            downlink_bytes,
+        });
+
         let mut update_head = true;
-        if let Some(previous) = &previous {
+        let mut pending_sample: Option<(i64, i64, i64, bool)> = None;
+        if let Some(previous) = previous {
             if request.read_at_unix_secs < previous.read_at_unix_secs {
                 rejected_counters += 1;
                 update_head = false;
@@ -1637,35 +1652,7 @@ pub async fn record_usage_report(
                 if window_start < request.read_at_unix_secs {
                     coverage_start =
                         Some(coverage_start.map_or(window_start, |start| start.min(window_start)));
-                    let insert = UsageSampleInsert {
-                        node_id,
-                        owner: &owner,
-                        window_start_unix_secs: window_start,
-                        window_end_unix_secs: request.read_at_unix_secs,
-                        uplink_bytes: uplink_delta,
-                        downlink_bytes: downlink_delta,
-                        has_gap,
-                        revision_id: accounting_metadata.revision_id,
-                        deployment_id: accounting_metadata.deployment_id,
-                        generation_id: accounting_generation,
-                    };
-                    let sample_inserted = match &owner {
-                        CounterOwner::User(_) => insert_usage_sample(&mut tx, insert).await?,
-                        CounterOwner::ChainHop(_) => insert_chain_sample(&mut tx, insert).await?,
-                    };
-                    if sample_inserted {
-                        add_node_window(
-                            &mut node_windows,
-                            node_id,
-                            &owner,
-                            uplink_delta,
-                            downlink_delta,
-                        )?;
-                        inserted_samples += 1;
-                        if has_gap {
-                            gap_samples += 1;
-                        }
-                    }
+                    pending_sample = Some((window_start, uplink_delta, downlink_delta, has_gap));
                 }
             }
         } else if first_reading_policy == FirstReadingPolicy::CountFromZero {
@@ -1686,56 +1673,156 @@ pub async fn record_usage_report(
             if window_start < request.read_at_unix_secs {
                 coverage_start =
                     Some(coverage_start.map_or(window_start, |start| start.min(window_start)));
-                let insert = UsageSampleInsert {
-                    node_id,
-                    owner: &owner,
-                    window_start_unix_secs: window_start,
-                    window_end_unix_secs: request.read_at_unix_secs,
-                    uplink_bytes,
-                    downlink_bytes,
-                    has_gap,
-                    revision_id: accounting_metadata.revision_id,
-                    deployment_id: accounting_metadata.deployment_id,
-                    generation_id: accounting_generation,
-                };
-                let sample_inserted = match &owner {
-                    CounterOwner::User(_) => insert_usage_sample(&mut tx, insert).await?,
-                    CounterOwner::ChainHop(_) => insert_chain_sample(&mut tx, insert).await?,
-                };
-                if sample_inserted {
-                    add_node_window(
-                        &mut node_windows,
-                        node_id,
-                        &owner,
-                        uplink_bytes,
-                        downlink_bytes,
-                    )?;
-                    inserted_samples += 1;
-                    if has_gap {
-                        gap_samples += 1;
+                pending_sample = Some((window_start, uplink_bytes, downlink_bytes, has_gap));
+            }
+        }
+        if let Some((window_start, sample_up, sample_down, has_gap)) = pending_sample {
+            match owner {
+                CounterOwner::User(grant) => {
+                    let row = UserSampleBatchRow {
+                        grant,
+                        window_start_unix_secs: window_start,
+                        uplink_bytes: sample_up,
+                        downlink_bytes: sample_down,
+                        has_gap,
+                        revision_id: accounting_metadata.revision_id,
+                        deployment_id: accounting_metadata.deployment_id,
+                        generation_id: accounting_generation,
+                    };
+                    if sample_up == 0 && sample_down == 0 && !has_gap {
+                        zero_user_samples.push(row);
+                    } else {
+                        nonzero_user_samples.push(row);
                     }
+                }
+                CounterOwner::ChainHop(hop) => {
+                    chain_samples.push(ChainSampleBatchRow {
+                        hop,
+                        window_start_unix_secs: window_start,
+                        uplink_bytes: sample_up,
+                        downlink_bytes: sample_down,
+                        has_gap,
+                        revision_id: accounting_metadata.revision_id,
+                        deployment_id: accounting_metadata.deployment_id,
+                        generation_id: accounting_generation,
+                    });
                 }
             }
         }
         if update_head {
             accepted_readings += 1;
-            upsert_usage_head(
-                &mut tx,
-                node_id,
-                canonical_label,
-                &xray_epoch,
-                request.read_at_unix_secs,
-                request.xray_started_at_unix_secs,
+            head_rows.push(UsageHeadBatchRow {
+                label: canonical_label,
                 uplink_bytes,
                 downlink_bytes,
-                accounting_generation,
-                &agent_instance_id,
-                sequence_i64,
-            )
-            .await?;
+                generation_id: accounting_generation,
+            });
         }
     }
 
+    let batch_ctx = UsageBatchContext {
+        node_id,
+        agent_instance_id: &agent_instance_id,
+        sequence: sequence_i64,
+        generation_id: generation.id,
+        xray_epoch: &xray_epoch,
+        read_at_unix_secs: request.read_at_unix_secs,
+        xray_started_at_unix_secs: request.xray_started_at_unix_secs,
+    };
+    insert_usage_readings_batch(&mut tx, &batch_ctx, &reading_rows).await?;
+    insert_zero_user_samples_batch(&mut tx, node_id, &zero_user_samples).await?;
+    let inserted_user_labels = insert_usage_samples_batch(
+        &mut tx,
+        node_id,
+        request.read_at_unix_secs,
+        &nonzero_user_samples,
+    )
+    .await?;
+    let inserted_chain_labels =
+        insert_chain_samples_batch(&mut tx, request.read_at_unix_secs, &chain_samples).await?;
+
+    let mut user_machine_windows =
+        Vec::with_capacity(zero_user_samples.len() + inserted_user_labels.len());
+    let mut inflow_windows = Vec::with_capacity(inserted_user_labels.len());
+
+    for sample in zero_user_samples {
+        add_node_window_parts(
+            &mut node_windows,
+            node_id,
+            &sample.grant.tenant_id,
+            false,
+            0,
+            0,
+        )?;
+        inserted_samples += 1;
+        user_machine_windows.push(crate::user_machine_usage::UserMachineUsageWindow {
+            node_id: node_id.to_owned(),
+            tenant_id: sample.grant.tenant_id,
+            user_id: sample.grant.user_id,
+            window_start_unix_secs: sample.window_start_unix_secs,
+            uplink_bytes: 0,
+            downlink_bytes: 0,
+            has_gap: false,
+        });
+    }
+    for sample in nonzero_user_samples {
+        if !inserted_user_labels.contains(&sample.grant.label) {
+            continue;
+        }
+        add_node_window_parts(
+            &mut node_windows,
+            node_id,
+            &sample.grant.tenant_id,
+            false,
+            sample.uplink_bytes,
+            sample.downlink_bytes,
+        )?;
+        inserted_samples += 1;
+        if sample.has_gap {
+            gap_samples += 1;
+        }
+        user_machine_windows.push(crate::user_machine_usage::UserMachineUsageWindow {
+            node_id: node_id.to_owned(),
+            tenant_id: sample.grant.tenant_id.clone(),
+            user_id: sample.grant.user_id.clone(),
+            window_start_unix_secs: sample.window_start_unix_secs,
+            uplink_bytes: sample.uplink_bytes,
+            downlink_bytes: sample.downlink_bytes,
+            has_gap: sample.has_gap,
+        });
+        inflow_windows.push(crate::node_inflow_usage::IngressWindow {
+            node_id: node_id.to_owned(),
+            tenant_id: sample.grant.tenant_id,
+            user_id: sample.grant.user_id,
+            ingress_id: sample.grant.ingress_id,
+            app_id: sample.grant.app_id,
+            window_start_unix_secs: sample.window_start_unix_secs,
+            uplink_bytes: sample.uplink_bytes,
+            downlink_bytes: sample.downlink_bytes,
+            has_gap: sample.has_gap,
+        });
+    }
+    for sample in chain_samples {
+        if !inserted_chain_labels.contains(&sample.hop.label) {
+            continue;
+        }
+        add_node_window_parts(
+            &mut node_windows,
+            &sample.hop.node_id,
+            &sample.hop.tenant_id,
+            true,
+            sample.uplink_bytes,
+            sample.downlink_bytes,
+        )?;
+        inserted_samples += 1;
+        if sample.has_gap {
+            gap_samples += 1;
+        }
+    }
+
+    crate::user_machine_usage::record_batch(&mut tx, &user_machine_windows).await?;
+    crate::node_inflow_usage::record_batch(&mut tx, &inflow_windows).await?;
+    upsert_usage_heads_batch(&mut tx, &batch_ctx, &head_rows).await?;
     persist_node_windows(&mut tx, request.read_at_unix_secs, node_windows).await?;
     let result = UsageReportResult {
         node_id: node_id.to_owned(),
@@ -2608,57 +2695,128 @@ async fn resolve_chain_owner_node(
     )
 }
 
-async fn usage_head_for_update(
-    tx: &mut Transaction<'_, Postgres>,
-    node_id: &str,
-    label: &str,
-) -> Result<Option<UsageHead>> {
-    let row = sqlx::query(
-        "SELECT EXTRACT(EPOCH FROM read_at)::bigint AS read_at_unix_secs,
-                uplink_bytes, downlink_bytes, xray_epoch, generation_id
-         FROM usage_counter_heads
-         WHERE node_id = $1 AND label = $2
-         FOR UPDATE",
-    )
-    .bind(node_id)
-    .bind(label)
-    .fetch_optional(&mut **tx)
-    .await?;
-
-    row.map(|row| {
-        Ok(UsageHead {
-            read_at_unix_secs: row.try_get("read_at_unix_secs")?,
-            uplink_bytes: row.try_get("uplink_bytes")?,
-            downlink_bytes: row.try_get("downlink_bytes")?,
-            xray_epoch: row.try_get("xray_epoch")?,
-            generation_id: row.try_get("generation_id")?,
-        })
-    })
-    .transpose()
+struct PreparedUsageCounter {
+    label: String,
+    uplink_bytes: i64,
+    downlink_bytes: i64,
+    raw_uplink_bytes: u64,
+    raw_downlink_bytes: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn upsert_usage_head(
-    tx: &mut Transaction<'_, Postgres>,
-    node_id: &str,
-    label: &str,
-    xray_epoch: &str,
+struct UsageBatchContext<'a> {
+    node_id: &'a str,
+    agent_instance_id: &'a str,
+    sequence: i64,
+    generation_id: i64,
+    xray_epoch: &'a str,
     read_at_unix_secs: i64,
     xray_started_at_unix_secs: i64,
+}
+
+struct UsageReadingBatchRow {
+    label: String,
+    uplink_bytes: i64,
+    downlink_bytes: i64,
+}
+
+struct UsageHeadBatchRow {
+    label: String,
     uplink_bytes: i64,
     downlink_bytes: i64,
     generation_id: i64,
-    agent_instance_id: &str,
-    sequence: i64,
+}
+
+struct UserSampleBatchRow {
+    grant: GrantMapping,
+    window_start_unix_secs: i64,
+    uplink_bytes: i64,
+    downlink_bytes: i64,
+    has_gap: bool,
+    revision_id: Option<i64>,
+    deployment_id: Option<i64>,
+    generation_id: i64,
+}
+
+struct ChainSampleBatchRow {
+    hop: ChainHopMapping,
+    window_start_unix_secs: i64,
+    uplink_bytes: i64,
+    downlink_bytes: i64,
+    has_gap: bool,
+    revision_id: Option<i64>,
+    deployment_id: Option<i64>,
+    generation_id: i64,
+}
+
+async fn usage_heads_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    labels: &[String],
+) -> Result<BTreeMap<String, UsageHead>> {
+    if labels.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let rows = sqlx::query(
+        "SELECT label,
+                EXTRACT(EPOCH FROM read_at)::bigint AS read_at_unix_secs,
+                uplink_bytes, downlink_bytes, xray_epoch, generation_id
+         FROM usage_counter_heads
+         WHERE node_id = $1 AND label = ANY($2)
+         ORDER BY label
+         FOR UPDATE",
+    )
+    .bind(node_id)
+    .bind(labels)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut heads = BTreeMap::new();
+    for row in rows {
+        let label: String = row.try_get("label")?;
+        heads.insert(
+            label,
+            UsageHead {
+                read_at_unix_secs: row.try_get("read_at_unix_secs")?,
+                uplink_bytes: row.try_get("uplink_bytes")?,
+                downlink_bytes: row.try_get("downlink_bytes")?,
+                xray_epoch: row.try_get("xray_epoch")?,
+                generation_id: row.try_get("generation_id")?,
+            },
+        );
+    }
+    Ok(heads)
+}
+
+async fn upsert_usage_heads_batch(
+    tx: &mut Transaction<'_, Postgres>,
+    ctx: &UsageBatchContext<'_>,
+    heads: &[UsageHeadBatchRow],
 ) -> Result<()> {
+    if heads.is_empty() {
+        return Ok(());
+    }
+    let mut labels = Vec::with_capacity(heads.len());
+    let mut uplinks = Vec::with_capacity(heads.len());
+    let mut downlinks = Vec::with_capacity(heads.len());
+    let mut generations = Vec::with_capacity(heads.len());
+    for head in heads {
+        labels.push(head.label.as_str());
+        uplinks.push(head.uplink_bytes);
+        downlinks.push(head.downlink_bytes);
+        generations.push(head.generation_id);
+    }
     sqlx::query(
         "INSERT INTO usage_counter_heads (
             node_id, label, xray_epoch, read_at, xray_started_at,
             uplink_bytes, downlink_bytes, generation_id, agent_instance_id, sequence
-         ) VALUES (
-            $1, $2, $3, to_timestamp($4::double precision),
-            to_timestamp($5::double precision), $6, $7, $8, $9, $10
          )
+         SELECT
+            $1, t.label, $2, to_timestamp($3::double precision),
+            to_timestamp($4::double precision),
+            t.uplink_bytes, t.downlink_bytes, t.generation_id, $5, $6
+         FROM UNNEST($7::text[], $8::bigint[], $9::bigint[], $10::bigint[])
+            AS t(label, uplink_bytes, downlink_bytes, generation_id)
+         ORDER BY t.label
          ON CONFLICT (node_id, label) DO UPDATE SET
             xray_epoch = EXCLUDED.xray_epoch,
             read_at = EXCLUDED.read_at,
@@ -2669,77 +2827,77 @@ async fn upsert_usage_head(
             agent_instance_id = EXCLUDED.agent_instance_id,
             sequence = EXCLUDED.sequence",
     )
-    .bind(node_id)
-    .bind(label)
-    .bind(xray_epoch)
-    .bind(read_at_unix_secs)
-    .bind(xray_started_at_unix_secs)
-    .bind(uplink_bytes)
-    .bind(downlink_bytes)
-    .bind(generation_id)
-    .bind(agent_instance_id)
-    .bind(sequence)
+    .bind(ctx.node_id)
+    .bind(ctx.xray_epoch)
+    .bind(ctx.read_at_unix_secs)
+    .bind(ctx.xray_started_at_unix_secs)
+    .bind(ctx.agent_instance_id)
+    .bind(ctx.sequence)
+    .bind(labels)
+    .bind(uplinks)
+    .bind(downlinks)
+    .bind(generations)
     .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
-struct UsageReadingInsert<'a> {
-    node_id: &'a str,
-    label: &'a str,
-    agent_instance_id: &'a str,
-    sequence: i64,
-    generation_id: i64,
-    xray_epoch: &'a str,
-    read_at_unix_secs: i64,
-    xray_started_at_unix_secs: i64,
-    uplink_bytes: i64,
-    downlink_bytes: i64,
-}
-
-async fn insert_usage_reading(
+async fn insert_usage_readings_batch(
     tx: &mut Transaction<'_, Postgres>,
-    reading: UsageReadingInsert<'_>,
-) -> Result<bool> {
-    let result = sqlx::query(
+    ctx: &UsageBatchContext<'_>,
+    readings: &[UsageReadingBatchRow],
+) -> Result<()> {
+    if readings.is_empty() {
+        return Ok(());
+    }
+    let mut labels = Vec::with_capacity(readings.len());
+    let mut uplinks = Vec::with_capacity(readings.len());
+    let mut downlinks = Vec::with_capacity(readings.len());
+    for reading in readings {
+        labels.push(reading.label.as_str());
+        uplinks.push(reading.uplink_bytes);
+        downlinks.push(reading.downlink_bytes);
+    }
+    let inserted: Vec<String> = sqlx::query_scalar(
         "INSERT INTO usage_readings (
             node_id, label, agent_instance_id, sequence, generation_id, xray_epoch,
             read_at, xray_started_at, uplink_bytes, downlink_bytes
          )
-         VALUES (
-            $1, $2, $3, $4, $5, $6,
+         SELECT
+            $1, t.label, $2, $3, $4, $5,
+            to_timestamp($6::double precision),
             to_timestamp($7::double precision),
-            to_timestamp($8::double precision),
-            $9, $10
-         )
-         ON CONFLICT (node_id, agent_instance_id, sequence, label) DO NOTHING",
+            t.uplink_bytes, t.downlink_bytes
+         FROM UNNEST($8::text[], $9::bigint[], $10::bigint[])
+            AS t(label, uplink_bytes, downlink_bytes)
+         ORDER BY t.label
+         ON CONFLICT (node_id, agent_instance_id, sequence, label) DO NOTHING
+         RETURNING label",
     )
-    .bind(reading.node_id)
-    .bind(reading.label)
-    .bind(reading.agent_instance_id)
-    .bind(reading.sequence)
-    .bind(reading.generation_id)
-    .bind(reading.xray_epoch)
-    .bind(reading.read_at_unix_secs)
-    .bind(reading.xray_started_at_unix_secs)
-    .bind(reading.uplink_bytes)
-    .bind(reading.downlink_bytes)
-    .execute(&mut **tx)
+    .bind(ctx.node_id)
+    .bind(ctx.agent_instance_id)
+    .bind(ctx.sequence)
+    .bind(ctx.generation_id)
+    .bind(ctx.xray_epoch)
+    .bind(ctx.read_at_unix_secs)
+    .bind(ctx.xray_started_at_unix_secs)
+    .bind(labels)
+    .bind(uplinks)
+    .bind(downlinks)
+    .fetch_all(&mut **tx)
     .await?;
-    Ok(result.rows_affected() == 1)
-}
-
-struct UsageSampleInsert<'a> {
-    node_id: &'a str,
-    owner: &'a CounterOwner,
-    window_start_unix_secs: i64,
-    window_end_unix_secs: i64,
-    uplink_bytes: i64,
-    downlink_bytes: i64,
-    has_gap: bool,
-    revision_id: Option<i64>,
-    deployment_id: Option<i64>,
-    generation_id: i64,
+    if inserted.len() != readings.len() {
+        let inserted_set: BTreeSet<String> = inserted.into_iter().collect();
+        for reading in readings {
+            if !inserted_set.contains(&reading.label) {
+                return Err(StoreError::InvalidData(format!(
+                    "duplicate usage reading for {}",
+                    reading.label
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -2750,17 +2908,14 @@ struct UsageWindowTotals {
     relay_down: i64,
 }
 
-fn add_node_window(
+fn add_node_window_parts(
     windows: &mut BTreeMap<(String, String), UsageWindowTotals>,
-    reporter: &str,
-    owner: &CounterOwner,
+    node: &str,
+    tenant: &str,
+    relay: bool,
     up: i64,
     down: i64,
 ) -> Result<()> {
-    let (node, tenant, relay) = match owner {
-        CounterOwner::User(grant) => (reporter, grant.tenant_id.as_str(), false),
-        CounterOwner::ChainHop(hop) => (hop.node_id.as_str(), hop.tenant_id.as_str(), true),
-    };
     let totals = windows
         .entry((node.to_owned(), tenant.to_owned()))
         .or_default();
@@ -2783,73 +2938,146 @@ async fn persist_node_windows(
     window_end: i64,
     windows: BTreeMap<(String, String), UsageWindowTotals>,
 ) -> Result<()> {
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let mut nodes = Vec::with_capacity(windows.len());
+    let mut tenants = Vec::with_capacity(windows.len());
+    let mut user_ups = Vec::with_capacity(windows.len());
+    let mut user_downs = Vec::with_capacity(windows.len());
+    let mut relay_ups = Vec::with_capacity(windows.len());
+    let mut relay_downs = Vec::with_capacity(windows.len());
+    for ((node, tenant), totals) in windows {
+        nodes.push(node);
+        tenants.push(tenant);
+        user_ups.push(totals.user_up);
+        user_downs.push(totals.user_down);
+        relay_ups.push(totals.relay_up);
+        relay_downs.push(totals.relay_down);
+    }
     // Sorted ownership keys give competing reports one lock order, including reverse-hop
     // attribution to a machine other than the reporter. Receipt and heads guard exact replay.
-    for ((node, tenant), totals) in windows {
-        sqlx::query(
-            "INSERT INTO usage_node_windows
-                (node_id, tenant_id, window_end, user_uplink_bytes, user_downlink_bytes,
-                 relay_uplink_bytes, relay_downlink_bytes)
-             VALUES ($1, $2, to_timestamp($3::double precision), $4, $5, $6, $7)
-             ON CONFLICT (node_id, window_end, tenant_id) DO UPDATE SET
-                user_uplink_bytes = usage_node_windows.user_uplink_bytes + EXCLUDED.user_uplink_bytes,
-                user_downlink_bytes = usage_node_windows.user_downlink_bytes + EXCLUDED.user_downlink_bytes,
-                relay_uplink_bytes = usage_node_windows.relay_uplink_bytes + EXCLUDED.relay_uplink_bytes,
-                relay_downlink_bytes = usage_node_windows.relay_downlink_bytes + EXCLUDED.relay_downlink_bytes",
-        )
-        .bind(node).bind(tenant).bind(window_end as f64)
-        .bind(totals.user_up).bind(totals.user_down).bind(totals.relay_up).bind(totals.relay_down)
-        .execute(&mut **tx).await?;
-    }
+    sqlx::query(
+        "INSERT INTO usage_node_windows
+            (node_id, tenant_id, window_end, user_uplink_bytes, user_downlink_bytes,
+             relay_uplink_bytes, relay_downlink_bytes)
+         SELECT t.node_id, t.tenant_id, to_timestamp($1::double precision),
+                t.user_up, t.user_down, t.relay_up, t.relay_down
+         FROM UNNEST(
+            $2::text[], $3::text[], $4::bigint[], $5::bigint[], $6::bigint[], $7::bigint[]
+         ) AS t(node_id, tenant_id, user_up, user_down, relay_up, relay_down)
+         ORDER BY t.node_id, t.tenant_id
+         ON CONFLICT (node_id, window_end, tenant_id) DO UPDATE SET
+            user_uplink_bytes = usage_node_windows.user_uplink_bytes + EXCLUDED.user_uplink_bytes,
+            user_downlink_bytes = usage_node_windows.user_downlink_bytes + EXCLUDED.user_downlink_bytes,
+            relay_uplink_bytes = usage_node_windows.relay_uplink_bytes + EXCLUDED.relay_uplink_bytes,
+            relay_downlink_bytes = usage_node_windows.relay_downlink_bytes + EXCLUDED.relay_downlink_bytes",
+    )
+    .bind(window_end as f64)
+    .bind(nodes)
+    .bind(tenants)
+    .bind(user_ups)
+    .bind(user_downs)
+    .bind(relay_ups)
+    .bind(relay_downs)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
-async fn insert_usage_sample(
+async fn insert_zero_user_samples_batch(
     tx: &mut Transaction<'_, Postgres>,
-    sample: UsageSampleInsert<'_>,
-) -> Result<bool> {
-    let CounterOwner::User(grant) = sample.owner else {
-        return Ok(false);
-    };
-    if sample.uplink_bytes == 0 && sample.downlink_bytes == 0 && !sample.has_gap {
-        // Zero is a valid collected window, not an audit event. The machine projection preserves
-        // that point, while the durable head/receipt already provide ordering and retry safety.
-        // Keep day-level presence identical without rewriting the same zero totals every 30s.
-        sqlx::query(
-            "WITH period AS (
-                SELECT date_trunc('day', to_timestamp($4::double precision) AT TIME ZONE 'Asia/Hong_Kong')
-                           AT TIME ZONE 'Asia/Hong_Kong' AS start
-             ), user_day AS (
-                INSERT INTO usage_rollups
-                    (tenant_id, user_id, app_id, period_start, period_end, uplink_bytes, downlink_bytes, has_gap)
-                SELECT $1, $2, $3, start, start + interval '24 hours', 0, 0, FALSE FROM period
-                ON CONFLICT DO NOTHING
-             )
-             INSERT INTO usage_node_rollups (tenant_id, node_id, period_start, period_end)
-             SELECT $1, $5, start, start + interval '24 hours' FROM period
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(&grant.tenant_id).bind(&grant.user_id).bind(&grant.app_id)
-        .bind(sample.window_start_unix_secs as f64).bind(sample.node_id)
-        .execute(&mut **tx).await?;
-        crate::user_machine_usage::record(
-            tx,
-            sample.node_id,
-            &grant.tenant_id,
-            &grant.user_id,
-            sample.window_start_unix_secs,
-            (0, 0),
-            false,
-        )
-        .await?;
-        return Ok(true);
+    node_id: &str,
+    samples: &[UserSampleBatchRow],
+) -> Result<()> {
+    if samples.is_empty() {
+        return Ok(());
     }
-    // app_id is looked up from ingresses once at insert and frozen, no longer following the
-    // model: when an ingress is moved to another view, this row still says which view it counted
-    // against at the time. Derived on demand, a quota's numerator would jump wholesale to the new
-    // view the instant the model changed.
-    // An ingress that cannot be found leaves NULL, and the query side falls back to a JOIN.
-    let inserted = sqlx::query_scalar::<_, i32>(
+    let mut tenants = Vec::with_capacity(samples.len());
+    let mut users = Vec::with_capacity(samples.len());
+    let mut apps = Vec::with_capacity(samples.len());
+    let mut window_starts = Vec::with_capacity(samples.len());
+    for sample in samples {
+        tenants.push(sample.grant.tenant_id.as_str());
+        users.push(sample.grant.user_id.as_str());
+        apps.push(sample.grant.app_id.as_str());
+        window_starts.push(sample.window_start_unix_secs as f64);
+    }
+    // Zero is a valid collected window, not an audit event. The machine projection preserves
+    // that point, while the durable head/receipt already provide ordering and retry safety.
+    // Keep day-level presence identical without rewriting the same zero totals every 30s.
+    sqlx::query(
+        "WITH periods AS (
+            SELECT
+                t.tenant_id,
+                t.user_id,
+                t.app_id,
+                date_trunc('day', to_timestamp(t.window_start) AT TIME ZONE 'Asia/Hong_Kong')
+                    AT TIME ZONE 'Asia/Hong_Kong' AS start
+            FROM UNNEST($2::text[], $3::text[], $4::text[], $5::double precision[])
+                AS t(tenant_id, user_id, app_id, window_start)
+         ), user_day AS (
+            INSERT INTO usage_rollups
+                (tenant_id, user_id, app_id, period_start, period_end, uplink_bytes, downlink_bytes, has_gap)
+            SELECT DISTINCT tenant_id, user_id, app_id, start, start + interval '24 hours', 0, 0, FALSE
+            FROM periods
+            ORDER BY tenant_id, user_id, app_id, start
+            ON CONFLICT DO NOTHING
+         )
+         INSERT INTO usage_node_rollups (tenant_id, node_id, period_start, period_end)
+         SELECT DISTINCT tenant_id, $1, start, start + interval '24 hours'
+         FROM periods
+         ORDER BY tenant_id, start
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(node_id)
+    .bind(tenants)
+    .bind(users)
+    .bind(apps)
+    .bind(window_starts)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_usage_samples_batch(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    window_end_unix_secs: i64,
+    samples: &[UserSampleBatchRow],
+) -> Result<BTreeSet<String>> {
+    if samples.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut window_starts = Vec::with_capacity(samples.len());
+    let mut tenants = Vec::with_capacity(samples.len());
+    let mut users = Vec::with_capacity(samples.len());
+    let mut ingresses = Vec::with_capacity(samples.len());
+    let mut apps = Vec::with_capacity(samples.len());
+    let mut grant_labels = Vec::with_capacity(samples.len());
+    let mut uplinks = Vec::with_capacity(samples.len());
+    let mut downlinks = Vec::with_capacity(samples.len());
+    let mut has_gaps = Vec::with_capacity(samples.len());
+    let mut revision_ids = Vec::with_capacity(samples.len());
+    let mut deployment_ids = Vec::with_capacity(samples.len());
+    let mut generation_ids = Vec::with_capacity(samples.len());
+    for sample in samples {
+        window_starts.push(sample.window_start_unix_secs as f64);
+        tenants.push(sample.grant.tenant_id.as_str());
+        users.push(sample.grant.user_id.as_str());
+        ingresses.push(sample.grant.ingress_id.as_str());
+        apps.push(sample.grant.app_id.as_str());
+        grant_labels.push(sample.grant.label.as_str());
+        uplinks.push(sample.uplink_bytes);
+        downlinks.push(sample.downlink_bytes);
+        has_gaps.push(sample.has_gap);
+        revision_ids.push(sample.revision_id);
+        deployment_ids.push(sample.deployment_id);
+        generation_ids.push(sample.generation_id);
+    }
+    // app_id is frozen at insert, no longer following the model: when an ingress is moved to
+    // another view, this row still says which view it counted against at the time.
+    let inserted: Vec<String> = sqlx::query_scalar(
         "WITH inserted AS (
              INSERT INTO usage_samples (
                 window_start, window_end, node_id,
@@ -2857,14 +3085,33 @@ async fn insert_usage_sample(
                 uplink_bytes, downlink_bytes, has_gap,
                 revision_id, deployment_id, generation_id
              )
-             VALUES (
-                to_timestamp($1::double precision),
+             SELECT
+                to_timestamp(t.window_start),
                 to_timestamp($2::double precision),
-                $3, $4, $5, $6,
-                $7, $8, $9, $10, $11, $12, $13, $14
+                $1,
+                t.tenant_id, t.user_id, t.ingress_id, t.app_id, t.grant_label,
+                t.uplink_bytes, t.downlink_bytes, t.has_gap,
+                t.revision_id, t.deployment_id, t.generation_id
+             FROM UNNEST(
+                $3::double precision[],
+                $4::text[],
+                $5::text[],
+                $6::text[],
+                $7::text[],
+                $8::text[],
+                $9::bigint[],
+                $10::bigint[],
+                $11::boolean[],
+                $12::bigint[],
+                $13::bigint[],
+                $14::bigint[]
+             ) AS t(
+                window_start, tenant_id, user_id, ingress_id, app_id, grant_label,
+                uplink_bytes, downlink_bytes, has_gap,
+                revision_id, deployment_id, generation_id
              )
              ON CONFLICT (node_id, grant_label, window_start, window_end) DO NOTHING
-             RETURNING tenant_id, node_id, user_id, app_id, window_start,
+             RETURNING tenant_id, node_id, user_id, app_id, grant_label, window_start,
                        uplink_bytes, downlink_bytes, has_gap
          ), rolled AS (
              INSERT INTO usage_rollups (
@@ -2873,12 +3120,15 @@ async fn insert_usage_sample(
              )
              SELECT tenant_id, user_id, app_id,
                     date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
-                        AT TIME ZONE 'Asia/Hong_Kong',
+                        AT TIME ZONE 'Asia/Hong_Kong' AS period_start,
                     (date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
-                        + INTERVAL '1 day') AT TIME ZONE 'Asia/Hong_Kong',
-                    uplink_bytes, downlink_bytes, has_gap, now()
+                        + INTERVAL '1 day') AT TIME ZONE 'Asia/Hong_Kong' AS period_end,
+                    sum(uplink_bytes)::bigint, sum(downlink_bytes)::bigint,
+                    bool_or(has_gap), now()
                FROM inserted
               WHERE app_id IS NOT NULL
+              GROUP BY 1, 2, 3, 4, 5
+              ORDER BY 1, 2, 3, 4, 5
              ON CONFLICT (tenant_id, user_id, app_id, period_start, period_end)
              DO UPDATE SET
                 uplink_bytes = usage_rollups.uplink_bytes + EXCLUDED.uplink_bytes,
@@ -2895,11 +3145,14 @@ async fn insert_usage_sample(
              )
              SELECT tenant_id, node_id,
                     date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
-                        AT TIME ZONE 'Asia/Hong_Kong',
+                        AT TIME ZONE 'Asia/Hong_Kong' AS period_start,
                     (date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
-                        + INTERVAL '1 day') AT TIME ZONE 'Asia/Hong_Kong',
-                    uplink_bytes, downlink_bytes, 0, 0, has_gap, now()
+                        + INTERVAL '1 day') AT TIME ZONE 'Asia/Hong_Kong' AS period_end,
+                    sum(uplink_bytes)::bigint, sum(downlink_bytes)::bigint,
+                    0, 0, bool_or(has_gap), now()
                FROM inserted
+              GROUP BY 1, 2, 3, 4
+              ORDER BY 1, 2, 3, 4
              ON CONFLICT (tenant_id, node_id, period_start, period_end)
              DO UPDATE SET
                 user_uplink_bytes = usage_node_rollups.user_uplink_bytes
@@ -2910,66 +3163,66 @@ async fn insert_usage_sample(
                 updated_at = now()
              RETURNING 1
          )
-         SELECT 1 FROM inserted",
+         SELECT grant_label FROM inserted",
     )
-    .bind(sample.window_start_unix_secs)
-    .bind(sample.window_end_unix_secs)
-    .bind(sample.node_id)
-    .bind(&grant.tenant_id)
-    .bind(&grant.user_id)
-    .bind(&grant.ingress_id)
-    .bind(&grant.app_id)
-    .bind(&grant.label)
-    .bind(sample.uplink_bytes)
-    .bind(sample.downlink_bytes)
-    .bind(sample.has_gap)
-    .bind(sample.revision_id)
-    .bind(sample.deployment_id)
-    .bind(sample.generation_id)
-    .fetch_optional(&mut **tx)
+    .bind(node_id)
+    .bind(window_end_unix_secs as f64)
+    .bind(window_starts)
+    .bind(tenants)
+    .bind(users)
+    .bind(ingresses)
+    .bind(apps)
+    .bind(grant_labels)
+    .bind(uplinks)
+    .bind(downlinks)
+    .bind(has_gaps)
+    .bind(revision_ids)
+    .bind(deployment_ids)
+    .bind(generation_ids)
+    .fetch_all(&mut **tx)
     .await?;
-    if inserted.is_some() {
-        crate::user_machine_usage::record(
-            tx,
-            sample.node_id,
-            &grant.tenant_id,
-            &grant.user_id,
-            sample.window_start_unix_secs,
-            (sample.uplink_bytes, sample.downlink_bytes),
-            sample.has_gap,
-        )
-        .await?;
-        crate::node_inflow_usage::record(
-            tx,
-            crate::node_inflow_usage::IngressWindow {
-                node_id: sample.node_id,
-                tenant_id: &grant.tenant_id,
-                user_id: &grant.user_id,
-                ingress_id: &grant.ingress_id,
-                app_id: &grant.app_id,
-                window_start_unix_secs: sample.window_start_unix_secs,
-                uplink_bytes: sample.uplink_bytes,
-                downlink_bytes: sample.downlink_bytes,
-                has_gap: sample.has_gap,
-            },
-        )
-        .await?;
-    }
-    Ok(inserted.is_some())
+    Ok(inserted.into_iter().collect())
 }
 
-async fn insert_chain_sample(
+async fn insert_chain_samples_batch(
     tx: &mut Transaction<'_, Postgres>,
-    sample: UsageSampleInsert<'_>,
-) -> Result<bool> {
-    let CounterOwner::ChainHop(hop) = sample.owner else {
-        return Ok(false);
-    };
-    // `hop.node_id` rather than `sample.node_id`: under reverse access the counter was read by
-    // the portal machine while the hop is forwarded by the bridge. The raw reading is still
+    window_end_unix_secs: i64,
+    samples: &[ChainSampleBatchRow],
+) -> Result<BTreeSet<String>> {
+    if samples.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut window_starts = Vec::with_capacity(samples.len());
+    let mut node_ids = Vec::with_capacity(samples.len());
+    let mut tenants = Vec::with_capacity(samples.len());
+    let mut apps = Vec::with_capacity(samples.len());
+    let mut chains = Vec::with_capacity(samples.len());
+    let mut hop_labels = Vec::with_capacity(samples.len());
+    let mut uplinks = Vec::with_capacity(samples.len());
+    let mut downlinks = Vec::with_capacity(samples.len());
+    let mut has_gaps = Vec::with_capacity(samples.len());
+    let mut revision_ids = Vec::with_capacity(samples.len());
+    let mut deployment_ids = Vec::with_capacity(samples.len());
+    let mut generation_ids = Vec::with_capacity(samples.len());
+    for sample in samples {
+        window_starts.push(sample.window_start_unix_secs as f64);
+        node_ids.push(sample.hop.node_id.as_str());
+        tenants.push(sample.hop.tenant_id.as_str());
+        apps.push(sample.hop.app_id.as_str());
+        chains.push(sample.hop.chain_id.as_str());
+        hop_labels.push(sample.hop.label.as_str());
+        uplinks.push(sample.uplink_bytes);
+        downlinks.push(sample.downlink_bytes);
+        has_gaps.push(sample.has_gap);
+        revision_ids.push(sample.revision_id);
+        deployment_ids.push(sample.deployment_id);
+        generation_ids.push(sample.generation_id);
+    }
+    // `hop.node_id` rather than the reporter's node_id: under reverse access the counter was read
+    // by the portal machine while the hop is forwarded by the bridge. The raw reading is still
     // recorded against whoever read it (differences must be taken against one source), and only
     // this step, turning it into accounting, attributes it to the hop's owner.
-    let inserted = sqlx::query_scalar::<_, i32>(
+    let inserted: Vec<String> = sqlx::query_scalar(
         "WITH inserted AS (
              INSERT INTO usage_chain_samples (
                 window_start, window_end, node_id,
@@ -2977,13 +3230,32 @@ async fn insert_chain_sample(
                 uplink_bytes, downlink_bytes, has_gap,
                 revision_id, deployment_id, generation_id
              )
-             VALUES (
+             SELECT
+                to_timestamp(t.window_start),
                 to_timestamp($1::double precision),
-                to_timestamp($2::double precision),
-                $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+                t.node_id, t.tenant_id, t.app_id, t.chain_id, t.hop_label,
+                t.uplink_bytes, t.downlink_bytes, t.has_gap,
+                t.revision_id, t.deployment_id, t.generation_id
+             FROM UNNEST(
+                $2::double precision[],
+                $3::text[],
+                $4::text[],
+                $5::text[],
+                $6::text[],
+                $7::text[],
+                $8::bigint[],
+                $9::bigint[],
+                $10::boolean[],
+                $11::bigint[],
+                $12::bigint[],
+                $13::bigint[]
+             ) AS t(
+                window_start, node_id, tenant_id, app_id, chain_id, hop_label,
+                uplink_bytes, downlink_bytes, has_gap,
+                revision_id, deployment_id, generation_id
              )
              ON CONFLICT (node_id, hop_label, window_start, window_end) DO NOTHING
-             RETURNING tenant_id, node_id, window_start,
+             RETURNING tenant_id, node_id, hop_label, window_start,
                        uplink_bytes, downlink_bytes, has_gap
          ), rolled AS (
              INSERT INTO usage_node_rollups (
@@ -2994,11 +3266,14 @@ async fn insert_chain_sample(
              )
              SELECT tenant_id, node_id,
                     date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
-                        AT TIME ZONE 'Asia/Hong_Kong',
+                        AT TIME ZONE 'Asia/Hong_Kong' AS period_start,
                     (date_trunc('day', window_start AT TIME ZONE 'Asia/Hong_Kong')
-                        + INTERVAL '1 day') AT TIME ZONE 'Asia/Hong_Kong',
-                    0, 0, uplink_bytes, downlink_bytes, has_gap, now()
+                        + INTERVAL '1 day') AT TIME ZONE 'Asia/Hong_Kong' AS period_end,
+                    0, 0, sum(uplink_bytes)::bigint, sum(downlink_bytes)::bigint,
+                    bool_or(has_gap), now()
                FROM inserted
+              GROUP BY 1, 2, 3, 4
+              ORDER BY 1, 2, 3, 4
              ON CONFLICT (tenant_id, node_id, period_start, period_end)
              DO UPDATE SET
                 relay_uplink_bytes = usage_node_rollups.relay_uplink_bytes
@@ -3009,24 +3284,24 @@ async fn insert_chain_sample(
                 updated_at = now()
              RETURNING 1
          )
-         SELECT 1 FROM inserted",
+         SELECT hop_label FROM inserted",
     )
-    .bind(sample.window_start_unix_secs)
-    .bind(sample.window_end_unix_secs)
-    .bind(&hop.node_id)
-    .bind(&hop.tenant_id)
-    .bind(&hop.app_id)
-    .bind(&hop.chain_id)
-    .bind(&hop.label)
-    .bind(sample.uplink_bytes)
-    .bind(sample.downlink_bytes)
-    .bind(sample.has_gap)
-    .bind(sample.revision_id)
-    .bind(sample.deployment_id)
-    .bind(sample.generation_id)
-    .fetch_optional(&mut **tx)
+    .bind(window_end_unix_secs as f64)
+    .bind(window_starts)
+    .bind(node_ids)
+    .bind(tenants)
+    .bind(apps)
+    .bind(chains)
+    .bind(hop_labels)
+    .bind(uplinks)
+    .bind(downlinks)
+    .bind(has_gaps)
+    .bind(revision_ids)
+    .bind(deployment_ids)
+    .bind(generation_ids)
+    .fetch_all(&mut **tx)
     .await?;
-    Ok(inserted.is_some())
+    Ok(inserted.into_iter().collect())
 }
 
 fn u64_to_i64(field: &str, value: u64) -> Result<i64> {

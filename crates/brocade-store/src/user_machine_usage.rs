@@ -34,24 +34,78 @@ pub struct UserMachineUsageRow {
     pub points: Vec<(i64, u64, u64, u64, bool, bool)>,
 }
 
-pub(crate) async fn record(
+pub(crate) struct UserMachineUsageWindow {
+    pub(crate) node_id: String,
+    pub(crate) tenant_id: String,
+    pub(crate) user_id: String,
+    pub(crate) window_start_unix_secs: i64,
+    pub(crate) uplink_bytes: i64,
+    pub(crate) downlink_bytes: i64,
+    pub(crate) has_gap: bool,
+}
+
+pub(crate) async fn record_batch(
     tx: &mut Transaction<'_, Postgres>,
-    node: &str,
-    tenant: &str,
-    user: &str,
-    start: i64,
-    bytes: (i64, i64),
-    gap: bool,
+    windows: &[UserMachineUsageWindow],
 ) -> Result<()> {
-    sqlx::query("INSERT INTO usage_user_node_rollups (tenant_id,user_id,node_id,period_start,uplink_bytes,downlink_bytes,has_gap)
-        VALUES ($1,$2,$3,date_trunc('day',to_timestamp($4) AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong',$5,$6,$7)
-        ON CONFLICT (tenant_id,user_id,period_start,node_id) DO UPDATE SET
-        uplink_bytes=usage_user_node_rollups.uplink_bytes+EXCLUDED.uplink_bytes,
-        downlink_bytes=usage_user_node_rollups.downlink_bytes+EXCLUDED.downlink_bytes,
-        has_gap=usage_user_node_rollups.has_gap OR EXCLUDED.has_gap
-        WHERE EXCLUDED.uplink_bytes<>0 OR EXCLUDED.downlink_bytes<>0 OR EXCLUDED.has_gap")
-        .bind(tenant).bind(user).bind(node).bind(start as f64).bind(bytes.0).bind(bytes.1).bind(gap)
-        .execute(&mut **tx).await?;
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let mut tenants = Vec::with_capacity(windows.len());
+    let mut users = Vec::with_capacity(windows.len());
+    let mut nodes = Vec::with_capacity(windows.len());
+    let mut starts = Vec::with_capacity(windows.len());
+    let mut uplinks = Vec::with_capacity(windows.len());
+    let mut downlinks = Vec::with_capacity(windows.len());
+    let mut gaps = Vec::with_capacity(windows.len());
+    for window in windows {
+        tenants.push(window.tenant_id.as_str());
+        users.push(window.user_id.as_str());
+        nodes.push(window.node_id.as_str());
+        starts.push(window.window_start_unix_secs as f64);
+        uplinks.push(window.uplink_bytes);
+        downlinks.push(window.downlink_bytes);
+        gaps.push(window.has_gap);
+    }
+    sqlx::query(
+        "INSERT INTO usage_user_node_rollups (
+            tenant_id, user_id, node_id, period_start, uplink_bytes, downlink_bytes, has_gap
+         )
+         SELECT
+            t.tenant_id,
+            t.user_id,
+            t.node_id,
+            date_trunc('day', to_timestamp(t.window_start) AT TIME ZONE 'Asia/Hong_Kong')
+                AT TIME ZONE 'Asia/Hong_Kong' AS period_start,
+            sum(t.uplink_bytes)::bigint,
+            sum(t.downlink_bytes)::bigint,
+            bool_or(t.has_gap)
+         FROM UNNEST(
+            $1::text[],
+            $2::text[],
+            $3::text[],
+            $4::double precision[],
+            $5::bigint[],
+            $6::bigint[],
+            $7::boolean[]
+         ) AS t(tenant_id, user_id, node_id, window_start, uplink_bytes, downlink_bytes, has_gap)
+         GROUP BY 1, 2, 3, 4
+         ORDER BY 1, 2, 4, 3
+         ON CONFLICT (tenant_id, user_id, period_start, node_id) DO UPDATE SET
+            uplink_bytes = usage_user_node_rollups.uplink_bytes + EXCLUDED.uplink_bytes,
+            downlink_bytes = usage_user_node_rollups.downlink_bytes + EXCLUDED.downlink_bytes,
+            has_gap = usage_user_node_rollups.has_gap OR EXCLUDED.has_gap
+         WHERE EXCLUDED.uplink_bytes <> 0 OR EXCLUDED.downlink_bytes <> 0 OR EXCLUDED.has_gap",
+    )
+    .bind(&tenants)
+    .bind(&users)
+    .bind(&nodes)
+    .bind(&starts)
+    .bind(&uplinks)
+    .bind(&downlinks)
+    .bind(&gaps)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
