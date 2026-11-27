@@ -506,7 +506,7 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--flavor', choices=['base', 'cvm'], default='base')
-    parser.add_argument('--jobs', type=int, choices=range(2, 9), default=4)
+    parser.add_argument('--jobs', type=int, default=8, help='positive build job count (default: %(default)s)')
     parser.add_argument(
         '--cube-runtime-only', action='store_true', help='prepare the optional Cube node stack in its fixed cache'
     )
@@ -520,6 +520,8 @@ def main():
         help='fixed Guest assets plus their SHA-256 manifest; assemble a node-only CVM install bundle',
     )
     args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error('--jobs must be a positive integer')
     if args.cvm_package_assets and not args.cube_runtime_only:
         parser.error('--cvm-package-assets requires --cube-runtime-only')
     if args.cube_runtime_only and (not args.cube_arch or not args.cube_sysroot_libs):

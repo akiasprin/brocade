@@ -130,7 +130,7 @@ def run(command, cwd, env, record, name, log_dir):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arch', choices=['x86_64', 'aarch64'], required=True)
-    parser.add_argument('--jobs', type=int, choices=range(2, 9), default=4)
+    parser.add_argument('--jobs', type=int, default=8, help='positive build job count (default: %(default)s)')
     parser.add_argument(
         '--sysroot-libs',
         type=Path,
@@ -144,6 +144,8 @@ def main():
     parser.add_argument('--clang', type=Path, default=Path('/usr/lib/llvm-21/bin/clang'))
     parser.add_argument('--go', default=os.environ.get('BROCADE_GO', 'go'))
     args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error('--jobs must be a positive integer')
     root = Path(__file__).resolve().parents[1]
     if str(root).startswith(('/tmp/', '/var/tmp/')):
         parser.error('use a persistent checkout')

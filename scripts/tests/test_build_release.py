@@ -25,6 +25,37 @@ SPEC.loader.exec_module(BUILD)
 
 
 class ReleaseBuildTests(unittest.TestCase):
+    def test_release_job_count_defaults_to_eight_and_accepts_positive_overrides(self):
+        for flags, jobs in (([], 8), (['--jobs', '1'], 1), (['--jobs', '48'], 48)):
+            with (
+                self.subTest(jobs=jobs),
+                patch.object(sys, 'argv', [str(PATH), *flags]),
+                patch.object(BUILD, 'build') as build,
+            ):
+                self.assertEqual(BUILD.main(), 0)
+                self.assertEqual(build.call_args.args[0].jobs, jobs)
+
+    def test_build_entry_points_reject_nonpositive_jobs(self):
+        cube = PATH.with_name('build-cube.py')
+        for script, flags in ((PATH, []), (cube, ['--arch', 'x86_64', '--sysroot-libs', '/unused'])):
+            for jobs in ('0', '-1'):
+                with self.subTest(script=script.name, jobs=jobs):
+                    result = subprocess.run(
+                        [sys.executable, str(script), *flags, '--jobs', jobs],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn('--jobs must be a positive integer', result.stderr)
+            if script == cube:
+                # Reaching the build-input check proves that the child entry point also accepts 48.
+                result = subprocess.run(
+                    [sys.executable, str(script), *flags, '--jobs', '48'], capture_output=True, text=True, timeout=10
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('required build input is missing', result.stderr)
+
     def test_cube_runtime_dispatch_does_not_start_the_console_pipeline(self):
         argv = [
             'build-release.py',
@@ -35,6 +66,8 @@ class ReleaseBuildTests(unittest.TestCase):
             '/target/sysroot',
             '--cube-bpf-include',
             '/target/include',
+            '--jobs',
+            '48',
         ]
         with (
             patch.object(sys, 'argv', argv),
@@ -51,6 +84,7 @@ class ReleaseBuildTests(unittest.TestCase):
             self.assertIn('--sysroot-libs', command)
             self.assertIn('--arch', command)
             self.assertIn('x86_64', command)
+            self.assertEqual(command[command.index('--jobs') + 1], '48')
             self.assertEqual(command[command.index('--glibc') + 1], '2.35')
             self.assertEqual(command[command.index('--go') + 1], '/tools/go')
             self.assertEqual(compiler.call_args.kwargs, {'component': 'cube'})

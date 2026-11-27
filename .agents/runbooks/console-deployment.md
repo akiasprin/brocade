@@ -48,7 +48,7 @@
 - 统一入口为 `python3 scripts/build-release.py --flavor base|cvm`，默认 `base`。禁止在 `target/releases/<时间戳>/source`、`/tmp`、`/var/tmp` 等临时快照中编译。发布归档在构建验证完成后复制产物、来源清单和摘要，不改变下次构建位置。
 - 同一工作树的两种变体共用 `target/brocade-release/lock` 排他锁；构建期间不得切换源码或并行复用前端目录。容器版分别构建 base/cvm Agent，基础版只构建 base Agent。
 - Console 缓存固定在 `target/brocade-release/<flavor>/cargo`，Agent 缓存按 `target/brocade-agent-build/<flavor>` 隔离，Zig 包装脚本保留在 `target/brocade-agent-build`，Xray 验证账本固定在 `target/brocade-xray-verified`。清理发布备份、临时归档时保留这些构建缓存；缓存失效仍按实际输入重建，不凭旧修改时间认定有效。
-- 两个 Console GNU 目标在一次 Cargo 调用中通过重复 `--target` 调度；需要构建的两个 Agent musl 目标也由一次 Cargo 调用调度。不得以两个 Cargo 同时争用同一 target 目录冒充并行；默认 jobs=4，入口允许 2–8，资源争抢时按实测调整。
+- 两个 Console GNU 目标在一次 Cargo 调用中通过重复 `--target` 调度；需要构建的两个 Agent musl 目标也由一次 Cargo 调用调度。不得以两个 Cargo 同时争用同一 target 目录冒充并行；默认 `--jobs 8`，可显式指定任意正整数；根据实际 CPU、内存和并发负载调整。
 - 前端由入口按源码、Node/npm 版本和产物摘要复用或构建一次，再供两个 Console 目标嵌入；不得让两边并发 `npm ci` 改写同一 node_modules。
 - 同一工作树的发布入口使用非阻塞锁，已有构建时立即报忙，不隐藏排队。锁只约束该入口，不能替代禁止其他任务写入工作树的要求；构建前后输入摘要不同，拒绝接纳产物。
 - 构建不设置总时限或阶段超时，内嵌 Xray 的 Go 命令和构建账本锁等待也不因耗时中止。构建和每个阶段开始、结束时输出 UTC ISO 8601 时间，包含结果和单调时钟耗时；运行中每 30 秒报告当前阶段、开始时间、阶段耗时及累计耗时。人工取消或实际错误终止本次进程组，失败记录不得引用此前成功的产物。
