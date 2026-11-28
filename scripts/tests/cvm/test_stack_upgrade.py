@@ -396,6 +396,8 @@ class FirstInstallTests(unittest.TestCase):
     uuid = '095651a0-b544-4a9e-99e6-997035521fd2'
 
     def setUp(self):
+        previous_umask = os.umask(0o077)
+        self.addCleanup(os.umask, previous_umask)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
