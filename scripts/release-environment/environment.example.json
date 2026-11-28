@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "paths": {
+    "workspace": "/path/to/private/release-workspace",
+    "evidence": "/path/to/private/release-evidence",
+    "cache": "/path/to/private/release-cache"
+  },
+  "source_repository": "/path/to/source-checkout",
+  "revision": "0000000000000000000000000000000000000000",
+  "base_image": "ubuntu:22.04",
+  "image_prefix": "brocade-release",
+  "node_version": "22.23.0",
+  "tool_sha256": {
+    "node": "14d7de44f235534799f8b171a4050d9a6a4bc99c87e053a25d3d54afa580aa20",
+    "go": "7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840"
+  },
+  "tools_directory": "/path/to/private/release-cache/tools",
+  "tools": {},
+  "inputs": {
+    "cube_sysroot_libs": "/path/to/pinned/cube-sysroot/lib",
+    "cube_bpf_include": "/path/to/pinned/bpf/include",
+    "cube_assets": "/path/to/pinned/cube-assets",
+    "os_image": "/path/to/pinned/ubuntu.img",
+    "geoip": "/path/to/pinned/geoip.dat",
+    "geosite": "/path/to/pinned/geosite.dat"
+  },
+  "os_image_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "geoip_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "geosite_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "install_missing_tools": true,
+  "jobs": {
+    "base": 16,
+    "cvm": 16,
+    "cube-a": 12,
+    "cube-b": 12
+  },
+  "minimum_cpus": 24,
+  "minimum_free_gib": 100,
+  "kvm_memory_gib": 33,
+  "reserved_memory_gib": 8,
+  "acceptance_selector": "all",
+  "stop_labs": true,
+  "run_directory": "/path/to/private/release-evidence/kvm-current"
+}
