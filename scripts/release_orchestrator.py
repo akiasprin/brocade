@@ -583,7 +583,7 @@ class ReleaseEnvironment:
             'BROCADE_GO': '/home/build/tool-go/bin/go',
             'BROCADE_ZIG': '/home/build/tool-zig/zig',
             'RUSTUP_TOOLCHAIN': self.pins['rust'],
-            'PATH': '/home/build/tool-node/bin:/home/build/tool-go/bin:/home/build/cargo/bin:/usr/lib/llvm-21/bin:/usr/local/bin:/usr/bin:/bin',
+            'PATH': '/home/build/tool-node/bin:/home/build/tool-go/bin:/home/build/tool-zig:/home/build/cargo/bin:/usr/lib/llvm-21/bin:/usr/local/bin:/usr/bin:/bin',
         }
         environment.update(extra_env or {})
         command = ['docker', 'run', '--rm', '--name', name, '--init', '--user', f'{os.getuid()}:{os.getgid()}']
@@ -688,7 +688,6 @@ rustc "$probe/main.rs" -o "$probe/rust-probe"
 "$probe/rust-probe"
 python3 -c 'import sys; assert sys.version_info >= (3, 10)'
 """
-        runner = Runner(self.evidence / 'preflight' / name, 'preflight-' + name)
         command = self.container(
             f'brocade-preflight-{os.getpid()}-{name}',
             target,
@@ -703,15 +702,26 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
             },
         )
         command[command.index('--workdir') : command.index('--workdir') + 2] = []
-        runner.execute(command + ['-c', script])
+        self.phase(self.evidence / 'preflight', name, command, retryable=True)
 
     def preflight(self, kvm=False):
         host = self.host_preflight(kvm=kvm)
         head = self.require_tools()
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            list(pool.map(self.probe, ['base', 'cvm', 'cube-a', 'cube-b']))
-        report = {'status': 'passed', 'host': host, 'head': head, 'pins': self.pins, 'checked_at': utc_now()}
-        atomic_json(self.evidence / 'preflight/report.json', report)
+        report_path = self.evidence / 'preflight/report.json'
+        report = {'status': 'running', 'host': host, 'head': head, 'pins': self.pins, 'checked_at': utc_now()}
+        atomic_json(report_path, report)
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                wait_all(
+                    [pool.submit(self.probe, name) for name in ('base', 'cvm', 'cube-a', 'cube-b')],
+                    'compiler preflight',
+                )
+        except BaseException as error:
+            report.update(status='failed', error=str(error), checked_at=utc_now())
+            atomic_json(report_path, report)
+            raise
+        report.update(status='passed', checked_at=utc_now())
+        atomic_json(report_path, report)
         return report
 
     def build_one(self, name):

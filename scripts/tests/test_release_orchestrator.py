@@ -55,6 +55,8 @@ class ReleaseOrchestratorTests(unittest.TestCase):
         self.assertIn('TARGET_KIND=cube', command)
         self.assertEqual(command[command.index('TARGET_KIND=cube') - 1], '--env')
         self.assertNotIn('TARGET_KIND', os.environ)
+        path = next(value for value in command if value.startswith('PATH='))
+        self.assertIn('/home/build/tool-zig:', path)
 
     def test_container_mounts_all_candidate_sources_for_independent_verification(self):
         with patch.object(self.environment, 'mount_git', side_effect=lambda source: [str(source / '.git-parent')]):
@@ -209,6 +211,27 @@ class ReleaseOrchestratorTests(unittest.TestCase):
         (evidence / 'first-install.json').write_text('{"download_fault": {"mode": "hash"}}')
         with self.assertRaisesRegex(ORCHESTRATOR.OrchestrationError, 'new disposable lab'):
             self.environment.first_install(root, self.root / 'cvm')
+
+    def test_failed_preflight_replaces_stale_success_report(self):
+        with (
+            patch.object(self.environment, 'host_preflight', return_value={'platform': 'linux'}),
+            patch.object(self.environment, 'require_tools', return_value='head'),
+            patch.object(self.environment, 'probe', side_effect=ORCHESTRATOR.OrchestrationError('compiler missing')),
+        ):
+            with self.assertRaisesRegex(ORCHESTRATOR.OrchestrationError, '4 suites'):
+                self.environment.preflight()
+        report = json.loads((self.environment.evidence / 'preflight/report.json').read_text())
+        self.assertEqual(report['status'], 'failed')
+        self.assertIn('compiler missing', report['error'])
+
+    def test_retryable_phase_archives_failed_attempt(self):
+        root = self.environment.evidence / 'preflight'
+        step = root / 'steps/base'
+        ORCHESTRATOR.atomic_json(step / 'result.json', {'exit_code': 127})
+        with patch.object(ORCHESTRATOR.Runner, 'execute') as execute:
+            self.environment.phase(root, 'base', ['probe'], retryable=True)
+        self.assertTrue((root / 'steps/base-attempt-2/result.json').is_file())
+        execute.assert_called_once()
 
     def test_docker_builder_falls_back_when_buildx_is_absent(self):
         source = self.environment.source('base')
