@@ -1158,11 +1158,10 @@ threading.Event().wait()
                 == 0
             ),
         )
-        assert self.detail(deployment)['status'] == 'running'
         self.wait(
-            'entry target remains converging behind its real receipt gate',
+            'entry deployment reaches running with its target held behind the real receipt gate',
             lambda: self.detail(deployment),
-            lambda d: any(t['status'] == 'converging' for t in d['targets']),
+            lambda d: d['status'] == 'running' and any(t['status'] == 'converging' for t in d['targets']),
         )
         captured = self.prefix + '/gate/compute-b-entry.json'
         proof = self.wait(

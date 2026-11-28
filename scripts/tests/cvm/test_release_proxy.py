@@ -4,6 +4,7 @@ import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -34,6 +35,23 @@ class LabRouteValidationTests(unittest.TestCase):
                     lab.verify_owned()
                 qmp.assert_not_called()
                 remote.assert_not_called()
+
+    def test_stop_skips_already_stopped_roles_even_when_pid_is_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lab = object.__new__(Lab)
+            lab.output = Path(directory)
+            lab.state = {
+                'roles': {
+                    'provider': {
+                        'pid': os.getpid(),
+                        'name': 'stale-lab-name',
+                        'qmp': '/stale/lab.qmp',
+                        'stopped': True,
+                    }
+                }
+            }
+            lab.stop()
+            self.assertTrue(lab.state['roles']['provider']['stopped'])
 
     def test_invalid_routes_are_rejected_before_remote_mutation(self):
         lab = object.__new__(Lab)

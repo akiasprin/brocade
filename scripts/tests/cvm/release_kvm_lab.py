@@ -178,6 +178,8 @@ class Lab:
 
     def stop(self):
         for role, state in self.state['roles'].items():
+            if state.get('stopped'):
+                continue
             pid = state.get('pid')
             if pid and Path(f'/proc/{pid}/cmdline').exists():
                 words = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
