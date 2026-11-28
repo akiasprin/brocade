@@ -81,10 +81,9 @@ export function NodeRetireDialog({
 }) {
   const phase = node.lifecycle_phase;
   const live = phase === 'active';
-  const [chosen, setChosen] = useState<NodeRetireMode>(live ? 'retire' : 'remove');
+  // 轮询更新状态不能升级用户意图；仅退役不再可用时禁用确认，移出须显式选择。
+  const [mode, setMode] = useState<NodeRetireMode>(live ? 'retire' : 'remove');
   const [force, setForce] = useState(true);
-  // 强制退役后移出失败时，机器在弹层打开期间变成已退役：此时只剩「移出」一种选择。
-  const mode: NodeRetireMode = live ? chosen : 'remove';
   const removing = mode === 'remove';
   const showForce = live || phase === 'retiring';
   const action = nodeRetireAction(phase, mode, showForce ? force : true);
@@ -137,7 +136,7 @@ export function NodeRetireDialog({
                 value="retire"
                 checked={mode === 'retire'}
                 disabled={!live}
-                onChange={() => setChosen('retire')}
+                onChange={() => setMode('retire')}
               />
               <span className="node-retire-dot" aria-hidden="true" />
               <span className="node-retire-option-title">
@@ -152,7 +151,7 @@ export function NodeRetireDialog({
                 name={`node-retire-mode-${node.node_id}`}
                 value="remove"
                 checked={removing}
-                onChange={() => setChosen('remove')}
+                onChange={() => setMode('remove')}
               />
               <span className="node-retire-dot" aria-hidden="true" />
               <span className="node-retire-option-title">
