@@ -957,9 +957,9 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
         run_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         selector = self.config['acceptance_selector']
         selected = ('main', 'stack', 'first-install') if selector == 'all' else (selector,)
-        cvm = self.source('cube-a') / 'scripts/tests/cvm'
-        for name in selected:
-            require(cvm.is_dir(), 'acceptance source is missing')
+        # Run the harness paired with this orchestrator, not an older build worktree.
+        cvm = ROOT / 'scripts/tests/cvm'
+        require(cvm.is_dir(), 'acceptance source is missing')
         jobs = []
         if 'stack' in selected or 'first-install' in selected:
             catalog = run_root / 'stack/catalog'
@@ -1067,20 +1067,25 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
                     str(root / 'prerequisites'),
                 ],
             )
-        inputs = root / 'services/inputs'
-        inputs.mkdir(mode=0o700, parents=True, exist_ok=True)
+        services = root / 'services'
+        command = [sys.executable, str(cvm / 'release_kvm_deploy.py')]
+        if name == 'first-install':
+            command.append('--agent-only-compute')
         for key in ('geoip', 'geosite'):
-            target = inputs / (key + '.dat')
-            if not target.exists():
-                shutil.copyfile(self.config['inputs'][key], target)
-                target.chmod(0o600)
-            require(digest(target) == self.config[key + '_sha256'], f'frozen {key} asset differs from its pin')
-        if not (root / 'services/input-hashes.json').exists():
-            command = [sys.executable, str(cvm / 'release_kvm_deploy.py')]
-            if name == 'first-install':
-                command.append('--agent-only-compute')
-            command += [str(lab), str(frozen), str(root / 'services')]
-            self.phase(root, 'deployment', command)
+            command += [
+                '--' + key,
+                str(self.config['inputs'][key]),
+                '--' + key + '-sha256',
+                self.config[key + '_sha256'],
+            ]
+        command += [str(lab), str(frozen), str(services)]
+        # Input hashes are written before deployment; only phase success records allow resuming.
+        self.phase(root, 'deployment', command)
+        for key in ('geoip', 'geosite'):
+            require(
+                digest(services / 'inputs' / (key + '.dat')) == self.config[key + '_sha256'],
+                f'deployed {key} asset differs from its pin',
+            )
         self.phase(
             root,
             'verify-owned',

@@ -60,8 +60,10 @@ reported as a fresh-install pass by resuming a modified VM.
 `verify` assembles both Cube bundles in the independent Python 3.11 packager,
 reopens all four candidate source trees, checks ELF/glibc boundaries and Stack
 A/B content identity, then freezes the deployment inputs. `accept` hashes those
-frozen inputs again before starting any VM. It still uses the real release KVM
-scripts and their original assertions.
+frozen inputs again before starting any VM. It runs the release KVM scripts
+from the same checkout as the orchestrator, without editing the candidate source
+trees. The deployment script copies and verifies the pinned GeoIP and GeoSite
+files and creates the Agent-only output directory exclusively.
 
 To explicitly retire only target caches marked by this orchestrator:
 

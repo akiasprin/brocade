@@ -10,6 +10,7 @@ from pathlib import Path
 import secrets
 import shlex
 import shutil
+import tempfile
 import time
 import urllib.request
 
@@ -30,12 +31,41 @@ mkdir -p /data/cubelet/storage
 """
 
 
+def copy_pinned_input(source, expected, target):
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError(f'pinned input is not a regular file: {source}')
+    with source.open('rb') as stream:
+        if hashlib.file_digest(stream, 'sha256').hexdigest() != expected:
+            raise RuntimeError(f'pinned input differs from its SHA-256: {source}')
+    if target.is_symlink():
+        raise RuntimeError(f'deployment input must not be a symlink: {target}')
+    if target.exists():
+        with target.open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != expected:
+                raise RuntimeError(f'deployment input differs from its SHA-256: {target}')
+        return
+    with tempfile.TemporaryDirectory(dir=target.parent) as directory:
+        staged = Path(directory) / target.name
+        shutil.copyfile(source, staged)
+        staged.chmod(0o600)
+        with staged.open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != expected:
+                raise RuntimeError(f'deployment input differs from its SHA-256: {target}')
+        staged.replace(target)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--agent-only-compute', action='store_true', help='prepare compute without a Cube installation')
+    for name in ('geoip', 'geosite'):
+        parser.add_argument('--' + name, type=Path)
+        parser.add_argument('--' + name + '-sha256')
     for name in ('lab_path', 'build_path', 'output_path'):
         parser.add_argument(name, type=Path)
     args = parser.parse_args()
+    for name in ('geoip', 'geosite'):
+        if (getattr(args, name) is None) != (getattr(args, name + '_sha256') is None):
+            parser.error(f'--{name} and --{name}-sha256 must be provided together')
     lab = Lab(args.lab_path)
     build_path, output_path = args.build_path, args.output_path
     if lab.state.get('agent_only_compute'):
@@ -66,7 +96,10 @@ def main():
         hashes[name] = digest
     for name in ('geoip.dat', 'geosite.dat'):
         target = inputs / name
-        if not target.exists():
+        source = getattr(args, name.removesuffix('.dat'))
+        if source is not None:
+            copy_pinned_input(source, getattr(args, name.removesuffix('.dat') + '_sha256'), target)
+        elif not target.exists():
             url = 'https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/' + name
             with urllib.request.urlopen(url, timeout=120) as response, target.open('wb') as stream:
                 shutil.copyfileobj(response, stream)

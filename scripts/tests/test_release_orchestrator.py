@@ -292,6 +292,60 @@ class ReleaseOrchestratorTests(unittest.TestCase):
         self.assertTrue(commands)
         self.assertTrue(all(kwargs['env']['DOCKER_BUILDKIT'] == '0' for _command, kwargs in commands))
 
+    def test_first_install_receives_pinned_inputs_without_output_precreation(self):
+        root = self.environment.evidence / 'first-install'
+        (root / 'lab-3').mkdir(parents=True)
+        (root / 'lab-3/lab.json').write_text('{}')
+        (root / 'prerequisites').mkdir()
+        (root / 'prerequisites/prerequisites.json').write_text('{}')
+        for key in ('geoip', 'geosite'):
+            source = self.root / (key + '.dat')
+            source.write_text(key)
+            self.environment.config['inputs'][key] = source
+            self.environment.config[key + '_sha256'] = ORCHESTRATOR.digest(source)
+        commands = []
+
+        def deploy(_root, name, command, **_kwargs):
+            commands.append((name, command))
+            if name == 'deployment':
+                self.assertFalse((root / 'services').exists())
+                inputs = root / 'services/inputs'
+                inputs.mkdir(parents=True)
+                for key in ('geoip', 'geosite'):
+                    (inputs / (key + '.dat')).write_text(key)
+
+        with patch.object(self.environment, 'phase', side_effect=deploy):
+            self.environment.prepare_lab('first-install', root, self.root / 'cvm', self.root / 'frozen')
+        command = next(command for name, command in commands if name == 'deployment')
+        self.assertIn('--agent-only-compute', command)
+        for key in ('geoip', 'geosite'):
+            self.assertIn('--' + key, command)
+            self.assertIn('--' + key + '-sha256', command)
+
+    def test_failed_deployment_is_not_hidden_by_its_input_manifest(self):
+        root = self.environment.evidence / 'first-install'
+        (root / 'lab-3').mkdir(parents=True)
+        (root / 'lab-3/lab.json').write_text('{}')
+        (root / 'prerequisites').mkdir()
+        (root / 'prerequisites/prerequisites.json').write_text('{}')
+        (root / 'services').mkdir()
+        (root / 'services/input-hashes.json').write_text('{}')
+        for key in ('geoip', 'geosite'):
+            self.environment.config['inputs'][key] = self.root / (key + '.dat')
+            self.environment.config[key + '_sha256'] = '0' * 64
+        ORCHESTRATOR.atomic_json(root / 'steps/deployment/result.json', {'exit_code': 1})
+
+        def preserve(_root, name, command, **kwargs):
+            if name == 'deployment':
+                return ORCHESTRATOR.ReleaseEnvironment.phase(self.environment, root, name, command, **kwargs)
+            return True
+
+        with (
+            patch.object(self.environment, 'phase', side_effect=preserve),
+            self.assertRaisesRegex(ORCHESTRATOR.OrchestrationError, 'new disposable run'),
+        ):
+            self.environment.prepare_lab('first-install', root, self.root / 'cvm', self.root / 'frozen')
+
     def test_accept_creates_the_stack_catalog_parent_on_a_fresh_run(self):
         candidate = self.environment.evidence / 'candidate'
         frozen = candidate / 'deployment-build'
@@ -304,10 +358,10 @@ class ReleaseOrchestratorTests(unittest.TestCase):
         (frozen / 'input-hashes.json').write_text(json.dumps({'head': 'head', 'files': {}}))
         self.environment.config['acceptance_selector'] = 'stack'
         self.environment.config['run_directory'] = self.root / 'fresh-acceptance'
-        (self.environment.source('cube-a') / 'scripts/tests/cvm').mkdir(parents=True)
 
-        def catalog_phase(root, name, _command, **_kwargs):
+        def catalog_phase(root, name, command, **_kwargs):
             self.assertEqual(name, 'stack-catalog')
+            self.assertEqual(Path(command[1]).parent, ORCHESTRATOR.ROOT / 'scripts/tests/cvm')
             catalog = root / 'stack/catalog'
             self.assertTrue(catalog.parent.is_dir())
             catalog.mkdir()
