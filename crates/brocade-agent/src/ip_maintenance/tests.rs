@@ -134,7 +134,6 @@ impl Fixture {
 async fn policy_changes_keep_absolute_start_and_cooldown_across_reload() {
     for minutes in [5, 30, 1440] {
         let fixture = Fixture::new();
-        let stamp = now().unwrap();
         let mut desired = IpMaintenanceDesired {
             generation: 1,
             ..Default::default()
@@ -146,6 +145,8 @@ async fn policy_changes_keep_absolute_start_and_cooldown_across_reload() {
             .0
             .begin_round(&desired, MaintenanceModule::Google, 5)
             .unwrap();
+        // Setup can cross a wall-clock second; compare the start that was actually persisted.
+        let stamp = fixture.disk().last_started_at;
         fixture
             .0
             .mutate(|state| {
@@ -159,16 +160,18 @@ async fn policy_changes_keep_absolute_start_and_cooldown_across_reload() {
             .unwrap();
         desired.generation = 2;
         desired.policy.interval_minutes = minutes;
+        let reload_started_at = now().unwrap();
         let state = fixture
             .run_until(desired, |state| {
                 state.current.as_ref().is_some_and(|r| r.generation == 2)
             })
             .await;
+        let reload_finished_at = now().unwrap();
         assert_eq!(state.last_started_at, stamp);
         assert_eq!(state.cooldown_until, stamp + 3600);
         assert!(
-            state.next_scheduled_at > stamp
-                && state.next_scheduled_at <= stamp + i64::from(minutes) * 60
+            state.next_scheduled_at > reload_started_at
+                && state.next_scheduled_at <= reload_finished_at + i64::from(minutes) * 60
         );
         assert_eq!(
             state.current.as_ref().unwrap().phase,
