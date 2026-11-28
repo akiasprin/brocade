@@ -2805,6 +2805,22 @@ pub async fn claim_desired_for_node_with_protocol(
     node_id: &str,
     protocol: u32,
 ) -> Result<Option<NodeDesiredDeployment>> {
+    Ok(deliver_desired_for_node(pool, node_id, protocol)
+        .await?
+        .map(|delivery| delivery.deployment))
+}
+
+pub struct DesiredDelivery {
+    pub deployment: NodeDesiredDeployment,
+    /// The transaction recorded a dispatch instead of re-delivering existing state.
+    pub claimed: bool,
+}
+
+pub async fn deliver_desired_for_node(
+    pool: &PgPool,
+    node_id: &str,
+    protocol: u32,
+) -> Result<Option<DesiredDelivery>> {
     let replay_supported = protocol >= DESIRED_REPLAY_PROTOCOL_VERSION;
     let mut tx = pool.begin().await?;
     // `load_current_snapshot_tx` is several SELECTs. Repeatable Read makes them one model view;
@@ -2885,7 +2901,12 @@ pub async fn claim_desired_for_node_with_protocol(
         let Some(obligation) = obligation else {
             let desired = load_resigned_environment_desired_connection(&mut tx, node_id).await?;
             tx.commit().await?;
-            return Ok(desired.filter(|d| supports_config_policy(d, protocol)));
+            return Ok(desired
+                .filter(|desired| supports_config_policy(desired, protocol))
+                .map(|deployment| DesiredDelivery {
+                    deployment,
+                    claimed: false,
+                }));
         };
         let deployment_id: i64 = obligation.try_get("deployment_id")?;
         let lifecycle_epoch: i64 = obligation.try_get("lifecycle_epoch")?;
@@ -2921,7 +2942,10 @@ pub async fn claim_desired_for_node_with_protocol(
             // Re-deliver the same frozen obligation, not a new attempt that would fence the
             // original response/report if it was merely delayed in transit.
             tx.commit().await?;
-            return Ok(Some(desired));
+            return Ok(Some(DesiredDelivery {
+                deployment: desired,
+                claimed: false,
+            }));
         }
         sqlx::query(
             "UPDATE node_convergence_obligations
@@ -2942,11 +2966,19 @@ pub async fn claim_desired_for_node_with_protocol(
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        return Ok(Some(desired));
+        return Ok(Some(DesiredDelivery {
+            deployment: desired,
+            claimed: true,
+        }));
     }
     if let Some(desired) = load_resigned_environment_desired_connection(&mut tx, node_id).await? {
         tx.commit().await?;
-        return Ok(supports_config_policy(&desired, protocol).then_some(desired));
+        return Ok(
+            supports_config_policy(&desired, protocol).then_some(DesiredDelivery {
+                deployment: desired,
+                claimed: false,
+            }),
+        );
     }
     let Some(row) = sqlx::query(
         // Same ordering as the read-only path above. In-flight config precedes new grants;
@@ -3094,7 +3126,10 @@ pub async fn claim_desired_for_node_with_protocol(
         // Preserve the original dispatch timestamp and frozen grants. A failed response is a
         // delivery retry, not a new claim or a new accounting boundary.
         tx.commit().await?;
-        return Ok(Some(desired));
+        return Ok(Some(DesiredDelivery {
+            deployment: desired,
+            claimed: false,
+        }));
     }
 
     // A node claim is not the wave start. This is only a compatibility guard for an active order
@@ -3138,7 +3173,10 @@ pub async fn claim_desired_for_node_with_protocol(
     .await?;
     tx.commit().await?;
 
-    Ok(Some(desired))
+    Ok(Some(DesiredDelivery {
+        deployment: desired,
+        claimed: true,
+    }))
 }
 
 pub async fn report_target_result(

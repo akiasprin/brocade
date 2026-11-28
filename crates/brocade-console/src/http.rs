@@ -4663,7 +4663,7 @@ async fn agent_traffic_limit(
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
     require_traffic_limit_protocol(&headers)?;
-    state
+    let changed = state
         .store
         .record_node_poll_with_protocol(
             &node.node_id,
@@ -4671,6 +4671,12 @@ async fn agent_traffic_limit(
             agent_protocol_version(&headers).and_then(|p| i32::try_from(p).ok()),
         )
         .await?;
+    if changed {
+        state
+            .realtime
+            .observations
+            .changed(&[crate::observations::ObservationDomain::Nodes]);
+    }
     Ok(Json(
         state
             .store
@@ -8153,22 +8159,28 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
     let failed_policy = HeaderValue::from_str(&failed_policy)
         .map_err(|_| StoreError::InvalidData("invalid failed-target collection header".into()))?;
     let host_tuning = state.store.host_network_tuning().await?;
-    let agent_version = user_agent(&headers).map(str::to_owned);
+    use crate::observations::ObservationDomain;
+    let events = &state.realtime.observations;
     let protocol_version = agent_protocol_version(&headers);
-    state
+    let changed = state
         .store
         .record_node_poll_with_protocol(
             &node.node_id,
-            agent_version.as_deref(),
+            user_agent(&headers),
             protocol_version.and_then(|version| i32::try_from(version).ok()),
         )
         .await?;
-    let route = route_from_headers(&headers);
-    if let Some(route) = &route {
-        state
+    if changed {
+        events.changed(&[ObservationDomain::Nodes]);
+    }
+    if let Some(route) = route_from_headers(&headers) {
+        if state
             .store
-            .record_node_route_ips(&node.node_id, route)
-            .await?;
+            .record_node_route_ips(&node.node_id, &route)
+            .await?
+        {
+            events.changed(&[ObservationDomain::Nodes]);
+        }
     }
 
     if protocol_version.is_none_or(|version| {
@@ -8191,8 +8203,14 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
 
     let desired = state
         .store
-        .claim_desired_for_node_with_protocol(&node.node_id, protocol_version.unwrap_or_default())
-        .await?;
+        .deliver_desired_for_node(&node.node_id, protocol_version.unwrap_or_default())
+        .await?
+        .map(|delivery| {
+            if delivery.claimed {
+                events.changed(&[ObservationDomain::Nodes, ObservationDomain::Deployments]);
+            }
+            delivery.deployment
+        });
     let needs_policy_upgrade = desired.is_none()
         && protocol_version.is_some_and(|version| {
             version < brocade_deployment::protocol::CONFIG_XRAY_UPDATE_POLICY_PROTOCOL_VERSION

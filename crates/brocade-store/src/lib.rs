@@ -172,6 +172,7 @@ pub use credentials::{
     WIREGUARD_KEY_BYTES,
 };
 pub use deployment::initialization::{NodeInitialization, NodeInitializationState};
+pub use deployment::DesiredDelivery;
 pub use distribution::DistributionSettings;
 pub use draft::{ApplyDraftResult, DraftPreview, ModelOp};
 pub use forwarding::{

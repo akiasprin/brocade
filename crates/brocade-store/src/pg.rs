@@ -1548,6 +1548,14 @@ impl PgStore {
         deployment::claim_desired_for_node_with_protocol(&self.pool, node_id, protocol).await
     }
 
+    pub async fn deliver_desired_for_node(
+        &self,
+        node_id: &str,
+        protocol: u32,
+    ) -> Result<Option<crate::DesiredDelivery>> {
+        deployment::deliver_desired_for_node(&self.pool, node_id, protocol).await
+    }
+
     pub async fn report_target_result(
         &self,
         report: TargetConvergenceReport,
@@ -1559,11 +1567,12 @@ impl PgStore {
         Ok(result)
     }
 
+    /// Records route addresses and reports whether the stored addresses changed.
     pub async fn record_node_route_ips(
         &self,
         node_id: &str,
         route: &brocade_deployment::protocol::RouteIpReport,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         agent::record_node_route_ips(&self.pool, node_id, route).await
     }
 
@@ -2356,15 +2365,18 @@ impl PgStore {
     }
 
     pub async fn record_node_poll(&self, node_id: &str, agent_version: Option<&str>) -> Result<()> {
-        agent::record_node_poll(&self.pool, node_id, agent_version, None).await
+        self.record_node_poll_with_protocol(node_id, agent_version, None)
+            .await
+            .map(|_| ())
     }
 
+    /// Records a heartbeat and reports changes in online state, release freshness, or version.
     pub async fn record_node_poll_with_protocol(
         &self,
         node_id: &str,
         agent_version: Option<&str>,
         protocol_version: Option<i32>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         agent::record_node_poll(&self.pool, node_id, agent_version, protocol_version).await
     }
 

@@ -253,33 +253,74 @@ async fn observation_events_require_read_access_and_follow_committed_agent_repor
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "text/event-stream");
     let mut stream = response.into_body().into_data_stream();
-    let ready = tokio::time::timeout(Duration::from_secs(1), stream.next())
+    assert!(next_observation_frame(&mut stream)
         .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(std::str::from_utf8(&ready)
-        .unwrap()
         .contains("event: ready"));
-    let report = app
-        .oneshot(
-            Request::get("/agent/v1/desired")
-                .header("authorization", format!("Bearer {}", node_token.token))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(report.status().is_success(), "{}", report.status());
-    let changed = tokio::time::timeout(Duration::from_secs(2), stream.next())
+
+    let poll = |version: &'static str, route: Option<&'static str>| {
+        let mut request = Request::get("/agent/v1/desired")
+            .header("authorization", format!("Bearer {}", node_token.token))
+            .header("user-agent", version)
+            .header(
+                "x-brocade-protocol-version",
+                brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
+            );
+        if let Some(route) = route {
+            request = request.header("x-brocade-route-ipv4", route);
+        }
+        app.clone().oneshot(request.body(Body::empty()).unwrap())
+    };
+    for (version, route, changed) in [
+        ("agent/1", None, true),
+        ("agent/1", None, false),
+        ("agent/1", Some("192.0.2.1"), true),
+        ("agent/1", Some("192.0.2.1"), false),
+        ("agent/2", Some("192.0.2.1"), true),
+    ] {
+        assert_eq!(
+            poll(version, route).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        if changed {
+            assert_observation_invalidation(&mut stream, "[\"nodes\"]").await;
+        } else {
+            assert_no_observation_invalidation(&mut stream).await;
+        }
+    }
+    // A reconnect can change the release-eligibility bit even when another authenticated
+    // endpoint has already kept the node's presence online.
+    sqlx::query("UPDATE node_agent_state SET last_poll_at = now() - interval '100 seconds' WHERE node_id = 'n1'")
+        .execute(db.pool()).await.unwrap();
+    assert_eq!(
+        poll("agent/2", Some("192.0.2.1")).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_observation_invalidation(&mut stream, "[\"nodes\"]").await;
+}
+
+async fn next_observation_frame(stream: &mut axum::body::BodyDataStream) -> String {
+    let frame = tokio::time::timeout(Duration::from_secs(3), stream.next())
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    let changed = std::str::from_utf8(&changed).unwrap();
-    assert!(changed.contains("event: invalidate"), "{changed}");
-    assert!(changed.contains("[\"nodes\"]"), "{changed}");
-    assert!(!changed.contains("n1"));
+    String::from_utf8(frame.to_vec()).unwrap()
+}
+
+async fn assert_observation_invalidation(stream: &mut axum::body::BodyDataStream, domains: &str) {
+    let frame = next_observation_frame(stream).await;
+    assert!(frame.contains("event: invalidate"), "{frame}");
+    assert!(frame.contains(domains), "{frame}");
+    assert!(!frame.contains("n1"), "{frame}");
+}
+
+async fn assert_no_observation_invalidation(stream: &mut axum::body::BodyDataStream) {
+    // Allow the server's 250 ms event coalescing timer to elapse.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(650), stream.next())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -364,7 +405,31 @@ async fn http_desired_delivery_recovers_a_lost_response_only_for_replay_capable_
     ).bind(deployment_id)
         .bind(json!({"actions":["disable-wire-guard"],"phantun":unmanaged,"wireguard":{"state":"disabled","reason":"test"},"xray":unmanaged,"hy2_port_hop":unmanaged}))
         .bind(&unmanaged).execute(db.pool()).await.unwrap();
-    let agent = agent_router(db.store.clone());
+    db.store
+        .record_node_poll_with_protocol("n1", None, Some(38))
+        .await
+        .unwrap();
+    let admin = admin_token(&db).await;
+    let agent = merged_router(
+        db.store.clone(),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        "https://console.example".into(),
+    );
+    let response = agent
+        .clone()
+        .oneshot(
+            Request::get("/realtime/observations/events")
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    assert!(next_observation_frame(&mut stream)
+        .await
+        .contains("event: ready"));
     let request = |protocol: u32| {
         Request::get("/agent/v1/desired")
             .header("authorization", format!("Bearer {}", token.token))
@@ -376,8 +441,19 @@ async fn http_desired_delivery_recovers_a_lost_response_only_for_replay_capable_
     let lost = agent.clone().oneshot(request(38)).await.unwrap();
     assert_eq!(lost.status(), StatusCode::OK);
     drop(lost);
+    assert_observation_invalidation(&mut stream, "[\"nodes\",\"deployments\"]").await;
     let legacy = agent.clone().oneshot(request(38)).await.unwrap();
     assert_eq!(legacy.status(), StatusCode::NO_CONTENT);
+    assert_no_observation_invalidation(&mut stream).await;
+    // Record the version separately so these polls exercise replay without metadata changes.
+    db.store
+        .record_node_poll_with_protocol(
+            "n1",
+            None,
+            Some(brocade_deployment::protocol::DESIRED_REPLAY_PROTOCOL_VERSION as i32),
+        )
+        .await
+        .unwrap();
     for _ in 0..2 {
         let replay = agent
             .clone()
@@ -395,6 +471,7 @@ async fn http_desired_delivery_recovers_a_lost_response_only_for_replay_capable_
             json!(["disable-wire-guard"])
         );
     }
+    assert_no_observation_invalidation(&mut stream).await;
 }
 
 #[tokio::test]

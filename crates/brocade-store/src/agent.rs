@@ -253,19 +253,28 @@ pub async fn record_node_poll(
     node_id: &str,
     agent_version: Option<&str>,
     protocol_version: Option<i32>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut tx = pool.begin().await?;
-    let phase = sqlx::query_scalar::<_, String>(
-        "UPDATE node_agent_state AS agent
+    // Read the previous values under the update lock so simultaneous polls do not both
+    // report the same change. Keep recording last_poll_at for release eligibility.
+    let poll = sqlx::query_as::<_, (String, bool)>(
+        "WITH previous AS (
+             SELECT node_id, last_poll_at, agent_version, agent_protocol_version
+               FROM node_agent_state
+              WHERE node_id = $1 AND token_hash IS NOT NULL AND token_revoked_at IS NULL
+              FOR UPDATE
+         )
+         UPDATE node_agent_state AS agent
             SET last_poll_at = now(),
                 agent_version = COALESCE($2, agent.agent_version),
                 agent_protocol_version = COALESCE($3, agent.agent_protocol_version)
-           FROM node_lifecycle_state AS lifecycle
-          WHERE agent.node_id = $1
-            AND lifecycle.node_id = agent.node_id
-            AND agent.token_hash IS NOT NULL
-            AND agent.token_revoked_at IS NULL
-      RETURNING lifecycle.phase",
+           FROM previous JOIN node_lifecycle_state AS lifecycle USING (node_id)
+          WHERE agent.node_id = previous.node_id
+      RETURNING lifecycle.phase,
+                ROW(previous.agent_version, previous.agent_protocol_version)
+                    IS DISTINCT FROM ROW(agent.agent_version, agent.agent_protocol_version)
+                OR (lifecycle.phase = 'active'
+                    AND NOT COALESCE(previous.last_poll_at >= now() - interval '90 seconds', false))",
     )
     .bind(node_id)
     .bind(agent_version)
@@ -273,7 +282,7 @@ pub async fn record_node_poll(
     .fetch_optional(&mut *tx)
     .await?;
 
-    let Some(phase) = phase else {
+    let Some((phase, changed)) = poll else {
         return Err(StoreError::Unauthorized(format!(
             "node {node_id} does not have an active node token"
         )));
@@ -282,7 +291,7 @@ pub async fn record_node_poll(
     // coming online again. Presence notifications describe active service only.
     if phase != NodeLifecyclePhase::Active.as_str() {
         tx.commit().await?;
-        return Ok(());
+        return Ok(changed);
     }
 
     let server_now: i64 =
@@ -295,24 +304,27 @@ pub async fn record_node_poll(
     .bind(node_id)
     .fetch_optional(&mut *tx)
     .await?;
-    crate::notifications::mark_online_locked(&mut tx, node_id, presence.as_deref(), server_now)
-        .await?;
+    let came_online =
+        crate::notifications::mark_online_locked(&mut tx, node_id, presence.as_deref(), server_now)
+            .await?;
     tx.commit().await?;
 
-    Ok(())
+    Ok(changed || came_online)
 }
 
 pub async fn record_node_route_ips(
     pool: &PgPool,
     node_id: &str,
     route: &RouteIpReport,
-) -> Result<()> {
-    sqlx::query(
+) -> Result<bool> {
+    let result = sqlx::query(
         "INSERT INTO node_agent_state (node_id, route_ipv4, route_ipv6)
          VALUES ($1, $2, $3)
          ON CONFLICT (node_id) DO UPDATE SET
             route_ipv4 = EXCLUDED.route_ipv4,
-            route_ipv6 = EXCLUDED.route_ipv6",
+            route_ipv6 = EXCLUDED.route_ipv6
+         WHERE ROW(node_agent_state.route_ipv4, node_agent_state.route_ipv6)
+             IS DISTINCT FROM ROW(EXCLUDED.route_ipv4, EXCLUDED.route_ipv6)",
     )
     .bind(node_id)
     .bind(route.ipv4.as_deref())
@@ -320,7 +332,7 @@ pub async fn record_node_route_ips(
     .execute(pool)
     .await?;
 
-    Ok(())
+    Ok(result.rows_affected() != 0)
 }
 
 fn public_ipv4(value: &str) -> Option<String> {

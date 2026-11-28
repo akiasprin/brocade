@@ -79,12 +79,6 @@ pub(super) async fn after_report(
 
 fn changed_domains(method: &axum::http::Method, path: &str) -> &'static [ObservationDomain] {
     use ObservationDomain::*;
-    if *method == axum::http::Method::GET {
-        return match path {
-            "/agent/v1/desired" => &[Nodes],
-            _ => &[],
-        };
-    }
     if !matches!(
         *method,
         axum::http::Method::POST
@@ -143,10 +137,15 @@ mod tests {
             )
             .route("/agent/v1/load", post(|| async { StatusCode::BAD_REQUEST }))
             .route("/nodes/agent-state", get(|| async { StatusCode::OK }))
+            .route(
+                "/agent/v1/desired",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
             .layer(axum::middleware::from_fn_with_state(state, after_report));
         for (method, path) in [
             (Method::POST, "/agent/v1/load"),
             (Method::GET, "/nodes/agent-state"),
+            (Method::GET, "/agent/v1/desired"),
         ] {
             app.clone()
                 .oneshot(
