@@ -736,8 +736,8 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
         return report
 
     def probe_packager(self):
-        script = ROOT / 'scripts/package_cube_candidate.py'
-        require(script.is_file(), f'missing Cube packager entry: {script}')
+        script = self.evidence / 'package_cube_candidate.py'
+        require(script.is_file(), 'run prepare before Cube packager probing')
         command = self.container(
             f'brocade-preflight-{os.getpid()}-packager',
             'packager',

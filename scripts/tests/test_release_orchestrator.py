@@ -200,6 +200,23 @@ class ReleaseOrchestratorTests(unittest.TestCase):
         with self.assertRaisesRegex(ORCHESTRATOR.OrchestrationError, 'interrupted Stack scenarios'):
             self.environment.stack_acceptance(root, self.root / 'cvm')
 
+    def test_packager_probe_uses_the_prepared_mounted_entry(self):
+        script = self.environment.evidence / 'package_cube_candidate.py'
+        script.parent.mkdir(parents=True)
+        script.touch()
+        command = []
+        with (
+            patch.object(
+                self.environment, 'container', return_value=['docker', 'run', '--workdir', '/unmounted-control']
+            ),
+            patch.object(
+                self.environment, 'phase', side_effect=lambda _root, _name, value, **_kwargs: command.extend(value)
+            ),
+        ):
+            self.environment.probe_packager()
+        self.assertIn(str(script), command)
+        self.assertNotIn(str(ORCHESTRATOR.ROOT / 'scripts/package_cube_candidate.py'), command)
+
     def test_cube_compile_does_not_require_packaging_python(self):
         self.environment.config['inputs'].update(
             {'cube_sysroot_libs': self.root / 'sysroot', 'cube_bpf_include': self.root / 'bpf'}
