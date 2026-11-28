@@ -593,7 +593,7 @@ class ReleaseEnvironment:
             'BROCADE_GO': '/home/build/tool-go/bin/go',
             'BROCADE_ZIG': '/home/build/tool-zig/zig',
             'RUSTUP_TOOLCHAIN': self.pins['rust'],
-            'PATH': '/home/build/tool-node/bin:/home/build/tool-go/bin:/home/build/tool-zig:/home/build/cargo/bin:/usr/lib/llvm-21/bin:/usr/local/bin:/usr/bin:/bin',
+            'PATH': '/home/build/tool-node/bin:/home/build/tool-go/bin:/home/build/tool-zig:/home/build/cargo/bin:/usr/lib/llvm-21/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
         }
         environment.update(extra_env or {})
         command = ['docker', 'run', '--rm', '--name', name, '--init', '--user', f'{os.getuid()}:{os.getgid()}']

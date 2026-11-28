@@ -57,6 +57,8 @@ class ReleaseOrchestratorTests(unittest.TestCase):
         self.assertNotIn('TARGET_KIND', os.environ)
         path = next(value for value in command if value.startswith('PATH='))
         self.assertIn('/home/build/tool-zig:', path)
+        for directory in ('/usr/local/sbin', '/usr/sbin', '/sbin'):
+            self.assertIn(directory, path.split('=', 1)[1].split(':'))
 
     def test_container_mounts_all_candidate_sources_for_independent_verification(self):
         with patch.object(self.environment, 'mount_git', side_effect=lambda source: [str(source / '.git-parent')]):
