@@ -216,6 +216,7 @@ class ReleaseOrchestratorTests(unittest.TestCase):
             self.environment.probe_packager()
         self.assertIn(str(script), command)
         self.assertNotIn(str(ORCHESTRATOR.ROOT / 'scripts/package_cube_candidate.py'), command)
+        self.assertTrue(any('git --version' in value and 'debugfs -V' in value for value in command))
 
     def test_cube_compile_does_not_require_packaging_python(self):
         self.environment.config['inputs'].update(

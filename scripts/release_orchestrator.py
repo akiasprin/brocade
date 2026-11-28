@@ -752,7 +752,7 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
             command
             + [
                 '-c',
-                'python3 -I -c "import sys,tomllib; assert sys.version_info >= (3, 11)" && debugfs -V && readelf --version && python3 -I "$1" --help',
+                'python3 -I -c "import sys,tomllib; assert sys.version_info >= (3, 11)" && git --version && debugfs -V && readelf --version && python3 -I "$1" --help',
                 'sh',
                 str(script),
             ],

@@ -8,8 +8,8 @@ configuration; CI selects the Node 22 major version.
 The orchestrator is a Linux control-host entry point. It creates four detached
 worktrees (`base`, `cvm`, `cube-a`, `cube-b`), independent compilation caches,
 and three Docker images. Jammy performs compilation with a glibc 2.35 ABI;
-Debian 12 provides Python 3.11+, `debugfs`, and `readelf` for independent node
-packaging and verification. It does not deploy to production or modify
+Debian 12 provides Python 3.11+, Git, `debugfs`, and `readelf` for independent
+source identity checks, node packaging and verification. It does not deploy to production or modify
 `/opt/brocade`.
 
 ## Local configuration

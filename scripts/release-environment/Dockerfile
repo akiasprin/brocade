@@ -57,8 +57,10 @@ RUN set -eux; \
       binutils \
       ca-certificates \
       e2fsprogs \
+      git \
       python3; \
     rm -rf /var/lib/apt/lists/*; \
     python3 -c 'import sys,tomllib; assert sys.version_info >= (3, 11)'; \
+    git --version; \
     debugfs -V; \
     readelf --version
