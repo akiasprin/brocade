@@ -490,9 +490,24 @@ cat /etc/ssh/sshd_config >> "$config"
 install -d -m 0755 /run/sshd
 /usr/sbin/sshd -t -f "$config"
 cat "$config" > /etc/ssh/sshd_config
+pid=
 if [ -s /run/sshd.pid ]; then
-  kill -HUP "$(cat /run/sshd.pid)"
+  pid=$(cat /run/sshd.pid)
+fi
+running=
+case "$pid" in
+  ''|*[!0-9]*) ;;
+  *)
+    if [ "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" = /usr/sbin/sshd ]; then
+      running=yes
+    fi
+    ;;
+esac
+if [ "$running" = yes ]; then
+  kill -HUP "$pid"
 else
+  rm -f /run/sshd.pid
   /usr/sbin/sshd
 fi
+unset pid running
 "#;

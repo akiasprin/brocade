@@ -51,6 +51,11 @@ class SandboxLoginContractTests(unittest.TestCase):
         with self.assertRaisesRegex(PACKAGE.stack.StackError, '/sbin/ip'):
             self.validate()
 
+    def test_rejects_sandbox_without_process_identity_command(self):
+        del self.stats['/usr/bin/readlink']
+        with self.assertRaisesRegex(PACKAGE.stack.StackError, '/usr/bin/readlink'):
+            self.validate()
+
     def test_rejects_non_executable_sandbox_command(self):
         self.stats['/usr/bin/ssh-keygen'] = ('regular', 0o644, None)
         with self.assertRaisesRegex(PACKAGE.stack.StackError, 'not executable'):

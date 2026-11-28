@@ -25,6 +25,7 @@ SANDBOX_EXECUTABLES = (
     '/usr/bin/install',
     '/usr/bin/kill',
     '/usr/bin/mktemp',
+    '/usr/bin/readlink',
     '/usr/bin/rm',
     '/usr/bin/sed',
     '/usr/bin/ssh-keygen',

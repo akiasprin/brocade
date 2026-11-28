@@ -298,9 +298,11 @@ fn password_initialization_compiles_only_a_versioned_secret_reference() {
 }
 
 #[test]
-fn password_initialization_creates_runtime_state_and_starts_ssh() {
+fn password_initialization_creates_runtime_state_and_rejects_a_stale_ssh_pid() {
     assert!(PASSWORD_INIT_SCRIPT.contains("install -d -m 0755 /run/sshd"));
     assert!(PASSWORD_INIT_SCRIPT.contains("/usr/sbin/sshd -t -f \"$config\""));
-    assert!(PASSWORD_INIT_SCRIPT.contains("kill -HUP \"$(cat /run/sshd.pid)\""));
-    assert!(PASSWORD_INIT_SCRIPT.contains("else\n  /usr/sbin/sshd\nfi"));
+    assert!(PASSWORD_INIT_SCRIPT.contains("readlink \"/proc/$pid/exe\""));
+    assert!(PASSWORD_INIT_SCRIPT.contains("= /usr/sbin/sshd"));
+    assert!(PASSWORD_INIT_SCRIPT.contains("kill -HUP \"$pid\""));
+    assert!(PASSWORD_INIT_SCRIPT.contains("rm -f /run/sshd.pid\n  /usr/sbin/sshd"));
 }
