@@ -14,6 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from cvm_elf import validate as validate_cube_elf
+import cvm_package
 import cvm_stack
 
 
@@ -46,7 +47,8 @@ def console_elf(path, architecture):
     return '.'.join(map(str, max(imported)))
 
 
-def verify(workspace, output):
+def verify(workspace, output, assets):
+    guest_assets = json.loads((assets / 'manifest.json').read_text())
     result = {'format_version': 1, 'result': 'verified', 'flavors': {}, 'stacks': {}}
     for flavor in ('base', 'cvm'):
         source = workspace / flavor
@@ -102,8 +104,17 @@ def verify(workspace, output):
         if digest(bundle) != receipt['sha256'] or receipt['deployment_ready'] is not False:
             raise ValueError(f'Cube {stack} bundle differs from its content identity')
         packaged = cvm_stack.inspect_archive(bundle, receipt['sha256'])
-        if packaged['source_sha256'] != runtime['sourceSHA256'] or packaged['min_glibc'] != '2.35':
-            raise ValueError(f'Cube {stack} bundle source or ABI does not match its runtime build')
+        provenance = cvm_package.package_provenance(source, directory / 'manifest.json', assets, runtime)
+        if (
+            packaged['source_sha256'] != runtime['sourceSHA256']
+            or packaged['min_glibc'] != '2.35'
+            or packaged['architecture'] != runtime['architecture']
+            or packaged['provenance'] != provenance
+        ):
+            raise ValueError(f'Cube {stack} bundle source, ABI or provenance does not match its inputs')
+        agent_sha = packaged['files']['runtime/cube-agent/cube-agent.ext4']['sha256']
+        if agent_sha != guest_assets['files']['agent.ext4']:
+            raise ValueError(f'Cube {stack} Guest Agent differs from the fixed asset manifest')
         result['stacks'][stack] = {
             'bundle': str(bundle),
             'sha256': receipt['sha256'],
@@ -111,6 +122,8 @@ def verify(workspace, output):
             'cubelet_sha256': packaged['files'][cvm_stack.CUBELET]['sha256'],
             'shim_sha256': packaged['files'][cvm_stack.SHIM]['sha256'],
             'shim_version_sha256': packaged['files']['runtime/cube-shim/version']['sha256'],
+            'guest_agent_sha256': agent_sha,
+            'provenance': provenance,
             'artifacts': runtime['artifacts'],
         }
     first, second = result['stacks'].values()
@@ -128,8 +141,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--workspace', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--assets', type=Path, required=True)
     args = parser.parse_args()
-    print(json.dumps(verify(args.workspace.resolve(), args.output.resolve()), sort_keys=True))
+    print(json.dumps(verify(args.workspace.resolve(), args.output.resolve(), args.assets.resolve()), sort_keys=True))
 
 
 if __name__ == '__main__':

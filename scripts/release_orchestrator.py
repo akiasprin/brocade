@@ -796,9 +796,13 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
             if failures:
                 raise OrchestrationError('; '.join(f'{name}: {error}' for name, error in failures))
 
-    def package_one(self, name):
+    def package_one(self, name, candidate):
         script = self.evidence / 'package_cube_candidate.py'
         require(script.is_file(), 'run prepare before Cube packaging')
+        require(
+            digest(script) == digest(ROOT / 'scripts/package_cube_candidate.py'),
+            'prepared packager differs from the orchestrator source; run prepare again',
+        )
         command = self.container(
             f'brocade-package-{os.getpid()}-{name}',
             'packager',
@@ -813,19 +817,23 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
             str(self.source(name)),
             str(self.config['inputs']['cube_assets']),
         ]
-        self.phase(self.evidence / 'package', name, command, retryable=True)
-
-    def package_all(self):
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            wait_all([pool.submit(self.package_one, name) for name in ('cube-a', 'cube-b')], 'Cube packaging')
+        Runner(candidate / name, 'package-' + name).execute(command)
 
     def verify(self):
         head = self.require_tools()
-        self.package_all()
-        output = self.evidence / 'candidate/verification.json'
-        frozen = self.evidence / 'candidate/deployment-build'
+        candidate = self.evidence / 'candidate'
+        frozen = candidate / 'deployment-build'
         require(not frozen.exists(), f'preserve the existing frozen candidate: {frozen}')
-        runner = Runner(self.evidence / 'candidate', 'verify-candidate')
+        if candidate.exists():
+            attempt = 1
+            while (self.evidence / f'candidate-attempt-{attempt}').exists():
+                attempt += 1
+            candidate.rename(self.evidence / f'candidate-attempt-{attempt}')
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self.package_one, name, candidate) for name in ('cube-a', 'cube-b')]
+            wait_all(futures, 'Cube packaging')
+        output = candidate / 'verification.json'
+        runner = Runner(candidate, 'verify-candidate')
         runner.execute(
             self.container(
                 f'brocade-verify-{os.getpid()}',
@@ -836,11 +844,12 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
             )
             + [
                 '-c',
-                'python3 -I "$1/scripts/verify_release_candidate.py" --workspace "$2" --output "$3"',
+                'python3 -I "$1/scripts/verify_release_candidate.py" --workspace "$2" --output "$3" --assets "$4"',
                 'sh',
                 str(self.source('cube-a')),
                 str(self.workspace),
                 str(output),
+                str(self.config['inputs']['cube_assets']),
             ]
         )
         result = json.loads(output.read_text())

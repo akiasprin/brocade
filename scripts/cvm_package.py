@@ -150,6 +150,17 @@ def validate_assets(assets, asset_manifest, architecture, login_validator=valida
     return pvm
 
 
+def package_provenance(root, build_manifest, assets, build):
+    return {
+        'guest_assets_manifest_sha256': stack.digest(assets / 'manifest.json'),
+        'package_recipe_sha256': stack.digest(root / 'scripts/cvm_package.py'),
+        'installer_sha256': stack.digest(root / 'scripts/cvm_stack.py'),
+        'runtime_build_manifest_sha256': stack.digest(build_manifest),
+        'host_transition_sha256': stack.digest(root / 'scripts/cvm_host.py'),
+        'shim_version': build['shimVersion'],
+    }
+
+
 @stack.progress_task('assemble node bundle')
 def prepare(root, build_manifest, assets, output):
     spec = importlib.util.spec_from_file_location('cube_build', root / 'scripts/build-cube.py')
@@ -364,14 +375,7 @@ def prepare(root, build_manifest, assets, output):
             architecture,
             build['sourceSHA256'],
             build['tools']['gnuLibcBaseline'],
-            {
-                'guest_assets_manifest_sha256': stack.digest(assets / 'manifest.json'),
-                'package_recipe_sha256': stack.digest(root / 'scripts/cvm_package.py'),
-                'installer_sha256': stack.digest(root / 'scripts/cvm_stack.py'),
-                'runtime_build_manifest_sha256': stack.digest(build_manifest),
-                'host_transition_sha256': stack.digest(root / 'scripts/cvm_host.py'),
-                'shim_version': build['shimVersion'],
-            },
+            package_provenance(root, build_manifest, assets, build),
             storage_backends=['xfs', 'plain'],
             pvm=pvm,
         )
