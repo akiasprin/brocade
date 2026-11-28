@@ -28,6 +28,7 @@ mod log_policy;
 mod materialize;
 pub mod model_timing;
 mod node_inflow_usage;
+mod node_removal;
 mod node_traffic_history;
 mod notifications;
 mod onboarding;
@@ -144,7 +145,7 @@ pub use console::{
     DeleteFrontResult, DeleteStepResult, DeploymentVerification, DynamicClashSubscription,
     DynamicSubscriptionFormat, FrontClientConfigState, FrontRouteAnalysisView, HopInRequest,
     HopWireRequest, ModelWriteResult, NodeAgentStateItem, NodeAgentStateList, NodeRegionOverride,
-    PruneChainResult, PutStepRequest, RedactedModelSnapshot, RedactedSecret,
+    NodeRemovalStatus, PruneChainResult, PutStepRequest, RedactedModelSnapshot, RedactedSecret,
     RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveRetiredNodesRequest,
     RemoveRetiredNodesResult, RemoveWarpBindingRequest, RemoveWarpBindingResult, RevisionList,
     RevisionListItem, RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult,

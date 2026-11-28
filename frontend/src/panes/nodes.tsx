@@ -71,6 +71,7 @@ import {
   saveNodeNotifications,
   saveNodeTraffic,
   saveNodeTrafficLimit,
+  scheduleNodeRemoval,
   setNodeCertGroup,
   setNodeStatus,
   setWireGuardLinkDisabled,
@@ -179,6 +180,15 @@ import { chainSpine, fetchSnapshot, type SnapshotChain, type SnapshotIngress, ty
 import { MuxObservationCard } from '../mux-observation';
 import { VpngateObservationCard } from '../vpngate-observation';
 import { NodeRegionEditor } from './node-region-editor';
+import {
+  announceNodeRemoval,
+  NodeLifecycleBanner,
+  nodeLifecycleMenuItem,
+  nodeRemovalQueued,
+  NodeRemovalToast,
+  NodeRetireDialog,
+  type NodeRetireAction,
+} from './node-lifecycle';
 import { NodeRealtimeProvider } from '../node-realtime';
 import { ReverseHealthCard } from '../reverse-health';
 import type { AppIr } from '../topo/model';
@@ -599,9 +609,27 @@ const nodeLabel = (n: NodeAgentStateItem) => n.name || n.node_id;
    中英混名的机器会聚到一头）。Collator 建一次复用，不要每次渲染新建。 */
 const NAME_ORDER = new Intl.Collator('zh', { numeric: true, sensitivity: 'base' });
 
-/** Only terminal lifecycle states have already lost their agent credential and teardown work. */
-export const nodeRemovalReady = (node: Pick<NodeAgentStateItem, 'retired_at' | 'lifecycle_phase'>) =>
-  node.retired_at !== null && (node.lifecycle_phase === 'retired' || node.lifecycle_phase === 'abandoned');
+/* 移出机器会同时删除经过它的线路、发布目标和用量明细；这些视图都要重新读取。 */
+const NODE_REMOVAL_QUERY_KEYS = [
+  ['nodes'],
+  ['snapshot'],
+  ['revisions'],
+  ['compile'],
+  ['deployments'],
+  ['cvm'],
+  ['usage-node-series'],
+  ['node-load-list'],
+  ['node-nic-list'],
+  ['ping-probe-nodes'],
+  ['link-mtu'],
+  ['certs'],
+  ['agent-log-policy'],
+  ['node-traffic'],
+] as const;
+
+function invalidateAfterNodeRemoval(qc: QueryClient) {
+  for (const key of NODE_REMOVAL_QUERY_KEYS) qc.invalidateQueries({ queryKey: key });
+}
 
 export const nodeListSnapshotFresh = (dataUpdatedAt: number, now = Date.now()) =>
   dataUpdatedAt > 0 && now - dataUpdatedAt <= 60_000;
@@ -642,67 +670,6 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   });
   const healthOf = useMemo(() => new Map((health.data?.nodes ?? []).map(view => [view.node_id, view])), [health.data]);
   const loadOf = useMemo(() => new Map((load.data?.nodes ?? []).map(n => [n.node_id, n])), [load.data]);
-  // 退役和永久移除沿用独立名单与确认边界。
-  const [selecting, setSelecting] = useState(false);
-  const [picked, setPicked] = useState<Set<string>>(new Set());
-  const [removalNotice, setRemovalNotice] = useState<string | null>(null);
-  const togglePick = (id: string) =>
-    setPicked(prev => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  const exitSelect = () => {
-    setSelecting(false);
-    setPicked(new Set());
-  };
-  const beginSelect = () => {
-    setSelecting(true);
-    setPicked(new Set());
-  };
-  const retireAll = useMutation({
-    // 名单在提交时重新计算，不使用渲染时的快照：从勾选到点击按钮之间列表会自动刷新
-    // （10 秒一次），期间若有机器已在别处退役，此处不应重复提交。
-    mutationFn: async () => {
-      const live = (nodes.data?.nodes ?? []).filter(n => picked.has(n.node_id) && !n.retired_at);
-      for (const n of live) await setNodeStatus(n.node_id, 'retired');
-    },
-    onSuccess: () => {
-      exitSelect();
-      qc.invalidateQueries({ queryKey: ['nodes'] });
-      qc.invalidateQueries({ queryKey: ['revisions'] });
-      qc.invalidateQueries({ queryKey: ['compile'] });
-      qc.invalidateQueries({ queryKey: ['snapshot'] });
-    },
-  });
-  const removeNodes = useMutation({
-    mutationFn: (nodeIds: string[]) => removeRetiredNodes(nodeIds),
-    onSuccess: result => {
-      exitSelect();
-      setRemovalNotice(
-        `已移除 ${result.removed_nodes.length} 台机器，并清理 ${result.removed_chains.length} 条关联线路。`,
-      );
-      for (const key of [
-        ['nodes'],
-        ['snapshot'],
-        ['revisions'],
-        ['compile'],
-        ['deployments'],
-        ['cvm'],
-        ['usage-node-series'],
-        ['node-load-list'],
-        ['node-nic-list'],
-        ['ping-probe-nodes'],
-        ['link-mtu'],
-        ['certs'],
-        ['agent-log-policy'],
-        ['node-traffic'],
-      ]) {
-        qc.invalidateQueries({ queryKey: key });
-      }
-    },
-  });
 
   if (nodes.isPending) return <Loading variant="nodes" sheeted={sheeted} />;
   if (nodes.error) return <ErrorBox error={nodes.error} />;
@@ -710,28 +677,11 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   const list = sortNodes(nodes.data.nodes);
   const nodeSnapshotFresh = nodeListSnapshotFresh(nodes.dataUpdatedAt, now);
   const isolatedNodeIds = new Set(list.filter(n => n.operationally_isolated).map(n => n.node_id));
-  const removable = list.filter(nodeRemovalReady);
-  // 已退役的不计入：对其再次提交退役是不产生任何变更的草稿操作，
-  // 而计入后会使操作者认为本次退役了 N 台。
-  const pickedLive = [...picked].filter(id => list.some(n => n.node_id === id && !n.retired_at));
-  const pickedRetired = [...picked].filter(id => removable.some(n => n.node_id === id));
-  const busy = retireAll.isPending || removeNodes.isPending;
-  const confirmRemoval = (ids: string[]) => {
-    const targets = [...new Set(ids)].sort();
-    if (targets.length === 0) return;
-    const names = targets.map(id => nodeLabel(list.find(node => node.node_id === id)!));
-    const confirmed = window.confirm(
-      `确定永久移除 ${targets.length} 台退役机器吗？\n\n${names.join('、')}\n\n` +
-        '所有包含这些机器的线路、运行状态、发布目标和用量明细会一并清理。已删除容器的不可变执行证据仅保留原机器 ID 文本，不再阻止机器记录删除。此操作不能撤销。',
-    );
-    if (!confirmed) return;
-    setRemovalNotice(null);
-    removeNodes.mutate(targets);
-  };
   const trafficOf = new Map((traffic.data?.nodes ?? []).map(item => [item.node_id, item]));
   const system = can(who.role, 'system');
+  /* 列表只用来看机器：退役与移出影响大，统一收在详情页 ⋯ 菜单的「退役/移出」里，逐台确认。 */
   const renderHeader = () => (
-    <header className="nd-page-head" data-selecting={selecting || undefined}>
+    <header className="nd-page-head">
       <div className="nd-page-identity">
         <span className="cg-plate">
           <Icon of="nodes" size={18} />
@@ -740,8 +690,8 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
       </div>
       <TitleActions
         primary={
-          !isVisitor(who) &&
-          !selecting && (
+          /* 访客不显示标题栏操作：入口触发写接口，与机器详情的处理相同。 */
+          !isVisitor(who) && (
             <button
               className="btn primary"
               type="button"
@@ -752,50 +702,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
             </button>
           )
         }
-      >
-        {/* 访客不显示标题栏操作：这些入口全部触发写接口，与机器详情的处理相同。 */}
-        {!isVisitor(who) &&
-          (selecting ? (
-            <>
-              <button className="btn" type="button" disabled={busy} onClick={exitSelect}>
-                取消
-              </button>
-              {/* 退役直接创建停用发布，不进入浏览器草稿。 */}
-              <button
-                className="btn danger"
-                type="button"
-                disabled={pickedLive.length === 0 || busy}
-                title={`退役选中的 ${pickedLive.length} 台：保留记录，并为 Agent 创建完整停用发布`}
-                onClick={() => retireAll.mutate()}
-              >
-                {retireAll.isPending ? '提交中…' : `退役下线${pickedLive.length > 0 ? ` ${pickedLive.length}` : ''}`}
-              </button>
-              {/* 没有可移除的退役机器时不画，多选只剩退役一种操作。 */}
-              {removable.length > 0 && (
-                <button
-                  className="btn danger node-remove-button"
-                  type="button"
-                  disabled={pickedRetired.length === 0 || busy}
-                  onClick={() => confirmRemoval(pickedRetired)}
-                >
-                  <Icon of="trash" size={13} className="node-remove-button-icon" />
-                  {removeNodes.isPending
-                    ? '移除中…'
-                    : `移除选中${pickedRetired.length > 0 ? ` ${pickedRetired.length}` : ''}`}
-                </button>
-              )}
-            </>
-          ) : (
-            <>
-              {/* 还没有机器时没有可勾选的，不画多选。 */}
-              {list.length > 0 && (
-                <button className="btn" type="button" disabled={!system} onClick={beginSelect}>
-                  多选
-                </button>
-              )}
-            </>
-          ))}
-      </TitleActions>
+      />
     </header>
   );
   const emptyMachines = (
@@ -818,9 +725,6 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   // 退役机器仍在同一网格末尾，保留生命周期说明。
   const body = (
     <>
-      {retireAll.error && <ErrorBox error={retireAll.error} />}
-      {removeNodes.error && <ErrorBox error={removeNodes.error} />}
-      {removalNotice && <div className="callout">{removalNotice}</div>}
       {list.length === 0 ? (
         emptyMachines
       ) : (
@@ -839,10 +743,6 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
                 healthFailed={!!health.error}
                 trafficPending={traffic.isPending}
                 now={now}
-                selecting={selecting}
-                selectable={!n.retired_at || nodeRemovalReady(n)}
-                checked={picked.has(n.node_id)}
-                onPick={() => togglePick(n.node_id)}
                 onPrepare={() => void prefetchNodeDetailData(qc, n.node_id, !isVisitor(who))}
                 go={go}
               />
@@ -859,6 +759,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
         {renderHeader()}
         <div className="nd-paper-body node-list-body">{body}</div>
       </div>
+      <NodeRemovalToast />
     </div>
   );
 }
@@ -952,10 +853,6 @@ function NodeCard({
   healthFailed,
   traffic,
   trafficPending,
-  selecting,
-  selectable,
-  checked,
-  onPick,
   onPrepare,
   go,
 }: {
@@ -970,10 +867,6 @@ function NodeCard({
   healthFailed: boolean;
   traffic?: NodeTrafficItem;
   trafficPending: boolean;
-  selecting: boolean;
-  selectable: boolean;
-  checked: boolean;
-  onPick: () => void;
   onPrepare: () => void;
   go: (d: Drill) => void;
 }) {
@@ -993,13 +886,12 @@ function NodeCard({
     [],
   );
   const prepareNow = () => {
-    if (selecting) return;
     if (prepareTimer.current) window.clearTimeout(prepareTimer.current);
     prepareTimer.current = 0;
     onPrepare();
   };
   const schedulePrepare = () => {
-    if (selecting || prepareTimer.current) return;
+    if (prepareTimer.current) return;
     // A short dwell distinguishes intent from merely sweeping the pointer across the roster.
     // Keyboard focus and touch press below remain immediate because both are explicit navigation.
     prepareTimer.current = window.setTimeout(prepareNow, 120);
@@ -1008,7 +900,13 @@ function NodeCard({
     if (prepareTimer.current) window.clearTimeout(prepareTimer.current);
     prepareTimer.current = 0;
   };
-  const status = nodeLifecycleLabel(node) ?? (lamp.tone === 'ok' ? null : lamp.why);
+  const lifecycle = nodeLifecycleLabel(node);
+  // 已安排移出的机器在列表里也标出去向，免得以为它会一直留在末尾。
+  const status = lifecycle
+    ? `${lifecycle}${nodeRemovalQueued(node) ? ' · 完成后移出' : ''}`
+    : lamp.tone === 'ok'
+      ? null
+      : lamp.why;
   const samples = (load?.series ?? [])
     .filter(sample => sample.window_end_unix_secs >= now / 1000 - 12 * 60)
     .slice(-LIST_NIC_WINDOWS);
@@ -1041,21 +939,27 @@ function NodeCard({
     : trafficPending
       ? '读取中'
       : 'Agent 尚未上报网卡累计';
-  const className = `node-card tone-${retired ? 'idle' : lamp.tone}${retired ? ' off' : ''}${checked ? ' picked' : ''}`;
-  const content = (
-    <>
+  const className = `node-card tone-${retired ? 'idle' : lamp.tone}${retired ? ' off' : ''}`;
+  return (
+    <button
+      type="button"
+      className={className}
+      aria-label={`查看 ${nodeLabel(node)} 的机器详情`}
+      aria-describedby={[status ? statusId : null, healthId].filter(Boolean).join(' ')}
+      data-route-focus={`node:${node.node_id}`}
+      onMouseEnter={schedulePrepare}
+      onMouseLeave={cancelPrepare}
+      onFocus={prepareNow}
+      onPointerDown={event => {
+        pressCard(event);
+        if (event.pointerType !== 'mouse') prepareNow();
+      }}
+      onClick={() => {
+        prepareNow();
+        go({ p: 'node', id: node.node_id });
+      }}
+    >
       <span className="node-card-head">
-        {selecting && (
-          <input
-            type="checkbox"
-            className="node-card-pick"
-            checked={checked}
-            disabled={!selectable}
-            aria-label={`选中 ${nodeLabel(node)}`}
-            aria-describedby={[status ? statusId : null, healthId].filter(Boolean).join(' ')}
-            onChange={onPick}
-          />
-        )}
         <span className="node-card-flag" title={node.public_ipv4_country ?? '未识别地区'}>
           {node.public_ipv4_country ? <RegionFlag code={node.public_ipv4_country} /> : <i />}
         </span>
@@ -1124,32 +1028,6 @@ function NodeCard({
         pending={healthPending}
         failed={healthFailed}
       />
-    </>
-  );
-  return selecting ? (
-    <label className={className} onPointerDown={pressCard}>
-      {content}
-    </label>
-  ) : (
-    <button
-      type="button"
-      className={className}
-      aria-label={`查看 ${nodeLabel(node)} 的机器详情`}
-      aria-describedby={[status ? statusId : null, healthId].filter(Boolean).join(' ')}
-      data-route-focus={`node:${node.node_id}`}
-      onMouseEnter={schedulePrepare}
-      onMouseLeave={cancelPrepare}
-      onFocus={prepareNow}
-      onPointerDown={event => {
-        pressCard(event);
-        if (event.pointerType !== 'mouse') prepareNow();
-      }}
-      onClick={() => {
-        prepareNow();
-        go({ p: 'node', id: node.node_id });
-      }}
-    >
-      {content}
     </button>
   );
 }
@@ -5613,7 +5491,17 @@ export function NodeDetail({
   const qc = useQueryClient();
   // 详情页的状态灯同样依赖 last_poll_at。详情也可能单独挂载；若这里仅命中
   // 缓存，负载查询触发重绘时会拿旧时间与当前时间比较，停留 60 秒后误报「失联」。
-  const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), refetchInterval: 30_000 });
+  // 已退役、等 Console 移出的机器几秒内就会消失：这段时间加快刷新，好及时回到列表。
+  const nodes = useQuery({
+    queryKey: ['nodes'],
+    queryFn: () => fetchNodes(),
+    refetchInterval: query =>
+      query.state.data?.nodes.some(
+        node => node.node_id === id && nodeRemovalQueued(node) && node.lifecycle_phase !== 'retiring',
+      )
+        ? 3_000
+        : 30_000,
+  });
   // 访客看不到发布记录，且详情页只在判断退役工单时需要它；不要发一个必然 403 的请求。
   const deployments = useQuery({
     queryKey: ['deployments'],
@@ -5734,6 +5622,83 @@ export function NodeDetail({
     },
   });
 
+  /* 退役/移出弹层与移出后的去向。机器被移出后这一页已经没有内容，回到机器列表并在那里提示；
+     返回被未保存的改动拦下时，原地说明已移出，而不是显示「没有这台机器」。 */
+  const [retireOpen, setRetireOpen] = useState(false);
+  const [removed, setRemoved] = useState<{ id: string; text: string } | null>(null);
+  // 同一台机器只自动离开一次：StrictMode 会重放 effect，而 history.back() 重复执行会多退一页。
+  const leftAfterRemoval = useRef<string | null>(null);
+  const leaveAfterRemoval = (text: string) => {
+    if (leftAfterRemoval.current === id) return;
+    leftAfterRemoval.current = id;
+    if (returnTo('nodes', { p: 'list' })) announceNodeRemoval(text);
+  };
+  const scheduleRemoval = useMutation({
+    mutationFn: () => scheduleNodeRemoval(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['nodes'] });
+      qc.invalidateQueries({ queryKey: ['deployments'] });
+      qc.invalidateQueries({ queryKey: ['snapshot'] });
+      qc.invalidateQueries({ queryKey: ['revisions'] });
+      qc.invalidateQueries({ queryKey: ['compile'] });
+    },
+  });
+  const removeNode = useMutation({
+    mutationFn: (_name: string) => removeRetiredNodes([id]),
+    onSuccess: (result, name) => {
+      invalidateAfterNodeRemoval(qc);
+      const text = `已移出 ${name}${result.removed_chains.length > 0 ? `，删除 ${result.removed_chains.length} 条线路` : ''}`;
+      setRemoved({ id, text });
+      setRetireOpen(false);
+      leaveAfterRemoval(text);
+    },
+  });
+  /* 已安排移出的机器由 Console 在后台移出，本页只会看到它从清单里消失。记住它被安排过，
+     消失时按移出成功处理，而不是报「没有这台机器」。 */
+  const [removalWatch, setRemovalWatch] = useState<{ id: string; name: string } | null>(null);
+  const watched = n && nodeRemovalQueued(n) ? { id, name: n.name || id } : null;
+  if (n && (watched?.id !== removalWatch?.id || watched?.name !== removalWatch?.name)) setRemovalWatch(watched);
+  const vanishedName = nodes.isSuccess && !n && removalWatch?.id === id ? removalWatch.name : null;
+  useEffect(() => {
+    if (vanishedName !== null) leaveAfterRemoval(`已移出 ${vanishedName}`);
+    // leaveAfterRemoval 每次渲染都会新建；只在机器消失的那一刻执行一次。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vanishedName]);
+  const lifecyclePending = retire.isPending || abandon.isPending || scheduleRemoval.isPending || removeNode.isPending;
+  const openRetire = () => {
+    retire.reset();
+    abandon.reset();
+    scheduleRemoval.reset();
+    removeNode.reset();
+    setRetireOpen(true);
+  };
+  const runLifecycle = async (action: NodeRetireAction, name: string) => {
+    try {
+      switch (action) {
+        case 'retire':
+          await retire.mutateAsync('retired');
+          break;
+        case 'force-retire':
+          await abandon.mutateAsync();
+          break;
+        case 'schedule-removal':
+          await scheduleRemoval.mutateAsync();
+          break;
+        case 'force-remove':
+          // 强制退役成功、移出失败时机器停在「强制退役」：弹层随之只剩「移出」，横幅也提供重试。
+          await abandon.mutateAsync();
+          await removeNode.mutateAsync(name);
+          return;
+        case 'remove':
+          await removeNode.mutateAsync(name);
+          return;
+      }
+      setRetireOpen(false);
+    } catch {
+      // 失败保留在对应 mutation 的 error 上，由弹层显示；弹层保持打开以便重试或取消。
+    }
+  };
+
   /* 验证接入：执行一次不做任何修改的空收敛，确认该机器是否已与当前模型一致 */
   const verify = useMutation({ mutationFn: () => verifyDeployment({ node_id: id }) });
 
@@ -5836,7 +5801,7 @@ export function NodeDetail({
   // 当前历史项的来源。来源是本机器的另一个时间范围时，时间按钮旁显示返回按钮。
   const fromHash = useSyncExternalStore(subscribeRouteHistory, previousRouteHash, () => null);
 
-  /* 页头的稀有/危险操作（重签 token、退役下线）收进 ⋯ 菜单：它们的视觉权重原与
+  /* 页头的稀有/危险操作（重签 token、退役/移出）收进 ⋯ 菜单：它们的视觉权重原与
      使用频率成反比——最稀有的危险操作画着最抢眼的红框。菜单项可以带一行说明，
      按钮上放不下的解释（旧 token 立即失效、打标记不删行）落在菜单里。
      开合机制与顶栏更多菜单相同（shell.tsx）：document 级点击与 Escape 关闭。 */
@@ -5902,8 +5867,19 @@ export function NodeDetail({
   // Navigation from the machine list already has this query and can reveal the real frame at once.
   if (nodes.isPending) return <Loading variant="detail" sheeted={sheeted} />;
   if (nodes.error) return <ErrorBox error={nodes.error} />;
-  if (!n) return <ErrorBox error={new Error(`没有这台机器：${id}`)} />;
+  if (!n) {
+    const gone = removed?.id === id ? removed.text : vanishedName !== null ? `已移出 ${vanishedName}` : null;
+    if (gone)
+      return (
+        <div className="callout" role="status">
+          {gone}
+        </div>
+      );
+    return <ErrorBox error={new Error(`没有这台机器：${id}`)} />;
+  }
   const forceCandidate = configHandoffForceCandidate(n);
+  const lifecycleMenu = nodeLifecycleMenuItem(n);
+  const offlineFor = pollTone(n) === 'bad' ? <PollAgo at={n.last_poll_at} /> : null;
 
   const lifecycleOrder = n.lifecycle_deployment_id
     ? deployments.data?.deployments.find(deployment => deployment.id === n.lifecycle_deployment_id)
@@ -6189,60 +6165,25 @@ export function NodeDetail({
                           </span>
                         </button>
                       )}
-                      <button
-                        role="menuitem"
-                        className={n.lifecycle_phase === 'active' ? 'dg' : undefined}
-                        disabled={!system || retire.isPending}
-                        onClick={() => retire.mutate(n.lifecycle_phase === 'active' ? 'retired' : 'active')}
-                      >
-                        <Icon
-                          of={n.lifecycle_phase === 'active' ? 'dash' : 'check'}
-                          size={14}
-                          className="action-menu-icon"
-                        />
-                        <span>
-                          {retire.isPending ? '提交中…' : n.lifecycle_phase === 'active' ? '退役机器' : '恢复机器'}
-                          <small>
-                            {n.lifecycle_phase === 'active'
-                              ? '立即创建完整停用发布；不会删除机器记录'
-                              : '递增生命周期代次并创建恢复发布；需要重新签发 Token'}
-                          </small>
-                        </span>
-                      </button>
-                      {n.lifecycle_phase === 'retiring' && teardownNeedsRepair && (
-                        <button
-                          role="menuitem"
-                          disabled={!system || retire.isPending}
-                          onClick={() => retire.mutate('retired')}
-                        >
-                          <Icon of="deploy" size={14} className="action-menu-icon" />
-                          <span>
-                            重建停用发布
-                            <small>当前没有可继续执行的停用单；沿用本次退役代次重新规划</small>
-                          </span>
-                        </button>
-                      )}
+                      {(forceCandidate || (!n.operationally_isolated && n.lifecycle_phase === 'active')) && <hr />}
+                      {/* 退役与移出只有这一个入口，选择与确认都在弹层里；恢复、重建停用发布与强制完成
+                          随状态出现在页面顶部的退役横幅上。菜单项在弹层打开时卸载，先把焦点交给 ⋯，
+                          关闭弹层时焦点才有地方回去。 */}
                       <button
                         role="menuitem"
                         className="dg"
-                        disabled={!system || abandon.isPending}
-                        onClick={() => abandon.mutate()}
+                        disabled={!system || lifecycleMenu.scheduled}
+                        onClick={() => {
+                          actsTriggerRef.current?.focus();
+                          openRetire();
+                        }}
                       >
-                        <Icon of="warn" size={14} className="action-menu-icon" />
+                        <Icon of="power" size={14} className="action-menu-icon" />
                         <span>
-                          {abandon.isPending ? '处理中…' : '强制退役'}
-                          <small>立即终止本机容器并清理未隔离关联机器；未确认资源不阻塞</small>
+                          退役/移出
+                          <small>{lifecycleMenu.note}</small>
                         </span>
                       </button>
-                      {n.lifecycle_deployment_id && (
-                        <button role="menuitem" onClick={() => navigate('deploy')}>
-                          <Icon of="deploy" size={14} className="action-menu-icon" />
-                          <span>
-                            查看发布 #{n.lifecycle_deployment_id}
-                            <small>打开发布页查看停用动作与波次确认</small>
-                          </span>
-                        </button>
-                      )}
                     </div>,
                     document.body,
                   )}
@@ -6305,6 +6246,26 @@ export function NodeDetail({
           </div>
         </div>
       )}
+      <NodeLifecycleBanner
+        node={n}
+        chains={inChains.map(use => use.chain.name || use.chain.id)}
+        offline={offlineFor}
+        teardownNeedsRepair={teardownNeedsRepair}
+        removalError={removeNode.error}
+        actions={
+          pub
+            ? null
+            : {
+                allowed: system,
+                pending: lifecyclePending,
+                onViewDeployment: () => navigate('deploy'),
+                onRepair: () => retire.mutate('retired'),
+                onRestore: () => retire.mutate('active'),
+                onForceComplete: () => abandon.mutate(),
+                onRemove: () => removeNode.mutate(n.name || id),
+              }
+        }
+      />
       {issued && (
         <div className="callout warn">
           <b>{issued.node_id}</b> 的 node token —— 只显示这一次：
@@ -6336,10 +6297,12 @@ export function NodeDetail({
         <HostInstallDialog node={id} name={base.name || id} onClose={() => setConfigureHost(false)} />
       )}
 
+      {/* 移出失败显示在退役横幅里，旁边就是重试的「移出」。 */}
       {(issue.error ||
         verify.error ||
         retire.error ||
         abandon.error ||
+        scheduleRemoval.error ||
         isolate.error ||
         serviceRestore.error ||
         forceRetirement.error) && (
@@ -6349,6 +6312,7 @@ export function NodeDetail({
             verify.error ??
             retire.error ??
             abandon.error ??
+            scheduleRemoval.error ??
             isolate.error ??
             serviceRestore.error ??
             forceRetirement.error
@@ -6675,6 +6639,18 @@ export function NodeDetail({
             onCancel={() => setConfirmForceRetirement(null)}
           />
         )}
+      {retireOpen && !pub && (
+        <NodeRetireDialog
+          node={n}
+          chains={inChains.map(use => use.chain.name || use.chain.id)}
+          offline={offlineFor}
+          allowed={system}
+          pending={lifecyclePending}
+          error={retire.error ?? abandon.error ?? scheduleRemoval.error ?? removeNode.error}
+          onConfirm={action => void runLifecycle(action, n.name || id)}
+          onClose={() => setRetireOpen(false)}
+        />
+      )}
     </NodeDetailLayout>
   );
 }

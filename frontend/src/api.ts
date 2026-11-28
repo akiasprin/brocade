@@ -667,6 +667,12 @@ export interface NodeAgentStateItem {
   lifecycle_deployment_id: number | null;
   lifecycle_completed_at: string | null;
   lifecycle_last_error: string | null;
+  /* 「退役完成后移出」的服务端意图，只对应当前这次退役。queued：等待退役完成，或某次尝试失败后
+     正在退避重试（此时 removal_last_error 非空）；failed：有限次重试后放弃，需要手动移出。
+     恢复机器会在服务端撤销它；没有安排时为 null 或缺省。 */
+  removal_status?: 'queued' | 'failed' | null;
+  removal_requested_at?: string | null;
+  removal_last_error?: string | null;
   operationally_isolated: boolean;
   isolated_at: string | null;
   convergence_debt_count: number;
@@ -791,6 +797,10 @@ export const abandonNode = (id: string, unregisterWarp = true) =>
   post<NodeLifecycleTransitionResult>(`/nodes/${encodeURIComponent(id)}/lifecycle/abandon`, {
     unregister_warp: unregisterWarp,
   });
+
+/** Retire the machine if it is still active, and have the Console remove it once retirement completes. */
+export const scheduleNodeRemoval = (id: string) =>
+  post<NodeLifecycleTransitionResult>(`/nodes/${encodeURIComponent(id)}/lifecycle/removal`, {});
 
 export const fetchNodes = (token = '') => api<{ nodes: NodeAgentStateItem[] }>('/nodes/agent-state', token);
 

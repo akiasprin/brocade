@@ -89,20 +89,16 @@ for (const engine of ['chromium', 'webkit'] as const) {
           expect(errors).toEqual([]);
         });
       }
-    test('sorting, retirement, multi-select and removal', async ({ page }) => {
+    test('retired machines sort last and the list carries no batch actions', async ({ page }) => {
       const errors = await preview(page);
       const names = await page.locator('.node-card-name').allTextContents();
       expect(names.slice(-3)).toEqual(['洛杉矶 旧 GIA', '首尔 旧机', '香港 旧 BGP']);
-      await page.getByRole('button', { name: '多选', exact: true }).click();
-      await page.getByRole('checkbox', { name: '选中 东京 IIJ', exact: true }).check();
-      await page.getByRole('checkbox', { name: '选中 首尔 旧机', exact: true }).check();
-      await expect(page.getByRole('checkbox', { name: '选中 香港 旧 BGP', exact: true })).toBeDisabled();
-      await expect(page.getByRole('button', { name: '退役下线 1', exact: true })).toBeEnabled();
-      page.once('dialog', dialog => dialog.accept());
-      await page.getByRole('button', { name: '移除选中 1', exact: true }).click();
-      await expect(page.locator('.node-card')).toHaveCount(26);
-      await expect(page.getByText('已移除 1 台机器，并清理 0 条关联线路。')).toBeVisible();
+      // 退役与移出只在机器详情的「更多操作」里；列表标题只保留纳管入口，卡片始终是查看详情的按钮。
+      await expect(page.locator('.node-cardpage > .node-list-panel > .nd-page-head button')).toHaveText([
+        '＋ 纳管机器',
+      ]);
       await expect(page.getByRole('checkbox')).toHaveCount(0);
+      await expect(card(page, '香港 旧 BGP')).toContainText('退役中');
       expect(errors).toEqual([]);
     });
     test('keyboard opens a full-page detail and history restores the list', async ({ page }) => {
@@ -124,13 +120,11 @@ for (const engine of ['chromium', 'webkit'] as const) {
     });
     test('read-only and visitor permissions', async ({ page }) => {
       const errors = await preview(page, 1440, 'dark', 'typical', 'role=readonly');
-      await expect(page.getByRole('button', { name: '多选', exact: true })).toBeDisabled();
       await expect(page.getByRole('button', { name: '＋ 纳管机器', exact: true })).toBeDisabled();
       await card(page, '澳门 CTM').click();
       await detailReady(page, '澳门 CTM');
       await page.goto('/tests/fixtures/node-list-preview.html?role=public#/nodes');
       await expect(page.locator('.node-card')).toHaveCount(27);
-      await expect(page.getByRole('button', { name: '多选', exact: true })).toHaveCount(0);
       await expect(page.getByRole('button', { name: '＋ 纳管机器', exact: true })).toHaveCount(0);
       await noOverflow(page);
       expect(errors).toEqual([]);
@@ -198,7 +192,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
   test.describe(`Comet health cards ${engine} phone`, () => {
     test.use({ isMobile: true, hasTouch: true });
     for (const theme of ['dark', 'light']) {
-      test(`390 ${theme} title, selection and full-page navigation`, async ({ page }) => {
+      test(`390 ${theme} title and full-page navigation`, async ({ page }) => {
         const errors = await preview(page, 390, theme);
         await noOverflow(page);
         const head = page.locator('.node-cardpage .nd-page-head');
@@ -209,11 +203,6 @@ for (const engine of ['chromium', 'webkit'] as const) {
         const tools = await head.locator('.nd-tools').boundingBox();
         expect(Math.abs(title!.y + title!.height / 2 - tools!.y - tools!.height / 2)).toBeLessThanOrEqual(1);
         await expect(page).toHaveScreenshot(`comet-${engine}-390-${theme}.png`);
-        await page.getByRole('button', { name: '多选', exact: true }).click();
-        await page.getByRole('checkbox', { name: '选中 澳门 CTM', exact: true }).check();
-        await noOverflow(page);
-        await expect(page).toHaveScreenshot(`comet-${engine}-390-${theme}-selection.png`);
-        await page.getByRole('button', { name: '取消', exact: true }).click();
         await card(page, '澳门 CTM').click();
         await detailReady(page, '澳门 CTM');
         await expect(page).toHaveScreenshot(`comet-${engine}-390-${theme}-detail.png`);
@@ -222,18 +211,14 @@ for (const engine of ['chromium', 'webkit'] as const) {
         expect(errors).toEqual([]);
       });
     }
-    test('320 header and mixed selection do not scroll sideways', async ({ page }) => {
+    test('320 header does not scroll sideways', async ({ page }) => {
       const errors = await preview(page, 320);
       await noOverflow(page);
-      await page.getByRole('button', { name: '多选', exact: true }).click();
-      await page.getByRole('checkbox', { name: '选中 澳门 CTM', exact: true }).check();
-      await page.getByRole('checkbox', { name: '选中 首尔 旧机', exact: true }).check();
       await page.evaluate(() => window.scrollTo(0, 0));
       await expect(page.locator('.node-cardpage .nd-page-head')).toBeInViewport();
       const title = page.getByRole('heading', { name: '机器', exact: true });
       expect(await title.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
-      await noOverflow(page);
-      await expect(page).toHaveScreenshot(`comet-${engine}-320-selection.png`);
+      await expect(page).toHaveScreenshot(`comet-${engine}-320.png`);
       expect(errors).toEqual([]);
     });
   });

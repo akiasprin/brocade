@@ -174,6 +174,9 @@ pub(crate) async fn advance_intent_tx(
     .fetch_one(&mut **tx)
     .await?;
     let lifecycle_epoch: i64 = row.try_get("lifecycle_epoch")?;
+    // A pending removal belongs to the retirement intent being replaced. Restoring the machine,
+    // through the status action or a model rollback, must never be followed by a stale removal.
+    crate::node_removal::cancel_for_intent_change_tx(tx, node_id).await?;
     // Claims are fenced by lifecycle epoch, but closing the old obligations explicitly keeps the
     // debt ledger and deployment settlement truthful after a retire/reactivate transition.
     sqlx::query(

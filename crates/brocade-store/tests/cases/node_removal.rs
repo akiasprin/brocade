@@ -435,3 +435,286 @@ async fn node_removal_cleans_accounting_references_and_preserves_other_machine_h
         }
     }
 }
+
+async fn removal_jobs(db: &TestPg, node: &str) -> Vec<(String, i32, Option<String>)> {
+    sqlx::query_as(
+        "SELECT status, attempts, last_error FROM jobs
+          WHERE kind = 'node-removal' AND payload->>'node_id' = $1
+          ORDER BY id",
+    )
+    .bind(node)
+    .fetch_all(db.pool())
+    .await
+    .unwrap()
+}
+
+async fn listed_removal(
+    db: &TestPg,
+    node: &str,
+) -> (Option<brocade_store::NodeRemovalStatus>, Option<String>) {
+    let list = db
+        .store
+        .list_node_agent_states(&system_admin())
+        .await
+        .unwrap();
+    let item = list
+        .nodes
+        .into_iter()
+        .find(|item| item.node_id == node)
+        .expect("listed node");
+    (item.removal_status, item.removal_last_error)
+}
+
+async fn node_count(db: &TestPg, node: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM nodes WHERE id = $1")
+        .bind(node)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+async fn report_teardown(db: &TestPg, node: &str) {
+    let teardown = db
+        .store
+        .claim_desired_for_node(node)
+        .await
+        .unwrap()
+        .expect("retirement creates a teardown target");
+    db.store
+        .report_target_result(applied_report(&teardown))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn scheduled_removal_waits_for_teardown_then_removes_machine() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    insert_other_tenant_fixture(db.pool()).await;
+
+    let forbidden = db
+        .store
+        .schedule_node_removal(&tenant_admin("platform.acme"), "n1")
+        .await
+        .unwrap_err();
+    assert!(matches!(forbidden, StoreError::Forbidden(_)));
+    let missing = db
+        .store
+        .schedule_node_removal(&system_admin(), "missing")
+        .await
+        .unwrap_err();
+    assert!(matches!(missing, StoreError::NotFound(_)));
+
+    // An active machine retires in the same action, with the ordinary teardown deployment.
+    let scheduled = db
+        .store
+        .schedule_node_removal(&system_admin(), "n1")
+        .await
+        .unwrap();
+    assert_eq!(
+        scheduled.lifecycle.phase,
+        brocade_store::NodeLifecyclePhase::Retiring
+    );
+    assert!(scheduled.deployment_id.is_some());
+    let again = db
+        .store
+        .schedule_node_removal(&system_admin(), "n1")
+        .await
+        .unwrap();
+    assert_eq!(again.deployment_id, scheduled.deployment_id);
+    assert_eq!(
+        removal_jobs(&db, "n1").await,
+        [("queued".to_owned(), 0, None)]
+    );
+    assert_eq!(
+        listed_removal(&db, "n1").await,
+        (Some(brocade_store::NodeRemovalStatus::Queued), None)
+    );
+    assert_eq!(listed_removal(&db, "n-other").await, (None, None));
+
+    // Waiting for the machine is not an attempt.
+    assert!(db.store.process_node_removal().await.unwrap().is_none());
+    assert_eq!(removal_jobs(&db, "n1").await[0].1, 0);
+    assert_eq!(node_count(&db, "n1").await, 1);
+
+    report_teardown(&db, "n1").await;
+    let removed = db
+        .store
+        .process_node_removal()
+        .await
+        .unwrap()
+        .expect("terminal retirement is removed");
+    assert_eq!(removed.removed_nodes, ["n1"]);
+    assert_eq!(removed.removed_chains, ["chn-a1b2-c3d4"]);
+    assert_eq!(node_count(&db, "n1").await, 0);
+    assert_eq!(node_count(&db, "n-other").await, 1);
+    assert_eq!(
+        removal_jobs(&db, "n1").await,
+        [("succeeded".to_owned(), 0, None)]
+    );
+    let note: String = sqlx::query_scalar("SELECT note FROM revisions WHERE id = $1")
+        .bind(i64::try_from(removed.revision_id).unwrap())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(note.contains("requested by"), "{note}");
+    assert!(db.store.process_node_removal().await.unwrap().is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn restoring_a_machine_cancels_its_scheduled_removal() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    insert_other_tenant_fixture(db.pool()).await;
+
+    db.store
+        .schedule_node_removal(&system_admin(), "n1")
+        .await
+        .unwrap();
+    let restored = db
+        .store
+        .update_node_status(
+            &system_admin(),
+            "n1",
+            brocade_store::UpdateNodeStatusRequest {
+                status: "active".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.lifecycle.phase,
+        brocade_store::NodeLifecyclePhase::Active
+    );
+    let jobs = removal_jobs(&db, "n1").await;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].0, "canceled");
+    assert_eq!(listed_removal(&db, "n1").await, (None, None));
+
+    // A later ordinary retirement is a new intent and must keep the machine.
+    retire_for_removal(&db, "n1").await;
+    assert_eq!(
+        db.store.node_lifecycle("n1").await.unwrap().phase,
+        brocade_store::NodeLifecyclePhase::Retired
+    );
+    assert!(db.store.process_node_removal().await.unwrap().is_none());
+    assert_eq!(node_count(&db, "n1").await, 1);
+    assert_eq!(listed_removal(&db, "n1").await, (None, None));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn forced_retirement_completes_a_scheduled_removal() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    insert_other_tenant_fixture(db.pool()).await;
+
+    db.store
+        .schedule_node_removal(&system_admin(), "n1")
+        .await
+        .unwrap();
+    let abandoned = db.store.abandon_node(&system_admin(), "n1").await.unwrap();
+    assert_eq!(
+        abandoned.lifecycle.phase,
+        brocade_store::NodeLifecyclePhase::Abandoned
+    );
+    let removed = db
+        .store
+        .process_node_removal()
+        .await
+        .unwrap()
+        .expect("abandoned retirement is terminal");
+    assert_eq!(removed.removed_nodes, ["n1"]);
+    assert_eq!(node_count(&db, "n1").await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn scheduled_removal_retries_with_backoff_then_gives_up() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    insert_other_tenant_fixture(db.pool()).await;
+    retire_for_removal(&db, "n1").await;
+
+    // A retired machine only gains the intent; no new revision or deployment is created.
+    let before: i64 = sqlx::query_scalar("SELECT current_revision FROM control_state")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let scheduled = db
+        .store
+        .schedule_node_removal(&system_admin(), "n1")
+        .await
+        .unwrap();
+    assert_eq!(scheduled.revision_id, u64::try_from(before).unwrap());
+    assert!(scheduled.canceled_deployment_ids.is_empty());
+
+    sqlx::query(
+        "CREATE FUNCTION reject_node_delete() RETURNS trigger LANGUAGE plpgsql AS
+         $$ BEGIN RAISE EXCEPTION 'node delete rejected by test'; END $$",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_node_delete BEFORE DELETE ON nodes
+         FOR EACH ROW EXECUTE FUNCTION reject_node_delete()",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    db.store.process_node_removal().await.unwrap_err();
+    let (status, error) = listed_removal(&db, "n1").await;
+    assert_eq!(status, Some(brocade_store::NodeRemovalStatus::Queued));
+    assert!(error.unwrap().contains("自动移出失败"));
+    // Backed off: the next tick does not retry immediately.
+    assert!(db.store.process_node_removal().await.unwrap().is_none());
+
+    for _ in 1..5 {
+        sqlx::query("UPDATE jobs SET run_after = now() WHERE kind = 'node-removal'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.store.process_node_removal().await.unwrap_err();
+    }
+    let jobs = removal_jobs(&db, "n1").await;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!((jobs[0].0.as_str(), jobs[0].1), ("failed", 5));
+    assert_eq!(
+        listed_removal(&db, "n1").await.0,
+        Some(brocade_store::NodeRemovalStatus::Failed)
+    );
+    assert_eq!(node_count(&db, "n1").await, 1);
+
+    // Scheduling again after giving up starts a fresh attempt series.
+    sqlx::query("DROP TRIGGER reject_node_delete ON nodes")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.store
+        .schedule_node_removal(&system_admin(), "n1")
+        .await
+        .unwrap();
+    assert_eq!(
+        listed_removal(&db, "n1").await,
+        (Some(brocade_store::NodeRemovalStatus::Queued), None)
+    );
+    let removed = db.store.process_node_removal().await.unwrap().unwrap();
+    assert_eq!(removed.removed_nodes, ["n1"]);
+    assert_eq!(node_count(&db, "n1").await, 0);
+}

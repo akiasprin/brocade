@@ -21,6 +21,9 @@ const USER_TRAFFIC_ENFORCE_TICK: Duration = Duration::from_secs(30);
 /// Durable permission jobs normally arrive through a wake signal.  The timer covers a lost signal,
 /// another process writing the row, and restart recovery.
 const GRANTS_TICK: Duration = Duration::from_secs(5);
+/// Scheduled removals only wait for a teardown report, so a short tick keeps "remove after
+/// retirement" from lingering on screen after the machine confirmed it.
+const NODE_REMOVAL_TICK: Duration = Duration::from_secs(2);
 /// Cap concurrent background maintenance passes so periodic jobs leave database pool capacity for
 /// live agent and admin traffic.
 const BACKGROUND_DB_CONCURRENCY: usize = 2;
@@ -309,6 +312,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(error) => eprintln!("grants: 自动化队列处理失败：{error}"),
+            }
+        }
+    });
+
+    // "Remove after retirement" is server intent for the same reason as initialization: it waits
+    // for the machine's teardown report, not for a browser to stay open.
+    let removal_store = store.clone();
+    let removal_grants_wake = grants_wake.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(NODE_REMOVAL_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            match removal_store.process_node_removal().await {
+                Ok(Some(result)) => {
+                    eprintln!(
+                        "node removal: 退役完成后已移出 {}（修订 {}）",
+                        result.removed_nodes.join(","),
+                        result.revision_id
+                    );
+                    removal_grants_wake.notify_one();
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("node removal: {error}"),
             }
         }
     });

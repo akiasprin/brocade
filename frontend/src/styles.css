@@ -10752,32 +10752,552 @@ details.more b {
   flex: none;
 }
 
-.node-lifecycle-confirm {
+/* 实心红：只用于不能撤销、且是当前唯一主操作的确认（例如「移出」机器）。与菜单危险项 hover 同色。 */
+.btn.danger.solid {
+  border-color: var(--err);
+  background: var(--err);
+  color: #fff;
+  font-weight: 600;
+}
+@media (hover: hover) {
+  .btn.danger.solid:hover {
+    background: color-mix(in srgb, var(--err) 88%, #000);
+  }
+}
+.btn.danger.solid:active:not(:disabled) {
+  background: color-mix(in srgb, var(--err) 80%, #000);
+}
+
+/* ═══ 机器退役/移出（panes/node-lifecycle.tsx）═══
+   弹层：两张选项卡片说明「仅退役」与「退役且移出」，下面列出会暂停或删除的线路，最后是「强制」开关。
+   选中移出时卡片与线路转红、确认按钮改为实心红，不能撤销的选择在视觉上与可恢复的选择分开。 */
+.node-retire-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(480px, calc(100vw - 40px));
+  max-height: min(88dvh, 720px);
+  overflow: hidden;
+  border-radius: 14px;
+}
+.node-retire-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 11px;
+  padding: 16px 12px 6px 20px;
+}
+.node-retire-ident {
   display: grid;
+  flex: 1;
+  min-width: 0;
+  line-height: 1.35;
+}
+.node-retire-ident h2 {
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 600 15px/1.35 var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-retire-sub {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.node-retire-offline {
+  color: var(--err);
+  font-weight: 600;
+}
+.node-retire-close {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .node-retire-close:hover {
+    background: color-mix(in srgb, var(--ink) 7%, transparent);
+    color: var(--ink);
+  }
+}
+.node-retire-close:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -1px;
+}
+.node-retire-body {
+  display: grid;
+  gap: 14px;
+  min-height: 0;
+  padding: 10px 20px 18px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.node-retire-options {
+  display: grid;
+  gap: 8px;
+}
+.node-retire-option {
+  position: relative;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  column-gap: 10px;
+  padding: 12px 14px;
+  border: 1.5px solid var(--line);
+  border-radius: 12px;
+  background: var(--sheet);
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background-color 140ms ease;
+}
+/* 原生单选只负责键盘与读屏；外观由整张卡片表达。 */
+.node-retire-option input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.node-retire-option:has(input:focus-visible) {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.node-retire-dot {
+  box-sizing: border-box;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  border: 1.5px solid color-mix(in srgb, var(--ink) 30%, transparent);
+  border-radius: 50%;
+}
+.node-retire-option-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.node-retire-option-title b {
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.node-retire-state {
+  color: var(--ink-3);
+  font-size: 11px;
+  font-weight: 600;
+}
+.node-retire-option small {
+  grid-column: 2;
+  margin-top: 2px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.node-retire-option[data-checked='true'] {
+  border-color: var(--ink-3);
+  background: var(--block);
+}
+.node-retire-option[data-checked='true'] .node-retire-dot {
+  border-color: var(--ink-2);
+}
+.node-retire-option[data-checked='true'] .node-retire-dot::after {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ink-2);
+  content: '';
+}
+.node-retire-option.danger[data-checked='true'] {
+  border-color: var(--err);
+  background: color-mix(in srgb, var(--err) 9%, var(--sheet));
+}
+.node-retire-option.danger[data-checked='true'] .node-retire-dot {
+  border-color: var(--err);
+}
+.node-retire-option.danger[data-checked='true'] .node-retire-dot::after {
+  background: var(--err);
+}
+.node-retire-option.danger[data-checked='true'] b {
+  color: var(--err);
+}
+.node-retire-option[data-disabled] {
+  cursor: default;
+  opacity: 0.55;
+}
+.node-retire-routes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.node-retire-route {
+  display: inline-block;
+  box-sizing: border-box;
+  max-width: 100%;
+  height: 22px;
+  padding: 0 7px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--block);
+  color: var(--ink-2);
+  font-size: 11.5px;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-retire-routes[data-removing] .node-retire-route {
+  border-color: color-mix(in srgb, var(--err) 30%, var(--line));
+  background: color-mix(in srgb, var(--err) 9%, transparent);
+  color: var(--err);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--err) 50%, transparent);
+}
+.node-retire-force {
+  display: grid;
+  gap: 6px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.node-retire-force-row {
+  display: flex;
+  align-items: center;
   gap: 10px;
 }
-.node-lifecycle-confirm > p {
+.node-retire-force-row b {
+  flex: 1;
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.node-retire-force p {
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.node-retire-force p.node-retire-warn {
+  display: flex;
+  gap: 6px;
+  color: var(--gold);
+}
+.node-retire-warn > .ui-icon {
+  flex: none;
+  margin-top: 2px;
+}
+/* 「强制」开关沿用 Ping 地址族开关：两格都写字，不靠灰色推断关闭；尺寸放大到弹层正文一档。 */
+.ping-family-switch.two-way-switch {
+  height: 28px;
+  margin-left: 0;
+}
+.two-way-switch button {
+  min-width: 52px;
+  padding: 0 10px;
+  font: 500 12px/24px var(--sans);
+}
+.ping-family-switch.two-way-switch[data-thumb='end'] .ping-family-switch-thumb {
+  transform: translateX(100%);
+}
+.node-retire-foot {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px 14px 20px;
+  border-top: 1px solid var(--line);
+  background: var(--block);
+}
+.node-retire-foot .btn {
+  gap: 6px;
+  min-height: 34px;
+  padding: 0 16px;
+}
+
+/* 详情页顶部的退役横幅：退役中为金色并带进度，卡住（失联或缺停用发布）时转红；
+   已退役为中性底色，强制退役或自动移出失败时转红。 */
+.node-life {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 13px 15px;
+  border: 1px solid color-mix(in srgb, var(--gold) 32%, var(--line));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--gold) 6%, var(--sheet));
+}
+.node-life.idle {
+  border-color: var(--line);
+  background: var(--block);
+}
+.node-life.bad {
+  border-color: color-mix(in srgb, var(--err) 30%, var(--line));
+  background: color-mix(in srgb, var(--err) 5%, var(--sheet));
+}
+.node-life-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  color: var(--ink-2);
+  font-size: 13px;
+}
+.node-life-top b {
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+}
+.node-life-meta {
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+.node-life-tag {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--err) 14%, transparent);
+  color: var(--err);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.node-life-steps {
+  display: grid;
+  grid-auto-columns: minmax(0, 1fr);
+  grid-auto-flow: column;
+  gap: 6px;
+  max-width: 640px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.node-life-steps li {
+  display: grid;
+  gap: 6px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.node-life-steps i {
+  height: 4px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+}
+.node-life-steps li[data-state='done'] {
+  color: var(--ink-3);
+}
+.node-life-steps li[data-state='done'] i {
+  background: var(--gold);
+}
+.node-life-steps li[data-state='now'] {
+  color: var(--ink);
+  font-weight: 600;
+}
+.node-life-steps li[data-state='now'] i {
+  background: linear-gradient(90deg, var(--gold) 0 40%, color-mix(in srgb, var(--gold) 30%, transparent) 40%);
+  background-size: 200% 100%;
+  animation: node-life-flow 1.2s linear infinite;
+}
+.node-life-steps li[data-state='stuck'] {
+  color: var(--err);
+  font-weight: 600;
+}
+.node-life-steps li[data-state='stuck'] i {
+  background: var(--err);
+}
+@keyframes node-life-flow {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .node-life-steps li[data-state='now'] i {
+    animation: none;
+    background: color-mix(in srgb, var(--gold) 55%, transparent);
+  }
+}
+.node-life-error {
+  margin: 0;
+  color: var(--err);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.node-life > .callout {
   margin: 0;
 }
-.node-lifecycle-confirm .callout {
-  padding: 9px 10px;
+.node-life-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-3);
+  font-size: 12.5px;
 }
-.node-lifecycle-artifacts {
+.node-life-note {
+  flex: 1 1 280px;
+  min-width: 0;
+  line-height: 1.55;
+}
+.node-life-note.bad {
+  color: var(--err);
+}
+.node-life-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.node-life-actions .btn {
+  gap: 5px;
+}
+.node-life-actions .btn.node-life-link {
+  border-color: transparent;
+  background: none;
+}
+@media (hover: hover) {
+  .node-life-actions .btn.node-life-link:hover {
+    background: color-mix(in srgb, var(--ink) 6%, transparent);
+  }
+}
+.node-life-actions .btn.node-life-urgent {
+  border-color: color-mix(in srgb, var(--gold) 45%, var(--line));
+  color: var(--gold);
+}
+@media (hover: hover) {
+  .node-life-actions .btn.node-life-urgent:hover {
+    background: var(--gold-wash);
+  }
+}
+
+/* 移出后回到机器列表的一次性确认：浮在左下角，几秒后消失，不挤动卡片网格。层级低于弹层。 */
+.node-removal-toast {
+  position: fixed;
+  left: 16px;
+  bottom: calc(16px + var(--safe-bottom));
+  z-index: 150;
+  display: flex;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 10px;
+  width: 380px;
+  max-width: calc(100vw - 32px);
+  padding: 10px 8px 10px 12px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--ink) 92%, var(--ground));
+  color: var(--sheet);
+  font-size: 12.5px;
+  line-height: 1.45;
+  box-shadow: var(--shadow);
+  animation: node-removal-toast-in 180ms var(--motion-ease-out) both;
+}
+.node-removal-toast > .ui-icon {
+  flex: none;
+  color: color-mix(in srgb, var(--ok) 70%, #fff);
+}
+.node-removal-toast > span {
+  flex: 1;
+  min-width: 0;
+}
+.node-removal-toast > button {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
+  flex: none;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  opacity: 0.7;
+  cursor: pointer;
 }
-.node-lifecycle-artifacts > span {
-  padding: 7px 9px;
-  border: 1px solid var(--line-soft);
-  border-radius: 7px;
-  background: var(--sunk);
-  color: var(--ink-2);
-  font-size: 10px;
+@media (hover: hover) {
+  .node-removal-toast > button:hover {
+    opacity: 1;
+  }
 }
-.node-lifecycle-confirm textarea.f {
-  width: 100%;
-  resize: vertical;
+.node-removal-toast > button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -1px;
+}
+@keyframes node-removal-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .node-removal-toast {
+    animation: none;
+  }
+}
+
+/* 窄屏（≤820px，与 ui/viewport.ts 的 NARROW_MAX 一致）：退役弹层贴底成为面板，按钮铺满一行，
+   横幅里的操作各占一份宽度，提示左右各留 8px。 */
+@media (max-width: 820px) {
+  .dialog-layer.modal:has(> .node-retire-dialog) {
+    align-items: stretch;
+    justify-content: flex-end;
+    padding: max(24px, var(--safe-top)) 0 0;
+  }
+  .dialog-layer.modal > .dialog-surface.node-retire-dialog {
+    width: 100%;
+    max-width: none;
+    max-height: calc(100dvh - max(24px, var(--safe-top)));
+    border-width: 1px 0 0;
+    border-radius: 16px 16px 0 0;
+  }
+  .dialog-layer.modal[data-motion-state='entering'] > .dialog-surface.node-retire-dialog {
+    animation-name: sub-sheet-in;
+  }
+  .dialog-layer.modal[data-motion-state='exiting'] > .dialog-surface.node-retire-dialog {
+    animation-name: sub-sheet-out;
+  }
+  .node-retire-head {
+    padding: 16px 8px 6px 16px;
+  }
+  .node-retire-close {
+    width: var(--ctl-h);
+    height: var(--ctl-h);
+  }
+  .node-retire-body {
+    padding: 8px 16px 16px;
+  }
+  .node-retire-foot {
+    padding: 12px 16px calc(14px + var(--safe-bottom));
+  }
+  .node-retire-foot .btn {
+    flex: 1;
+    min-height: 40px;
+  }
+  .node-life-steps li {
+    font-size: 10.5px;
+  }
+  .node-life-actions {
+    flex: 1 1 100%;
+  }
+  .node-life-actions .btn {
+    flex: 1;
+  }
+  .node-removal-toast {
+    left: 8px;
+    width: auto;
+    right: 8px;
+    max-width: none;
+    bottom: calc(10px + var(--safe-bottom));
+  }
 }
 /* 移动端两个按钮占满一行：44px 高、各占一半宽度，符合触摸目标尺寸。
    桌面端的「右下角两个小按钮」在触屏上是最难命中的位置。 */
@@ -15712,7 +16232,7 @@ body.has-artpanel .topo-deck {
   border-top: 1px solid var(--line-soft);
   margin: 6px 3px;
 }
-/* 菜单里的危险项（机器详情的「退役下线」）：默认红字、无红框，hover 才整块变红。
+/* 菜单里的危险项（机器详情的「退役/移出」）：默认红字、无红框，hover 才整块变红。
    危险操作收进菜单后视觉权重降了一档，颜色是它仅剩的识别。 */
 .fg-menu button.dg {
   color: var(--err);
@@ -20141,7 +20661,7 @@ h4.sec > .btn {
   box-sizing: border-box;
   padding: 0;
   overflow: hidden;
-  border: 1px solid var(--line-soft);
+  border: 0;
   border-radius: 10px;
   background: color-mix(in srgb, var(--sunk) 46%, transparent);
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ink) 3%, transparent);
@@ -25974,13 +26494,6 @@ body.observe-brushing .observe-chart-tip {
   padding-bottom: 14px;
   box-sizing: content-box;
 }
-.node-card-pick {
-  flex: none;
-  width: 15px;
-  height: 15px;
-  margin: 0;
-  accent-color: var(--action);
-}
 .node-card-flag {
   display: inline-flex;
   flex: none;
@@ -26205,25 +26718,6 @@ body.observe-brushing .observe-chart-tip {
     min-height: 50px;
   }
 }
-@container (max-width: 350px) {
-  .node-cardpage > .node-list-panel > .nd-page-head[data-selecting='true'] {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: 46px auto;
-    height: auto;
-    min-height: 0;
-  }
-  .node-cardpage > .node-list-panel > .nd-page-head[data-selecting='true'] > .nd-page-identity {
-    grid-column: 1;
-    grid-row: 1;
-  }
-  .node-cardpage > .node-list-panel > .nd-page-head[data-selecting='true'] > .title-actions {
-    grid-column: 1;
-    grid-row: 2;
-    width: 100%;
-    margin: 0;
-    padding: 0 12px 10px;
-  }
-}
 @media (max-width: 820px) {
   .node-list-body {
     padding: 12px;
@@ -26243,17 +26737,6 @@ body.observe-brushing .observe-chart-tip {
   .node-card-resource {
     gap: 4px;
   }
-}
-
-/* `.btn` 不设 gap；「移除选中」的垃圾桶图标与文字之间的间距在这里给出。 */
-.node-remove-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.node-remove-button-icon {
-  display: inline-flex;
-  flex: none;
 }
 
 /* 列表卡和详情书签共用的状态灯：绿色表示无需处理、黄色表示有警告、红色表示需立即查看、
@@ -28830,7 +29313,8 @@ body.observe-brushing .observe-chart-tip {
   ) {
   transform: scale(0.985);
 }
-:is(.node-card, .chain-card).picked {
+/* 只有线路卡还能多选；机器卡没有选中态。 */
+.chain-card.picked {
   box-shadow:
     inset 0 0 0 2px color-mix(in srgb, var(--card-edge) 65%, var(--line)),
     var(--sheet-shadow);

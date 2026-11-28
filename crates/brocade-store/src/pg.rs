@@ -1789,6 +1789,20 @@ impl PgStore {
         console::remove_retired_nodes(&self.pool, actor, request).await
     }
 
+    /// Retire the machine if it is still active and remove it once retirement completes.
+    pub async fn schedule_node_removal(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+    ) -> Result<crate::NodeLifecycleTransitionResult> {
+        crate::node_removal::schedule_node_removal(&self.pool, actor, node_id).await
+    }
+
+    /// Remove at most one machine whose scheduled removal became due.
+    pub async fn process_node_removal(&self) -> Result<Option<RemoveRetiredNodesResult>> {
+        crate::node_removal::process(&self.pool).await
+    }
+
     pub async fn node_lifecycle(&self, node_id: &str) -> Result<crate::NodeLifecycleState> {
         crate::lifecycle::load(&self.pool, node_id).await
     }

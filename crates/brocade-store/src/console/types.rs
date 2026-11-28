@@ -85,11 +85,19 @@ pub struct NodeAgentStateList {
     pub nodes: Vec<NodeAgentStateItem>,
 }
 
+/// `Queued` waits for teardown or retries after a failed attempt; `Failed` gave up and needs a
+/// manual removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeRemovalStatus {
+    Queued,
+    Failed,
+}
+
 /// Permanently remove machines whose retirement has reached a terminal state.
 ///
-/// This is intentionally a batch request: the retired-machines panel supports selecting several
-/// rows, and deleting them in separate transactions could leave half the requested machines (and
-/// half their chains) behind after one failure.
+/// A batch is one request because deleting several machines in separate transactions could leave
+/// half of them (and half their chains) behind after one failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoveRetiredNodesRequest {
     pub node_ids: Vec<String>,
@@ -249,6 +257,14 @@ pub struct NodeAgentStateItem {
     pub lifecycle_deployment_id: Option<i64>,
     pub lifecycle_completed_at: Option<String>,
     pub lifecycle_last_error: Option<String>,
+    /// "Remove after retirement completes", reported only for the current retirement intent.
+    #[serde(default)]
+    pub removal_status: Option<NodeRemovalStatus>,
+    #[serde(default)]
+    pub removal_requested_at: Option<String>,
+    /// The last failed attempt; set while `Queued` retries as well as once `Failed`.
+    #[serde(default)]
+    pub removal_last_error: Option<String>,
     /// Temporary serving isolation is independent of retirement. The machine remains active and
     /// keeps polling full convergence obligations, but subscriptions no longer select it until an
     /// administrator explicitly restores service.

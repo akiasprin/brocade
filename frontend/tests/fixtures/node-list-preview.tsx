@@ -1,8 +1,14 @@
 // Production App, shell, routing, roster and detail backed by a synthetic fleet.
 // ?scene=typical|calm|trouble|few|many|empty, role=system-admin|readonly|public, theme=dark|light.
+// Retirement states are opt-in so the default scenes keep their baselines:
+// routes=on puts chains through hk-hkix, hk-old and kr-old; teardown=running serves the retiring
+// machines' teardown deployment #58; abandoned=<id>,… marks retired machines as force-retired;
+// removal=<id>:queued|failed,… schedules removal or reports a failed one.
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import type { AdminRole, ConsoleSnapshot, Whoami } from '../../src/api';
+import type { AdminRole, ConsoleSnapshot, DeploymentListItem, NodeAgentStateItem, Whoami } from '../../src/api';
+import { DEFAULT_HOP_MUX } from '../../src/api';
+import { appIdFromBytes, modelIdPairFromBytes } from '../../src/model-id';
 import { App } from '../../src/app';
 import { CVM_ENABLED } from '../../src/product';
 import { theme } from '../../src/forge/theme';
@@ -53,11 +59,129 @@ const masked = (ip: string | null) =>
       : ip.replace(/\.\d+\.\d+$/, '.***.***');
 
 const xrayEnabled = params.get('xray') !== 'off';
+
+/** Chains whose every hop is the listed machines; removing a machine removes its chains. */
+const ROUTES = [
+  { name: '香港直连', nodes: ['hk-hkix'] },
+  { name: '香港 → 东京', nodes: ['hk-hkix', 'jp-iij'] },
+  { name: '旧香港入口', nodes: ['hk-old'] },
+  { name: '首尔备用', nodes: ['kr-old'] },
+].map((route, index) => ({ ...route, ...modelIdPairFromBytes(new Uint8Array([9, index + 1, 0, index + 1])) }));
+let routes = params.get('routes') === 'on' ? ROUTES : [];
+const routeApp = () => ({
+  id: appIdFromBytes(new Uint8Array([9, 9])),
+  label: '退役示例',
+  chains: routes.map(route => ({ id: route.chainId, tenant: 'platform', name: route.name })),
+  ingresses: routes.map((route, index) => ({
+    id: route.ingressId,
+    chain: route.chainId,
+    node: route.nodes[0],
+    bind: '0.0.0.0',
+    port: 63001 + index,
+    projection: {},
+    identity: { public_key: 'preview-key', short_ids: ['0123456789abcdef'] },
+    guard: {
+      no_private: true,
+      no_bittorrent: true,
+      no_mail: true,
+      no_udp_amplification: true,
+      tcp_and_quic_only: false,
+      cn_source_block: 'off',
+    },
+    wires: { vless: { kind: 'vless-reality' } },
+  })),
+  steps: routes.flatMap(route =>
+    route.nodes.map((node, hop) => ({
+      chain: route.chainId,
+      node,
+      accept: null,
+      hop_in: hop ? { port: 22000 + hop, security: { t: 'none' } } : null,
+      rules: [
+        {
+          m: { t: 'any' },
+          a:
+            hop === route.nodes.length - 1
+              ? { t: 'egress', send_through: null }
+              : {
+                  t: 'forward',
+                  to: route.nodes[hop + 1],
+                  dial: { t: 'overlay' },
+                  pool: { t: 'mux', v: DEFAULT_HOP_MUX },
+                },
+        },
+      ],
+    })),
+  ),
+  fronts: [],
+  grants: [],
+});
+
+const listParam = (name: string) => (params.get(name) ?? '').split(',').filter(Boolean);
+const abandoned = new Set(listParam('abandoned'));
+const removals = new Map(
+  listParam('removal').flatMap(entry => {
+    const [id, status] = entry.split(':');
+    return status === 'queued' || status === 'failed' ? [[id, status] as const] : [];
+  }),
+);
+const REMOVAL_ERROR = '机器仍被配置发布 #61 引用';
+const withLifecycle = (state: NodeAgentStateItem): NodeAgentStateItem => {
+  const removal = removals.get(state.node_id) ?? null;
+  const forced = abandoned.has(state.node_id) && state.lifecycle_phase !== 'active';
+  return {
+    ...state,
+    ...(forced && {
+      lifecycle_phase: 'abandoned',
+      lifecycle_deployment_id: null,
+      lifecycle_completed_at: state.lifecycle_completed_at ?? '2026-10-25T11:50:00Z',
+      retired_at: state.retired_at ?? '2026-10-25T11:50:00Z',
+    }),
+    removal_status: removal,
+    removal_requested_at: removal ? '2026-10-25T11:40:00Z' : null,
+    removal_last_error: removal === 'failed' ? REMOVAL_ERROR : null,
+  };
+};
+const teardown = (): DeploymentListItem[] =>
+  params.get('teardown') === 'running' && machines.some(machine => machine.state === 'retiring')
+    ? [
+        {
+          id: 58,
+          revision_id: 42,
+          status: 'running',
+          activation_status: 'waiting',
+          settlement_status: 'uncertain',
+          activated_at: null,
+          active: true,
+          actor: 'operator',
+          kind: 'config',
+          note: null,
+          base_revision_id: 41,
+          rollback_of_deployment_id: null,
+          sync_of_deployment_id: null,
+          created_at: '2026-10-02T03:00:00Z',
+          started_at: '2026-10-02T03:00:02Z',
+          finished_at: null,
+          total_targets: 1,
+          changed_targets: 1,
+          skipped_targets: 0,
+          failed_targets: 0,
+          debt_targets: 0,
+          disruptive_targets: 1,
+          max_wave: 1,
+          awaiting_confirmation: false,
+        },
+      ]
+    : [];
+const retiredStates = new Set(['retiring', 'retired', 'cleanup']);
+const updateMachine = (id: string, change: Partial<Machine>) => {
+  machines = machines.map(machine => (machine.id === id ? { ...machine, ...change } : machine));
+};
+
 const snapshot = (): ConsoleSnapshot =>
   ({
     snapshot: {
       revision: 41,
-      apps: [],
+      apps: routes.length ? [routeApp()] : [],
       nodes: machines.map(machine => ({
         id: machine.id,
         tenant: 'platform',
@@ -105,13 +229,38 @@ globalThis.fetch = async (input, init) => {
   const json = (body: unknown) => Response.json(body);
   if (method === 'PUT' && path.endsWith('/status')) {
     const id = decodeURIComponent(path.split('/')[2]);
-    machines = machines.map(machine => (machine.id === id ? { ...machine, state: 'retiring' } : machine));
+    const { status } = JSON.parse(String(init?.body)) as { status: 'active' | 'retired' };
+    // Restoring also cancels a scheduled removal, as the Console does.
+    if (status === 'active') {
+      abandoned.delete(id);
+      removals.delete(id);
+    }
+    updateMachine(id, { state: status === 'active' ? 'ok' : 'retiring' });
+    return json({ revision_id: 42 });
+  }
+  const lifecycle = path.match(/^\/nodes\/([^/]+)\/lifecycle\/(abandon|removal)$/);
+  if (method === 'POST' && lifecycle) {
+    const id = decodeURIComponent(lifecycle[1]);
+    const machine = machineOf(id);
+    if (lifecycle[2] === 'abandon') {
+      abandoned.add(id);
+      updateMachine(id, { state: 'retired' });
+    } else {
+      removals.set(id, 'queued');
+      if (machine && !retiredStates.has(machine.state ?? 'ok')) updateMachine(id, { state: 'retiring' });
+    }
     return json({ revision_id: 42 });
   }
   if (method === 'DELETE' && path === '/nodes') {
     const { node_ids } = JSON.parse(String(init?.body)) as { node_ids: string[] };
     machines = machines.filter(machine => !node_ids.includes(machine.id));
-    return json({ revision_id: 42, removed_nodes: node_ids, removed_chains: [] });
+    const removedChains = routes.filter(route => route.nodes.some(node => node_ids.includes(node)));
+    routes = routes.filter(route => !removedChains.includes(route));
+    return json({
+      revision_id: 42,
+      removed_nodes: node_ids,
+      removed_chains: removedChains.map(route => route.chainId),
+    });
   }
   if (path === '/branding') return json({ site_name: 'Brocade', icon_data_url: null });
   if (path === '/auth/state') return json({ initialized: true, public_open: role === 'public' });
@@ -153,7 +302,7 @@ globalThis.fetch = async (input, init) => {
       },
       targets: [],
     });
-  if (path === '/deployments') return json({ deployments: [] });
+  if (path === '/deployments') return json({ deployments: teardown() });
   if (path === '/grants/automation')
     return json({
       pending_jobs: 0,
@@ -190,7 +339,7 @@ globalThis.fetch = async (input, init) => {
   if (path === '/nodes/agent-state')
     return json({
       nodes: machines.map(machine => {
-        const state = agentState(machine, now);
+        const state = withLifecycle(agentState(machine, now));
         return {
           ...state,
           xray_enabled: xrayEnabled,

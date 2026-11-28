@@ -93,7 +93,21 @@ pub async fn remove_retired_nodes(
 
     let mut tx = pool.begin().await?;
     let previous = lock_control_state(&mut tx).await?;
+    let note = format!("remove retired nodes {}", node_ids.join(","));
+    let result = remove_retired_nodes_tx(&mut tx, actor, previous, &node_ids, &note).await?;
+    tx.commit().await?;
+    Ok(result)
+}
 
+/// The removal itself, for a caller already holding the model lock. `node_ids` must be sorted and
+/// unique, and `previous` is the revision `lock_control_state` returned.
+pub(crate) async fn remove_retired_nodes_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    previous: u64,
+    node_ids: &[String],
+    note: &str,
+) -> Result<RemoveRetiredNodesResult> {
     let rows = sqlx::query(
         "SELECT n.id, n.retired_at IS NOT NULL AS retired, lifecycle.phase
            FROM nodes n
@@ -102,8 +116,8 @@ pub async fn remove_retired_nodes(
           ORDER BY n.id
           FOR UPDATE OF n, lifecycle",
     )
-    .bind(&node_ids)
-    .fetch_all(&mut *tx)
+    .bind(node_ids)
+    .fetch_all(&mut **tx)
     .await?;
     let found = rows
         .iter()
@@ -140,8 +154,8 @@ pub async fn remove_retired_nodes(
           WHERE node_id = ANY($1)
           ORDER BY node_id",
     )
-    .bind(&node_ids)
-    .fetch_all(&mut *tx)
+    .bind(node_ids)
+    .fetch_all(&mut **tx)
     .await?;
     if !external.is_empty() {
         return Err(StoreError::Conflict(format!(
@@ -150,8 +164,7 @@ pub async fn remove_retired_nodes(
         )));
     }
 
-    let note = format!("remove retired nodes {}", node_ids.join(","));
-    let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
+    let revision_id = insert_revision(tx, actor.operator_id(), note).await?;
 
     // A machine may be the head, an ordinary hop, or a rule-only branch. In every case the user
     // asked for its associated line to disappear, so remove the whole chain rather than trimming a
@@ -169,18 +182,18 @@ pub async fn remove_retired_nodes(
                 )
           ORDER BY chain.app_id, chain.id",
     )
-    .bind(&node_ids)
-    .fetch_all(&mut *tx)
+    .bind(node_ids)
+    .fetch_all(&mut **tx)
     .await?;
     let mut removed_chains = Vec::with_capacity(chains.len());
     for row in chains {
         let app_id: String = row.try_get("app_id")?;
         let chain_id: String = row.try_get("id")?;
-        super::steps::delete_whole_chain_tx(&mut tx, actor, &app_id, &chain_id).await?;
+        super::steps::delete_whole_chain_tx(tx, actor, &app_id, &chain_id).await?;
         removed_chains.push(chain_id);
     }
 
-    remove_node_forwarding_tx(&mut tx, &node_ids).await?;
+    remove_node_forwarding_tx(tx, node_ids).await?;
 
     // Capability/capacity reports are disposable node snapshots. Immutable CVM execution rows
     // retain the original node ID as detached historical text, while these live RESTRICT
@@ -191,8 +204,8 @@ pub async fn remove_retired_nodes(
         "DELETE FROM cvm_network_quota_hosts WHERE node_id = ANY($1)",
     ] {
         sqlx::query(statement)
-            .bind(&node_ids)
-            .execute(&mut *tx)
+            .bind(node_ids)
+            .execute(&mut **tx)
             .await?;
     }
 
@@ -203,68 +216,68 @@ pub async fn remove_retired_nodes(
     // machine's complete footprint; retaining them would keep RESTRICT references and make the
     // visible removal lie about what is still stored.
     sqlx::query("DELETE FROM deployment_targets WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM node_agent_state WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM node_applied_state WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM usage_samples WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM usage_chain_samples WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM usage_node_rollups WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM usage_user_node_rollups WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM usage_user_ingress_rollups WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM usage_readings WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM usage_report_receipts WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM usage_counter_heads WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM usage_generation_activations WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM usage_agent_cursors WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM usage_generations WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM node_operational_isolations WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM node_lifecycle_state WHERE node_id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?;
 
     // Remove references stored as JSON rather than foreign keys.
@@ -278,11 +291,11 @@ pub async fn remove_retired_nodes(
                 )
           WHERE id = TRUE",
     )
-    .bind(&node_ids)
-    .execute(&mut *tx)
+    .bind(node_ids)
+    .execute(&mut **tx)
     .await?;
     // Legacy Agent approval is an audit baseline, not a live machine reference.
-    for node_id in &node_ids {
+    for node_id in node_ids {
         sqlx::query(
             "UPDATE subscription_serving_state
                 SET isolated_node_ids = isolated_node_ids - $1,
@@ -290,13 +303,13 @@ pub async fn remove_retired_nodes(
               WHERE id = TRUE",
         )
         .bind(node_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
 
     let removed = sqlx::query("DELETE FROM nodes WHERE id = ANY($1)")
-        .bind(&node_ids)
-        .execute(&mut *tx)
+        .bind(node_ids)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
     if removed != node_ids.len() as u64 {
@@ -306,11 +319,12 @@ pub async fn remove_retired_nodes(
         )));
     }
 
-    let revision_id = commit_revision(&mut tx, revision_id, previous, true).await?;
-    tx.commit().await?;
+    crate::node_removal::settle_removed_tx(tx, node_ids).await?;
+
+    let revision_id = commit_revision(tx, revision_id, previous, true).await?;
     Ok(RemoveRetiredNodesResult {
         revision_id,
-        removed_nodes: node_ids,
+        removed_nodes: node_ids.to_vec(),
         removed_chains,
     })
 }

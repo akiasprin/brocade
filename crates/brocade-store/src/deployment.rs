@@ -780,6 +780,29 @@ pub async fn transition_node_status(
     node_id: &str,
     request: console::UpdateNodeStatusRequest,
 ) -> Result<NodeLifecycleTransitionResult> {
+    transition_node_lifecycle(pool, actor, node_id, request, false).await
+}
+
+/// Retire an active machine and, in the same transaction, record that the Console removes it once
+/// retirement completes. Failing either leaves neither.
+pub(crate) async fn transition_node_status_with_removal(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+) -> Result<NodeLifecycleTransitionResult> {
+    let request = console::UpdateNodeStatusRequest {
+        status: "retired".to_owned(),
+    };
+    transition_node_lifecycle(pool, actor, node_id, request, true).await
+}
+
+async fn transition_node_lifecycle(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    request: console::UpdateNodeStatusRequest,
+    schedule_removal: bool,
+) -> Result<NodeLifecycleTransitionResult> {
     if !actor.is_system_admin() {
         return Err(StoreError::Forbidden(
             "only system-admin can change node lifecycle".to_owned(),
@@ -850,6 +873,9 @@ pub async fn transition_node_status(
     let lifecycle_epoch: i64 = lifecycle.try_get("lifecycle_epoch")?;
     let lifecycle_phase: String = lifecycle.try_get("phase")?;
     let attached_deployment_id: Option<i64> = lifecycle.try_get("deployment_id")?;
+    if schedule_removal {
+        crate::node_removal::enqueue_tx(&mut tx, node_id, actor.operator_id()).await?;
+    }
     let attached_is_open = if let Some(deployment_id) = attached_deployment_id {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(

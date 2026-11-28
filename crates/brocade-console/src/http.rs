@@ -1788,6 +1788,10 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/nodes/{node_id}/isolate", post(isolate_node))
         .route("/nodes/{node_id}/lifecycle/abandon", post(abandon_node))
         .route(
+            "/nodes/{node_id}/lifecycle/removal",
+            post(schedule_node_removal),
+        )
+        .route(
             "/nodes/{node_id}/restore-service",
             post(restore_node_service),
         )
@@ -7011,6 +7015,24 @@ async fn remove_retired_nodes(
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
     let result = state.store.remove_retired_nodes(&admin, request).await?;
+    state.grants_wake.notify_one();
+    Ok(Json(result).into_response())
+}
+
+/// Retire the machine if it is still active, and have the Console remove it once retirement
+/// completes. The removal itself runs in the background worker, not in this request.
+async fn schedule_node_removal(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let result = state.store.schedule_node_removal(&admin, &node_id).await?;
+    // Retirement may complete inside the request when no teardown target is left. WARP cleanup
+    // has to run before the worker can remove the machine, as it does after an agent report.
+    if result.lifecycle.phase == NodeLifecyclePhase::Retired {
+        cleanup_retired_warp_bindings(&state, &node_id).await;
+    }
     state.grants_wake.notify_one();
     Ok(Json(result).into_response())
 }

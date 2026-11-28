@@ -110,12 +110,11 @@ for (const kind of ['machine', 'chain'] as const) {
   });
 }
 
-base('machine hover preserves the stronger selected ring', async ({ page }) => {
-  await open(page, 'machine');
+// 只有线路卡片保留多选；机器的退役与移出在详情页的「更多操作」里，机器卡片没有选中态。
+base('chain hover preserves the stronger selected ring', async ({ page }) => {
+  await open(page, 'chain');
   await page.getByRole('button', { name: '多选', exact: true }).click();
-  const card = page
-    .locator('.node-card')
-    .filter({ has: page.getByRole('checkbox', { name: '选中 澳门 CTM', exact: true }) });
+  const card = page.locator('.chain-card.tone-ok').first();
   await card.getByRole('checkbox').check();
   await expect(card).toHaveClass(/picked/);
   await page.mouse.move(0, 0);
@@ -158,38 +157,39 @@ for (const kind of ['machine', 'chain'] as const) {
     await page.keyboard.up('Space');
     await expect(page).toHaveURL(kind === 'machine' ? /#\/nodes\/node\// : /#\/chains\/chain\//);
   });
-  base(`${kind} selected press and checkbox focus preserve selection`, async ({ page }) => {
-    await open(page, kind);
-    await page.getByRole('button', { name: '多选', exact: true }).click();
-    const card = page.locator(kind === 'machine' ? '.node-card.tone-ok' : '.chain-card.tone-ok').first();
-    const checkbox = card.getByRole('checkbox');
-    await checkbox.check();
-    await expect(card).toHaveClass(/picked/);
-    await page.mouse.move(0, 0);
-    await settle(card);
-    const selected = await card.evaluate(element => {
-      const style = getComputedStyle(element);
-      return { shadow: style.boxShadow, background: style.backgroundColor, image: style.backgroundImage };
-    });
-    await hoverSurface(card);
-    expect(await card.evaluate(element => getComputedStyle(element).backgroundColor)).toBe(selected.background);
-    await page.mouse.down();
-    await expect.poll(() => scale(card)).toBeCloseTo(0.985, 3);
-    expect(await card.evaluate(element => getComputedStyle(element).boxShadow)).toBe(selected.shadow);
-    await expect(card).toHaveScreenshot(`${kind}-selected-pressed.png`);
-    await page.mouse.up();
-    await checkbox.check();
-    await page.keyboard.press('Tab');
-    await checkbox.focus();
-    await expect(card).toHaveCSS('outline-style', 'solid');
-    await expect(card).toHaveCSS('outline-width', '2px');
-    expect(await card.evaluate(element => getComputedStyle(element).boxShadow)).toBe(selected.shadow);
-    await expect(card).toHaveScreenshot(`${kind}-selected-checkbox-focus.png`);
-    await page.keyboard.press('Space');
-    await expect(checkbox).not.toBeChecked();
-    await expect(page).toHaveURL(kind === 'machine' ? /#\/nodes$/ : /#\/chains$/);
-  });
 }
+
+base('chain selected press and checkbox focus preserve selection', async ({ page }) => {
+  await open(page, 'chain');
+  await page.getByRole('button', { name: '多选', exact: true }).click();
+  const card = page.locator('.chain-card.tone-ok').first();
+  const checkbox = card.getByRole('checkbox');
+  await checkbox.check();
+  await expect(card).toHaveClass(/picked/);
+  await page.mouse.move(0, 0);
+  await settle(card);
+  const selected = await card.evaluate(element => {
+    const style = getComputedStyle(element);
+    return { shadow: style.boxShadow, background: style.backgroundColor, image: style.backgroundImage };
+  });
+  await hoverSurface(card);
+  expect(await card.evaluate(element => getComputedStyle(element).backgroundColor)).toBe(selected.background);
+  await page.mouse.down();
+  await expect.poll(() => scale(card)).toBeCloseTo(0.985, 3);
+  expect(await card.evaluate(element => getComputedStyle(element).boxShadow)).toBe(selected.shadow);
+  await expect(card).toHaveScreenshot('chain-selected-pressed.png');
+  await page.mouse.up();
+  await checkbox.check();
+  await page.keyboard.press('Tab');
+  await checkbox.focus();
+  await expect(card).toHaveCSS('outline-style', 'solid');
+  await expect(card).toHaveCSS('outline-width', '2px');
+  expect(await card.evaluate(element => getComputedStyle(element).boxShadow)).toBe(selected.shadow);
+  await expect(card).toHaveScreenshot('chain-selected-checkbox-focus.png');
+  await page.keyboard.press('Space');
+  await expect(checkbox).not.toBeChecked();
+  await expect(page).toHaveURL(/#\/chains$/);
+});
 
 base('chain Space cancels when focus leaves or the window blurs', async ({ page }) => {
   const card = await open(page, 'chain');

@@ -8,6 +8,7 @@ import type { Win } from '../src/wm/store';
 import { SCENES, agentState, nicView, trafficItem, loadListView } from './fixtures/node-roster-data';
 
 let NodesPane: typeof NodesPaneComponent;
+let announceNodeRemoval: (text: string) => void;
 
 beforeAll(async () => {
   window.matchMedia = ((media: string) => ({
@@ -17,6 +18,7 @@ beforeAll(async () => {
     removeEventListener() {},
   })) as unknown as typeof window.matchMedia;
   ({ NodesPane } = await import('../src/panes/nodes'));
+  ({ announceNodeRemoval } = await import('../src/panes/node-lifecycle'));
 });
 
 afterEach(() => {
@@ -99,22 +101,11 @@ function mount(
   bare = true,
   metrics: { nic: NodeNicView[]; traffic: NodeTrafficItem[]; health?: NodeLoadView[] } = { nic: [], traffic: [] },
 ) {
-  let current = nodes;
-  let finishRemoval: (() => void) | null = null;
-  const fetcher = vi.fn((path: string, init?: RequestInit) => {
+  const fetcher = vi.fn((path: string) => {
     if (path === '/node-traffic') return Promise.resolve(Response.json({ nodes: metrics.traffic }));
     if (path === '/load/nodes?windows=6') return Promise.resolve(Response.json({ nodes: metrics.health ?? [] }));
     if (path.startsWith('/load/nodes/nic')) return Promise.resolve(Response.json({ nodes: metrics.nic }));
-    if (path === '/nodes/agent-state') return Promise.resolve(Response.json({ nodes: current }));
-    if (path === '/nodes' && init?.method === 'DELETE') {
-      const { node_ids } = JSON.parse(String(init.body)) as { node_ids: string[] };
-      return new Promise<Response>(resolve => {
-        finishRemoval = () => {
-          current = current.filter(node => !node_ids.includes(node.node_id));
-          resolve(Response.json({ revision_id: 9, removed_nodes: node_ids, removed_chains: [] }));
-        };
-      });
-    }
+    if (path === '/nodes/agent-state') return Promise.resolve(Response.json({ nodes }));
     return Promise.resolve(Response.json({ nodes: [] }));
   });
   vi.stubGlobal('fetch', fetcher);
@@ -127,13 +118,12 @@ function mount(
       </SessionProvider>
     </QueryClientProvider>,
   );
-  return { fetcher, client, finishRemoval: () => finishRemoval?.() };
+  return { fetcher, client };
 }
 
 const cardNames = () =>
   [...document.querySelectorAll('.node-card .node-card-name')].map(element => element.textContent ?? '');
 const button = (name: string | RegExp) => screen.getByRole('button', { name }) as HTMLButtonElement;
-const checkbox = (name: string) => screen.getByRole('checkbox', { name }) as HTMLInputElement;
 
 describe('machine list title bar', () => {
   it('keeps machine flags free of maintenance badges without fetching per-machine maintenance views', () => {
@@ -161,7 +151,7 @@ describe('machine list title bar', () => {
       within(header)
         .getAllByRole('button')
         .map(item => item.textContent),
-    ).toEqual(['多选', '＋ 纳管机器']);
+    ).toEqual(['＋ 纳管机器']);
     expect(screen.queryByRole('tablist')).toBeNull();
     expect(screen.queryByRole('button', { name: '更多操作' })).toBeNull();
   });
@@ -179,73 +169,50 @@ describe('machine list title bar', () => {
     );
   });
 
-  it('picks live machines for retirement and stopped retired ones for removal in one selection', async () => {
+  it('only opens machines: no checkboxes, selection or batch retire and remove', () => {
     const page = mount(fleet());
-    fireEvent.click(button('多选'));
 
-    expect(screen.queryByRole('button', { name: '＋ 纳管机器' })).toBeNull();
-    expect(button('退役下线').disabled).toBe(true);
-    expect(button('移除选中').disabled).toBe(true);
-    // 仍在退役中的机器还没有停用，不能勾选移除。
-    expect(checkbox('选中 香港 旧 BGP').disabled).toBe(true);
-
-    fireEvent.click(checkbox('选中 东京 IIJ'));
-    fireEvent.click(checkbox('选中 香港 CMI'));
-    fireEvent.click(checkbox('选中 首尔 旧机'));
-    // 两类操作各数各的：退役只算在线机器，移除只算已停用的退役机器。
-    expect(button('退役下线 2').disabled).toBe(false);
-    expect(button('移除选中 1').disabled).toBe(false);
-
-    fireEvent.click(button('退役下线 2'));
-    await waitFor(() => expect(screen.queryAllByRole('checkbox')).toHaveLength(0));
-    const retired = page.fetcher.mock.calls
-      .filter(([path, init]) => init?.method === 'PUT' && path.endsWith('/status'))
-      .map(([path, init]) => [path, JSON.parse(String(init?.body))]);
-    expect(retired).toEqual([
-      ['/nodes/hk-cmi/status', { status: 'retired' }],
-      ['/nodes/jp-iij/status', { status: 'retired' }],
-    ]);
-    expect(page.fetcher.mock.calls.some(([path, init]) => path === '/nodes' && init?.method === 'DELETE')).toBe(false);
-    expect(button('多选')).toBeTruthy();
-  });
-
-  it('removes the picked retired machines after confirming and keeps them checked while removing', async () => {
-    const page = mount(fleet());
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
-    fireEvent.click(button('多选'));
-    fireEvent.click(checkbox('选中 洛杉矶 旧 GIA'));
-    fireEvent.click(checkbox('选中 首尔 旧机'));
-    fireEvent.click(button('移除选中 2'));
-
-    expect(confirm.mock.calls[0][0]).toContain('确定永久移除 2 台退役机器吗？');
-    expect(confirm.mock.calls[0][0]).toContain('首尔 旧机、洛杉矶 旧 GIA');
-    await waitFor(() => expect(button('移除中…').disabled).toBe(true));
-    const removal = page.fetcher.mock.calls.find(([path, init]) => path === '/nodes' && init?.method === 'DELETE');
-    expect(JSON.parse(String(removal?.[1]?.body))).toEqual({ node_ids: ['kr-old', 'us-old'] });
-    expect(button('取消').disabled).toBe(true);
-    expect(checkbox('选中 首尔 旧机').checked).toBe(true);
-    expect(checkbox('选中 洛杉矶 旧 GIA').checked).toBe(true);
-
-    await act(async () => page.finishRemoval());
-    await waitFor(() => expect(screen.getByText('已移除 2 台机器，并清理 0 条关联线路。')).toBeTruthy());
-    await waitFor(() => expect(cardNames()).toHaveLength(25));
-    expect(cardNames().at(-1)).toBe('香港 旧 BGP');
     expect(screen.queryAllByRole('checkbox')).toHaveLength(0);
-
-    // 没有可移除的退役机器以后，多选里只剩退役一种操作。
-    fireEvent.click(button('多选'));
-    expect(screen.queryByRole('button', { name: /移除选中/ })).toBeNull();
+    for (const name of ['多选', '取消', /退役下线/, /移除选中/]) {
+      expect(screen.queryByRole('button', { name })).toBeNull();
+    }
+    // 每张卡片（含退役中与已退役）都只是进入详情的按钮，退役与移出在详情的 ⋯ 菜单里逐台确认。
+    const cards = [...document.querySelectorAll<HTMLElement>('.node-card')];
+    expect(cards).toHaveLength(27);
+    expect(cards.every(card => card.tagName === 'BUTTON' && !card.classList.contains('picked'))).toBe(true);
+    expect(page.fetcher.mock.calls.some(([path]) => path.includes('/status') || path === '/nodes')).toBe(false);
   });
 
-  it('does not remove anything when the confirmation is declined', () => {
-    const page = mount(fleet());
-    vi.spyOn(window, 'confirm').mockReturnValue(false);
-    fireEvent.click(button('多选'));
-    fireEvent.click(checkbox('选中 首尔 旧机'));
-    fireEvent.click(button('移除选中 1'));
+  it('marks a retirement that will end in removal on its card', () => {
+    const nodes = fleet();
+    nodes.find(node => node.node_id === 'hk-old')!.removal_status = 'queued';
+    // 旧字段留在运行中的机器上不算已安排：恢复会撤销这次移出。
+    nodes.find(node => node.node_id === 'jp-iij')!.removal_status = 'queued';
+    mount(nodes);
 
-    expect(page.fetcher.mock.calls.some(([path, init]) => path === '/nodes' && init?.method === 'DELETE')).toBe(false);
-    expect(checkbox('选中 首尔 旧机').checked).toBe(true);
+    const retiring = button('查看 香港 旧 BGP 的机器详情');
+    expect(retiring.querySelector('.node-card-status')?.textContent).toBe('退役中 · 完成后移出');
+    expect(button('查看 东京 IIJ 的机器详情').textContent).not.toContain('完成后移出');
+  });
+
+  it('confirms a removal made from the detail page once the list is back', async () => {
+    vi.useFakeTimers();
+    try {
+      mount(fleet());
+      act(() => announceNodeRemoval('已移出 首尔 旧机，删除 2 条线路'));
+      const notice = screen.getByRole('status');
+      expect(notice.textContent).toContain('已移出 首尔 旧机，删除 2 条线路');
+      // 提示浮在网格之上，不占据卡片流。
+      expect(notice.closest('.node-list-body')).toBeNull();
+      act(() => vi.advanceTimersByTime(6_600));
+      expect(screen.queryByRole('status')).toBeNull();
+
+      act(() => announceNodeRemoval('已移出 洛杉矶 旧 GIA'));
+      fireEvent.click(button('关闭提示'));
+      expect(screen.queryByRole('status')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('hides the tools from visitors and disables them for read-only operators', () => {
@@ -256,20 +223,17 @@ describe('machine list title bar', () => {
       token_prefix: null,
       masked_assets: true,
     });
-    expect(screen.queryByRole('button', { name: '多选' })).toBeNull();
     expect(screen.queryByRole('button', { name: '＋ 纳管机器' })).toBeNull();
     expect(cardNames()).toHaveLength(27);
     cleanup();
 
     mount(fleet(), { ...admin, operator_id: 'reviewer', role: 'readonly', masked_assets: true });
-    expect(button('多选').disabled).toBe(true);
     expect(button('＋ 纳管机器').disabled).toBe(true);
   });
 
-  it('shows the empty state without 多选 when there is no machine yet', () => {
+  it('shows the empty state with only the provisioning entry when there is no machine yet', () => {
     mount([]);
     expect(screen.getByText('还没有机器')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: '多选' })).toBeNull();
     expect(button('＋ 纳管机器').disabled).toBe(false);
   });
 

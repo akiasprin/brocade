@@ -3179,6 +3179,9 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 l.deployment_id AS lifecycle_deployment_id,
                 l.completed_at::text AS lifecycle_completed_at,
                 l.last_error AS lifecycle_last_error,
+                removal.status AS removal_status,
+                removal.created_at::text AS removal_requested_at,
+                removal.last_error AS removal_last_error,
                 oi.isolated_at::text AS isolated_at,
                 oi.node_id IS NOT NULL AS operationally_isolated,
                 COALESCE(debt.debt_count, 0) AS convergence_debt_count,
@@ -3249,6 +3252,18 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
          LEFT JOIN node_public_ip_state p6 ON p6.node_id = n.id AND p6.family = 6
          LEFT JOIN node_applied_state a ON a.node_id = n.id
          LEFT JOIN node_lifecycle_state l ON l.node_id = n.id
+         -- Kind matches node_removal::KIND. One pass over the removal rows rather than a lookup
+         -- per machine: jobs has no index on the payload node id.
+         LEFT JOIN (
+             SELECT DISTINCT ON (job.payload->>'node_id')
+                    job.payload->>'node_id' AS node_id,
+                    job.payload->>'intent_revision' AS intent_revision,
+                    job.status, job.created_at, job.last_error
+               FROM jobs job
+              WHERE job.kind = 'node-removal' AND job.status IN ('queued', 'running', 'failed')
+              ORDER BY job.payload->>'node_id', job.id DESC
+         ) removal ON removal.node_id = n.id
+                  AND removal.intent_revision = l.intent_revision::text
          LEFT JOIN node_operational_isolations oi ON oi.node_id = n.id
          LEFT JOIN vpngate_probe_nodes vpn ON vpn.node_id = n.id
          LEFT JOIN vpngate_catalog_nodes catalog ON catalog.node_id = n.id
@@ -3299,6 +3314,9 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 l.deployment_id AS lifecycle_deployment_id,
                 l.completed_at::text AS lifecycle_completed_at,
                 l.last_error AS lifecycle_last_error,
+                removal.status AS removal_status,
+                removal.created_at::text AS removal_requested_at,
+                removal.last_error AS removal_last_error,
                 oi.isolated_at::text AS isolated_at,
                 oi.node_id IS NOT NULL AS operationally_isolated,
                 COALESCE(debt.debt_count, 0) AS convergence_debt_count,
@@ -3369,6 +3387,18 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
          LEFT JOIN node_public_ip_state p6 ON p6.node_id = n.id AND p6.family = 6
          LEFT JOIN node_applied_state a ON a.node_id = n.id
          LEFT JOIN node_lifecycle_state l ON l.node_id = n.id
+         -- Kind matches node_removal::KIND. One pass over the removal rows rather than a lookup
+         -- per machine: jobs has no index on the payload node id.
+         LEFT JOIN (
+             SELECT DISTINCT ON (job.payload->>'node_id')
+                    job.payload->>'node_id' AS node_id,
+                    job.payload->>'intent_revision' AS intent_revision,
+                    job.status, job.created_at, job.last_error
+               FROM jobs job
+              WHERE job.kind = 'node-removal' AND job.status IN ('queued', 'running', 'failed')
+              ORDER BY job.payload->>'node_id', job.id DESC
+         ) removal ON removal.node_id = n.id
+                  AND removal.intent_revision = l.intent_revision::text
          LEFT JOIN node_operational_isolations oi ON oi.node_id = n.id
          LEFT JOIN vpngate_probe_nodes vpn ON vpn.node_id = n.id
          LEFT JOIN vpngate_catalog_nodes catalog ON catalog.node_id = n.id
@@ -3593,6 +3623,17 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
         lifecycle_deployment_id: row.try_get("lifecycle_deployment_id")?,
         lifecycle_completed_at: row.try_get("lifecycle_completed_at")?,
         lifecycle_last_error: row.try_get("lifecycle_last_error")?,
+        removal_status: row
+            .try_get::<Option<String>, _>("removal_status")?
+            .map(|status| {
+                if status == "failed" {
+                    NodeRemovalStatus::Failed
+                } else {
+                    NodeRemovalStatus::Queued
+                }
+            }),
+        removal_requested_at: row.try_get("removal_requested_at")?,
+        removal_last_error: row.try_get("removal_last_error")?,
         operationally_isolated,
         isolated_at: row.try_get("isolated_at")?,
         convergence_debt_count,
