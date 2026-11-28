@@ -570,7 +570,7 @@ class ReleaseEnvironment:
         common = self.git_common(source)
         return ['--volume', f'{common}:{common}:ro']
 
-    def container(self, name, target, source, entrypoint=False, extra_env=None):
+    def container(self, name, target, source, entrypoint=False, extra_env=None, evidence=False):
         environment = {
             'HOME': '/home/build',
             'CARGO_HOME': '/home/build/cargo',
@@ -614,6 +614,8 @@ class ReleaseEnvironment:
             '--volume',
             f'{self.cache / "downloads"}:/home/build/cache',
         ]
+        if evidence:
+            command += ['--volume', f'{self.evidence}:{self.evidence}']
         for path in self.config['inputs'].values():
             command += ['--volume', f'{path}:{path}:ro']
         if entrypoint:
@@ -778,6 +780,7 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
                 'packager',
                 self.source('cube-a'),
                 entrypoint=True,
+                evidence=True,
             )
             + [
                 '-c',

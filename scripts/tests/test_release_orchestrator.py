@@ -60,11 +60,13 @@ class ReleaseOrchestratorTests(unittest.TestCase):
 
     def test_container_mounts_all_candidate_sources_for_independent_verification(self):
         with patch.object(self.environment, 'mount_git', side_effect=lambda source: [str(source / '.git-parent')]):
-            command = self.environment.container('verify', 'packager', self.environment.source('cube-a'))
+            command = self.environment.container('verify', 'packager', self.environment.source('cube-a'), evidence=True)
         for name in ('base', 'cvm', 'cube-a', 'cube-b'):
             source = str(self.environment.source(name))
             self.assertIn(f'{source}:{source}', command)
             self.assertIn(str(self.environment.source(name) / '.git-parent'), command)
+        evidence = str(self.environment.evidence)
+        self.assertIn(f'{evidence}:{evidence}', command)
 
     def test_unowned_target_cache_is_rejected_before_compilation(self):
         target = self.environment.source('base') / 'target/brocade-agent-build'
