@@ -243,7 +243,7 @@ describe('退役/移出 dialog', () => {
     async node => {
       const client = mount();
       const dialog = openDialog();
-      const retirement = within(dialog).getByRole('button', { name: '退役', exact: true }) as HTMLButtonElement;
+      const retirement = within(dialog).getByRole('button', { name: '退役' }) as HTMLButtonElement;
 
       server.node = node;
       await act(() => client.invalidateQueries({ queryKey: ['nodes'] }));
@@ -257,9 +257,7 @@ describe('退役/移出 dialog', () => {
       expect(writes()).toEqual([]);
 
       fireEvent.click(option(dialog, /^移出/));
-      expect((within(dialog).getByRole('button', { name: '移出', exact: true }) as HTMLButtonElement).disabled).toBe(
-        false,
-      );
+      expect((within(dialog).getByRole('button', { name: '移出' }) as HTMLButtonElement).disabled).toBe(false);
     },
   );
 
