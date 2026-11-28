@@ -409,6 +409,18 @@ async fn start_sandbox(
 
     thread::sleep(Duration::from_millis(5));
 
+    // Shim task deletion can leave the guest overlay mounted and holding
+    // its writable backing disk. Release those references before unmounting.
+    rpc::remove_remaining_containers(sandbox.clone(), logger).await;
+    let mounts = std::mem::take(&mut sandbox.lock().await.mounts);
+    for mount in mounts.iter().rev() {
+        if let Err(err) = nix::mount::umount(mount.as_str()) {
+            warn!(logger, "failed to unmount sandbox storage before power-off";
+                "mount" => mount.as_str(), "error" => %err);
+        }
+    }
+    // The power-off syscall itself does not write back remaining mounts.
+    unistd::sync();
     let ret = unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) };
     if ret != 0 {
         println!("shutdown vm failed, ret:{:}", ret);

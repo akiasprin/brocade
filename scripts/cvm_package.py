@@ -4,6 +4,7 @@ Called by scripts/build-release.py. This does not compile a second control plane
 fetch mutable images, or import a developer machine's running Cube installation.
 """
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -28,11 +29,25 @@ SANDBOX_EXECUTABLES = (
     '/usr/bin/readlink',
     '/usr/bin/rm',
     '/usr/bin/sed',
+    '/usr/bin/sleep',
     '/usr/bin/ssh-keygen',
     '/usr/bin/touch',
     '/usr/sbin/chpasswd',
     '/usr/sbin/sshd',
 )
+
+
+def replace_legacy_sandbox_boot(container):
+    if container.get('command') != ['/bin/sh'] or container.get('args') != [
+        '-c',
+        'mkdir -p /run/sshd; ssh-keygen -A; exec /usr/sbin/sshd -D -e',
+    ]:
+        return False
+    # The credential initializer owns sshd startup. The old foreground sshd
+    # can lose the port race to it and take down the entire Sandbox.
+    container['command'] = ['/usr/bin/sleep']
+    container['args'] = ['infinity']
+    return True
 
 
 def _debugfs(image, command):
@@ -232,10 +247,15 @@ def prepare(root, build_manifest, assets, output):
                 annotations.pop(key, None)
             else:
                 annotations[key] = version
-        system_id = 'system-' + stack.digest(assets / 'system.json')[:20]
+        converted_boot = replace_legacy_sandbox_boot(containers[0])
+        system_bytes = (json.dumps(system, sort_keys=True) + '\n').encode()
+        system_sha = (
+            hashlib.sha256(system_bytes).hexdigest() if converted_boot else stack.digest(assets / 'system.json')
+        )
+        system_id = 'system-' + system_sha[:20]
         config = tree / 'config'
         config.mkdir()
-        (config / 'system.json').write_text(json.dumps(system, sort_keys=True) + '\n')
+        (config / 'system.json').write_bytes(system_bytes)
         source = (root / 'components/cube/Cubelet/config/config.toml').read_text()
         for before, after in [
             ('address = ":9998"', f'address = "{stack.INSPECTION_ADDRESS}"'),

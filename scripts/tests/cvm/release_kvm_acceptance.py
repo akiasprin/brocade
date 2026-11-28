@@ -752,6 +752,8 @@ threading.Event().wait()
     def lifecycle(self):
         original = self.instance('beta')
         marker = self.state['native']['beta']['marker']
+        boot = self.guest('beta', 'cat /proc/sys/kernel/random/boot_id')
+        self.guest('beta', 'mkdir ~/shutdown-proof; for n in $(seq 1 128); do touch ~/shutdown-proof/$n; done')
         for action in ('stop', 'start', 'restart'):
             self.operation('beta', action)
             deployment = self.publish()
@@ -759,10 +761,32 @@ threading.Event().wait()
             current = self.instance_ready('beta')
             assert current['report']['volume_id'] == original['report']['volume_id']
             assert current['report']['power'] == ('stopped' if action == 'stop' else 'running')
-            if action != 'stop':
+            if action == 'stop':
+                self.verify_stopped_root(original)
+            else:
+                next_boot = self.guest('beta', 'cat /proc/sys/kernel/random/boot_id')
+                assert next_boot and next_boot != boot
+                boot = next_boot
                 assert self.guest('beta', 'cat ~/acceptance') == marker
+                assert self.guest('beta', 'find ~/shutdown-proof -type f | wc -l') == '128'
             self.record('global approval plus actual native lifecycle and retained volume: ' + action)
         self.configure_lifecycle()
+
+    def verify_stopped_root(self, running):
+        runtime = running['report']['runtime_id']
+        assert re.fullmatch(r'cvm-[a-f0-9-]{36}', runtime)
+        name = 'sb-' + runtime + '-root'
+        assert running['report']['volume_id'] == 'cube-' + hashlib.sha256(name.encode()).hexdigest()
+        root = Path('/data/cubelet/storage/plain/objects/volumes') / name / name
+        role = self.state['nodes'][running['node_id']]['role']
+        fsck = self.lab.remote(role, shlex.join(['sudo', 'env', 'LC_ALL=C', 'e2fsck', '-fn', str(root)]), check=False)
+        report = (fsck.stdout + fsck.stderr).decode(errors='replace')
+        self.private('stopped-root-fsck.json', {'exit_code': fsck.returncode, 'output': report})
+        assert fsck.returncode == 0 and 'Pass 5:' in report and 'Fix?' not in report, 'stopped root is inconsistent'
+        superblock = self.lab.remote(role, shlex.join(['sudo', 'env', 'LC_ALL=C', 'tune2fs', '-l', str(root)]))
+        state = re.search(r'^Filesystem state:\s+(.+)$', superblock.stdout.decode(), re.M)
+        assert state and state[1] == 'clean', 'stopped root was not cleanly unmounted'
+        self.record('retained ext4 root is clean and passes a full offline check after Guest stop')
 
     def configure_lifecycle(self):
         original = self.instance('beta')

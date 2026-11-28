@@ -15,3 +15,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
  && if ! id cube >/dev/null 2>&1; then useradd --create-home --shell /bin/bash cube; fi \
  && rm -f /etc/ssh/ssh_host_* \
  && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Brocade Guest initialization starts sshd after provisioning its credentials.
+ENTRYPOINT ["/usr/bin/sleep"]
+CMD ["infinity"]

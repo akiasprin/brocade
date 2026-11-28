@@ -62,6 +62,22 @@ class SandboxLoginContractTests(unittest.TestCase):
             self.validate()
 
 
+class SandboxBootTests(unittest.TestCase):
+    def test_legacy_foreground_ssh_yields_to_credential_initialization(self):
+        container = {
+            'command': ['/bin/sh'],
+            'args': ['-c', 'mkdir -p /run/sshd; ssh-keygen -A; exec /usr/sbin/sshd -D -e'],
+        }
+        self.assertTrue(PACKAGE.replace_legacy_sandbox_boot(container))
+        self.assertEqual(container, {'command': ['/usr/bin/sleep'], 'args': ['infinity']})
+        self.assertFalse(PACKAGE.replace_legacy_sandbox_boot(container))
+
+    def test_preserves_custom_entrypoint(self):
+        container = {'command': ['/bin/sh'], 'args': ['-c', 'exec /etc/custom-init']}
+        self.assertFalse(PACKAGE.replace_legacy_sandbox_boot(container))
+        self.assertEqual(container['args'], ['-c', 'exec /etc/custom-init'])
+
+
 class AssetValidationTests(unittest.TestCase):
     def test_validates_login_contract_against_sandbox_root_image(self):
         with tempfile.TemporaryDirectory() as temporary:

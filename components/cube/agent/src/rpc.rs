@@ -61,6 +61,7 @@ use rustjail::process::Process;
 use rustjail::process::ProcessOperations;
 use rustjail::specconv::CreateOpts;
 use rustjail::{pipestream::PipeStream, process::StreamType};
+use slog::Logger;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf};
 use tokio::sync::Mutex;
 use tracing::instrument;
@@ -343,11 +344,7 @@ impl AgentService {
     }
 
     #[instrument]
-    async fn do_remove_container(
-        &self,
-        req: protocols::agent::RemoveContainerRequest,
-    ) -> Result<()> {
-        let cid = req.container_id.clone();
+    async fn do_remove_container(&self, cid: String, timeout: u32) -> Result<()> {
         let mut cmounts: Vec<String> = vec![];
 
         let mut remove_container_resources = |sandbox: &mut Sandbox| -> Result<()> {
@@ -370,7 +367,7 @@ impl AgentService {
             Ok(())
         };
 
-        if req.timeout == 0 {
+        if timeout == 0 {
             let s = Arc::clone(&self.sandbox);
             let mut sandbox = s.lock().await;
 
@@ -401,7 +398,7 @@ impl AgentService {
             };
         });
 
-        if tokio::time::timeout(Duration::from_secs(req.timeout.into()), rx)
+        if tokio::time::timeout(Duration::from_secs(timeout.into()), rx)
             .await
             .is_err()
         {
@@ -827,7 +824,10 @@ impl protocols::agent_ttrpc::AgentService for AgentService {
         trace_rpc_call!(ctx, "remove_container", req);
         is_allowed!(req);
 
-        match self.do_remove_container(req).await {
+        match self
+            .do_remove_container(req.container_id, req.timeout)
+            .await
+        {
             Err(e) => Err(ttrpc_error!(ttrpc::Code::INTERNAL, e)),
             Ok(_) => Ok(Empty::new()),
         }
@@ -1929,6 +1929,17 @@ async fn read_stream(reader: Arc<Mutex<ReadHalf<PipeStream>>>, l: usize) -> Resu
     }
 
     Ok(content)
+}
+
+pub(crate) async fn remove_remaining_containers(sandbox: Arc<Mutex<Sandbox>>, logger: &Logger) {
+    let containers: Vec<_> = sandbox.lock().await.containers.keys().cloned().collect();
+    let service = AgentService { sandbox };
+    for id in containers {
+        if let Err(err) = service.do_remove_container(id.clone(), 0).await {
+            warn!(logger, "failed to remove container before power-off";
+                "container_id" => id, "error" => %err);
+        }
+    }
 }
 
 pub fn start(s: Arc<Mutex<Sandbox>>, server_address: &str) -> Result<TtrpcServer> {
