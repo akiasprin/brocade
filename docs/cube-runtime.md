@@ -30,11 +30,13 @@ python3 scripts/build-release.py --cube-runtime-only \
 
 `build_complete` 表示构建完成；`deploymentReady` 保持 false，需另做对应架构、升级和恢复验收。系统镜像、Guest 内核和 Guest Agent 按独立制品准备，不绑定 CPU、内存或硬盘大小。Agent 安装器从固定运行包安装 Cube 栈；节点管理员仍需准备持久 XFS/reflink 或 ext4 和上游网络。原生 KVM/PVM 的选择、换核和切换流程见 [CVM 安装与运行包](cvm.md#原生-kvm-与-pvm)。
 
-### 构建 Brocade Guest 镜像
+### 构建 Brocade Sandbox 系统镜像
 
-Brocade 固定资产不能直接使用 Cube 的最小 Guest 镜像；该镜像没有 `cube` 登录用户或 OpenSSH 服务。使用 one-click Guest 构建入口时，通过 `ONE_CLICK_GUEST_IMAGE_DOCKERFILE` 选择仓库内的 `components/cube/deploy/guest-image/Dockerfile.brocade`。该配方固定实际的 x86_64 OCI manifest，安装 OpenSSH 客户端与服务端，创建 `/home/cube` 及可登录 shell，并清除构建时生成的 SSH host key；首次凭据收敛会在 Guest 内生成独立 host key、写入密码策略并启动 sshd。
+Cube 的 `guest.img` 是只读的 MicroVM 基础 OS，只负责 PID 1、Guest Agent 和设备挂载；实际 `guest_exec`、SSH 登录与用户进程运行在 `system.json` 指向的 Sandbox `root.ext4` 可写 overlay 中。登录契约因此必须由 `root.ext4` 提供，不能通过只修改 `guest.img` 满足。
 
-节点包打包器使用 `debugfs` 只读检查最终 `guest.img`，要求 `cube` 账户、home、shell、`sshd_config` 及密码初始化脚本依赖的全部可执行文件真实存在；仅有正确 Dockerfile 或清单 SHA-256 不算通过。固定资产环境因此必须安装 `e2fsprogs` 提供 `debugfs`。镜像内容变化后更新固定资产 `manifest.json` 中 `guest.img` 的真实 SHA-256，再重新组包和执行 KVM 验收；不得只改清单或复用旧镜像。
+Brocade 的固定 Sandbox OCI 使用仓库内的 `components/cube/deploy/sandbox-image/Dockerfile.brocade`，固定实际架构 manifest，并在上游系统镜像基础上安装 OpenSSH 客户端与服务端，创建 `/home/cube` 及可登录 shell，并清除构建时生成的 SSH host key；随后仍使用 CubeTemplateCenter 的 `PrepareSource` 和 `BuildExt4` 生成 `root.ext4` 与保持同一 OCI 配置语义的 `system.json`。首次凭据收敛在每个 Sandbox 的可写 overlay 内生成独立 host key、写入密码策略并启动 sshd。
+
+节点包打包器使用 `debugfs` 只读检查最终 `root.ext4`，要求 `cube` 账户、home、shell、`sshd_config` 及密码初始化脚本依赖的全部可执行文件真实存在；仅有正确 Dockerfile、`guest.img` 内容或清单 SHA-256 不算通过。固定资产环境因此必须安装 `e2fsprogs` 提供 `debugfs`。镜像内容变化后同时更新固定资产 `root.ext4`、对应 `system.json` 和 `manifest.json` 中的真实 SHA-256，再重新组包并执行 KVM 验收；不得只改清单或复用旧镜像。
 
 ### 打包 PVM 内核配对
 

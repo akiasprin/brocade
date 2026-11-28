@@ -1,4 +1,4 @@
-"""Assemble the node-only CVM bundle from accepted builds and fixed Guest assets.
+"""Assemble the node-only CVM bundle from accepted builds and fixed Cube assets.
 
 Called by scripts/build-release.py. This does not compile a second control plane,
 fetch mutable images, or import a developer machine's running Cube installation.
@@ -18,7 +18,7 @@ from cvm_elf import validate as validate_elf
 
 
 ASSETS = ('system.json', 'root.ext4', 'vmlinux', 'guest.img', 'agent.ext4')
-GUEST_EXECUTABLES = (
+SANDBOX_EXECUTABLES = (
     '/usr/bin/cat',
     '/usr/bin/id',
     '/usr/bin/install',
@@ -41,79 +41,96 @@ def _debugfs(image, command):
             capture_output=True,
         )
     except FileNotFoundError as error:
-        raise stack.StackError('debugfs is required to validate the Guest image') from error
+        raise stack.StackError('debugfs is required to validate the Sandbox root image') from error
     diagnostics = result.stderr.decode(errors='replace')
     if result.returncode or 'File not found by ext2_lookup' in diagnostics:
-        raise stack.StackError(f'Guest image lookup failed: {command}')
+        raise stack.StackError(f'Sandbox root image lookup failed: {command}')
     return result.stdout
 
 
-def _guest_read(image, path):
+def _sandbox_read(image, path):
     return _debugfs(image, f'cat {path}')
 
 
-def _guest_stat(image, path):
+def _sandbox_stat(image, path):
     output = _debugfs(image, f'stat {path}').decode(errors='replace')
     match = re.search(r'Type:\s+(\w+)\s+Mode:\s+([0-7]+)', output)
     if not match:
-        raise stack.StackError(f'Guest image path is missing or invalid: {path}')
+        raise stack.StackError(f'Sandbox root image path is missing or invalid: {path}')
     destination = None
     if match[1] == 'symlink':
         link = re.search(r'Fast link dest:\s+"([^"]+)"', output)
         if not link:
-            raise stack.StackError(f'Guest image symlink cannot be resolved: {path}')
+            raise stack.StackError(f'Sandbox root image symlink cannot be resolved: {path}')
         destination = link[1]
     return match[1], int(match[2], 8), destination
 
 
-def _validate_guest_executable(image, path, stat_file):
+def _validate_sandbox_executable(image, path, stat_file):
     current = path
     seen = set()
     for _ in range(8):
         if current in seen:
-            raise stack.StackError(f'Guest image executable has a symlink cycle: {path}')
+            raise stack.StackError(f'Sandbox root image executable has a symlink cycle: {path}')
         seen.add(current)
         try:
             kind, mode, destination = stat_file(image, current)
         except (KeyError, stack.StackError) as error:
-            raise stack.StackError(f'Guest image is missing required executable: {path}') from error
+            raise stack.StackError(f'Sandbox root image is missing required executable: {path}') from error
         if kind == 'regular':
             if not mode & 0o111:
-                raise stack.StackError(f'Guest image path is not executable: {path}')
+                raise stack.StackError(f'Sandbox root image path is not executable: {path}')
             return
         if kind != 'symlink' or not destination:
-            raise stack.StackError(f'Guest image executable has invalid file type: {path}')
+            raise stack.StackError(f'Sandbox root image executable has invalid file type: {path}')
         current = posixpath.normpath(
             destination if destination.startswith('/') else posixpath.join(posixpath.dirname(current), destination)
         )
         if not current.startswith('/'):
-            raise stack.StackError(f'Guest image executable symlink escapes the root: {path}')
-    raise stack.StackError(f'Guest image executable has too many symlink levels: {path}')
+            raise stack.StackError(f'Sandbox root image executable symlink escapes the root: {path}')
+    raise stack.StackError(f'Sandbox root image executable has too many symlink levels: {path}')
 
 
-def validate_guest_contract(image, read_file=_guest_read, stat_file=_guest_stat):
+def validate_sandbox_login_contract(image, read_file=_sandbox_read, stat_file=_sandbox_stat):
     try:
         passwd = read_file(image, '/etc/passwd').decode('utf-8')
     except (KeyError, UnicodeDecodeError, stack.StackError) as error:
-        raise stack.StackError('Guest image has no valid /etc/passwd') from error
+        raise stack.StackError('Sandbox root image has no valid /etc/passwd') from error
     accounts = [line.split(':') for line in passwd.splitlines() if line and not line.startswith('#')]
     cube = [fields for fields in accounts if len(fields) == 7 and fields[0] == 'cube']
     if len(cube) != 1 or cube[0][5] != '/home/cube' or cube[0][6] in ('', '/bin/false', '/sbin/nologin'):
-        raise stack.StackError('Guest image must contain one login-capable cube account with /home/cube')
+        raise stack.StackError('Sandbox root image must contain one login-capable cube account with /home/cube')
     try:
         home_kind, _, _ = stat_file(image, '/home/cube')
     except (KeyError, stack.StackError) as error:
-        raise stack.StackError('Guest image cube account has no home directory') from error
+        raise stack.StackError('Sandbox root image cube account has no home directory') from error
     if home_kind != 'directory':
-        raise stack.StackError('Guest image cube account home is not a directory')
+        raise stack.StackError('Sandbox root image cube account home is not a directory')
     try:
         sshd_config = read_file(image, '/etc/ssh/sshd_config')
     except (KeyError, stack.StackError) as error:
-        raise stack.StackError('Guest image has no OpenSSH server configuration') from error
+        raise stack.StackError('Sandbox root image has no OpenSSH server configuration') from error
     if not sshd_config.strip() or b'\0' in sshd_config:
-        raise stack.StackError('Guest image OpenSSH server configuration is invalid')
-    for path in ('/bin/sh', cube[0][6], *GUEST_EXECUTABLES):
-        _validate_guest_executable(image, path, stat_file)
+        raise stack.StackError('Sandbox root image OpenSSH server configuration is invalid')
+    for path in ('/bin/sh', cube[0][6], *SANDBOX_EXECUTABLES):
+        _validate_sandbox_executable(image, path, stat_file)
+
+
+def validate_assets(assets, asset_manifest, architecture, login_validator=validate_sandbox_login_contract):
+    pvm = asset_manifest.get('pvm')
+    if architecture == 'x86_64' and pvm is None:
+        raise stack.StackError('new x86_64 CVM bundles require paired PVM host/Guest assets for automatic fallback')
+    extra_assets = ('vmlinux-pvm', 'pvm-host.deb') if pvm is not None else ()
+    if asset_manifest.get('architecture') != architecture or set(asset_manifest.get('files', {})) != set(
+        ASSETS + extra_assets
+    ):
+        raise stack.StackError('fixed Cube assets must match the runtime architecture and complete asset inventory')
+    for name in ASSETS + extra_assets:
+        source = assets / name
+        if source.is_symlink() or not source.is_file() or stack.digest(source) != asset_manifest['files'][name]:
+            raise stack.StackError('Cube asset SHA-256 mismatch')
+    login_validator(assets / 'root.ext4')
+    return pvm
 
 
 @stack.progress_task('assemble node bundle')
@@ -126,19 +143,7 @@ def prepare(root, build_manifest, assets, output):
         raise stack.StackError('CVM runtime build is incomplete or does not match current source')
     architecture = build['architecture']
     asset_manifest = stack.read_json(assets / 'manifest.json')
-    pvm = asset_manifest.get('pvm')
-    if architecture == 'x86_64' and pvm is None:
-        raise stack.StackError('new x86_64 CVM bundles require paired PVM host/Guest assets for automatic fallback')
-    extra_assets = ('vmlinux-pvm', 'pvm-host.deb') if pvm is not None else ()
-    if asset_manifest.get('architecture') != architecture or set(asset_manifest.get('files', {})) != set(
-        ASSETS + extra_assets
-    ):
-        raise stack.StackError('fixed Guest assets must match the runtime architecture and complete asset inventory')
-    for name in ASSETS + extra_assets:
-        source = assets / name
-        if source.is_symlink() or not source.is_file() or stack.digest(source) != asset_manifest['files'][name]:
-            raise stack.StackError('Guest asset SHA-256 mismatch')
-    validate_guest_contract(assets / 'guest.img')
+    pvm = validate_assets(assets, asset_manifest, architecture)
     with tempfile.TemporaryDirectory(prefix='package-', dir=build_manifest.parent) as temporary:
         tree = Path(temporary)
 

@@ -1,0 +1,16 @@
+FROM ghcr.io/tencentcloud/cubesandbox-base@sha256:127ca10b571c9790f8f08794fa91196edca86baba69acc86ff9995589bda68aa
+
+USER root
+
+RUN export DEBIAN_FRONTEND=noninteractive \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      coreutils \
+      openssh-client \
+      openssh-server \
+      passwd \
+      procps \
+      sed \
+ && if ! id cube >/dev/null 2>&1; then useradd --create-home --shell /bin/bash cube; fi \
+ && rm -f /etc/ssh/ssh_host_* \
+ && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
