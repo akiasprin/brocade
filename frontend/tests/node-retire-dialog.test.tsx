@@ -238,6 +238,31 @@ describe('退役/移出 dialog', () => {
     expect(within(dialog).getByRole('button', { name: '退役且移出' }).className).toContain('solid');
   });
 
+  it.each([retiring(), retired(), retired({ lifecycle_phase: 'abandoned' })])(
+    'keeps the retirement choice when polling advances to $lifecycle_phase',
+    async node => {
+      const client = mount();
+      const dialog = openDialog();
+      const retirement = within(dialog).getByRole('button', { name: '退役', exact: true }) as HTMLButtonElement;
+
+      server.node = node;
+      await act(() => client.invalidateQueries({ queryKey: ['nodes'] }));
+      await waitFor(() => expect(dialog.getAttribute('aria-label')).toBe(`移出 ${NAME}`));
+
+      expect(option(dialog, /^仅退役/).checked).toBe(true);
+      expect(option(dialog, /^仅退役/).disabled).toBe(true);
+      expect(option(dialog, /^移出/).checked).toBe(false);
+      expect(retirement.disabled).toBe(true);
+      fireEvent.click(retirement);
+      expect(writes()).toEqual([]);
+
+      fireEvent.click(option(dialog, /^移出/));
+      expect((within(dialog).getByRole('button', { name: '移出', exact: true }) as HTMLButtonElement).disabled).toBe(
+        false,
+      );
+    },
+  );
+
   it('opens a finished retirement on 移出 only, without 强制, and focuses 取消', () => {
     mount(retired());
     const dialog = openDialog();
