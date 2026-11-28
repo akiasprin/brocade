@@ -210,6 +210,29 @@ class ReleaseOrchestratorTests(unittest.TestCase):
         with self.assertRaisesRegex(ORCHESTRATOR.OrchestrationError, 'new disposable lab'):
             self.environment.first_install(root, self.root / 'cvm')
 
+    def test_docker_builder_falls_back_when_buildx_is_absent(self):
+        source = self.environment.source('base')
+        commands = []
+
+        def execute(command, **kwargs):
+            commands.append((command, kwargs))
+
+        with (
+            patch.object(self.environment, 'host_preflight'),
+            patch.object(self.environment, 'prepare_sources'),
+            patch.object(self.environment, 'prepare_tools'),
+            patch.object(self.environment, 'prepare_formatters'),
+            patch.object(self.environment, 'pinned_base_image', return_value='ubuntu@sha256:' + '0' * 64),
+            patch.object(ORCHESTRATOR, 'run', return_value=subprocess.CompletedProcess([], 1)),
+            patch.object(
+                ORCHESTRATOR, 'checked', return_value=subprocess.CompletedProcess([], 0, b'sha256:image\n', b'')
+            ),
+            patch.object(ORCHESTRATOR.Runner, 'execute', side_effect=execute),
+        ):
+            self.environment.prepare()
+        self.assertTrue(commands)
+        self.assertTrue(all(kwargs['env']['DOCKER_BUILDKIT'] == '0' for _command, kwargs in commands))
+
     def test_parallel_failures_are_aggregated(self):
         from concurrent.futures import Future
 

@@ -337,6 +337,8 @@ class ReleaseEnvironment:
             self.cache / 'downloads',
         ):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        build_environment = os.environ.copy()
+        build_environment['DOCKER_BUILDKIT'] = '1' if run(['docker', 'buildx', 'version']).returncode == 0 else '0'
         self.prepare_sources()
         self.prepare_tools()
         pinned = self.pinned_base_image()
@@ -357,7 +359,7 @@ class ReleaseEnvironment:
                     self.image(target),
                     str(ROOT),
                 ],
-                env={**os.environ, 'DOCKER_BUILDKIT': '1'},
+                env=build_environment,
             )
 
         with ThreadPoolExecutor(max_workers=3) as pool:
@@ -374,7 +376,13 @@ class ReleaseEnvironment:
             )
             images[target] = {'reference': self.image(target), 'id': identity}
         atomic_json(
-            self.evidence / 'environment/images.json', {'base_image': pinned, 'images': images, 'pins': self.pins}
+            self.evidence / 'environment/images.json',
+            {
+                'base_image': pinned,
+                'buildkit': build_environment['DOCKER_BUILDKIT'] == '1',
+                'images': images,
+                'pins': self.pins,
+            },
         )
 
     def prepare_sources(self):
