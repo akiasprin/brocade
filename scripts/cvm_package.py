@@ -19,6 +19,7 @@ from cvm_elf import validate as validate_elf
 
 ASSETS = ('system.json', 'root.ext4', 'vmlinux', 'guest.img', 'agent.ext4')
 SANDBOX_EXECUTABLES = (
+    '/sbin/ip',
     '/usr/bin/cat',
     '/usr/bin/id',
     '/usr/bin/install',

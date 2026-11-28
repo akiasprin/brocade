@@ -46,6 +46,11 @@ class SandboxLoginContractTests(unittest.TestCase):
         with self.assertRaisesRegex(PACKAGE.stack.StackError, '/usr/sbin/sshd'):
             self.validate()
 
+    def test_rejects_sandbox_without_network_reconcile_command(self):
+        del self.stats['/sbin/ip']
+        with self.assertRaisesRegex(PACKAGE.stack.StackError, '/sbin/ip'):
+            self.validate()
+
     def test_rejects_non_executable_sandbox_command(self):
         self.stats['/usr/bin/ssh-keygen'] = ('regular', 0o644, None)
         with self.assertRaisesRegex(PACKAGE.stack.StackError, 'not executable'):
