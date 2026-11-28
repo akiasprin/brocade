@@ -419,8 +419,6 @@ class Acceptance:
         )
         self.gate(hold_desired=[], hold_machine=['compute-a'])
         deployment = self.publish()
-        self.state['barrier_deployment'] = deployment
-        self.save()
         self.wait(
             'actual ordinary receipt intercepted',
             lambda: (
@@ -470,14 +468,6 @@ class Acceptance:
         )
         self.native_guests()
 
-    def finish_initial(self):
-        self.complete(self.state['barrier_deployment'], timeout=240)
-        self.record(
-            'non-disruptive creation advances automatically to wave two only after wave one completes',
-            deployment=self.state['barrier_deployment'],
-        )
-        self.native_guests()
-
     def integrity_failure(self):
         self.operation('alpha', 'restart')
         self.operation('beta', 'restart')
@@ -497,17 +487,24 @@ class Acceptance:
         assert next(t for t in detail['targets'] if t['node_id'] == 'compute-a')['status'] == 'failed-dirty'
         assert next(t for t in detail['targets'] if t['node_id'] == 'compute-b')['status'] == 'pending'
         assert self.guest('alpha', 'cat /proc/sys/kernel/random/boot_id', cached_revision=credential_revision) == boot
+        instance = self.instance('alpha')
+        assert instance['report']['status'] == 'failed'
+        failed_generation = instance['desired']['generation']
         self.record(
             'Agent rejects actual corrupted native bytes before execution; failure halts later wave without rebooting Guest',
             deployment=deployment,
         )
         self.gate(corrupt_artifact=[])
         self.call('POST', f'/deployments/{deployment}/targets/compute-a/retry', {}, expected=(200, 202))
-        self.wait(
+        detail = self.wait(
             'CVM-only retry',
             lambda: self.detail(deployment),
             lambda d: next(t for t in d['targets'] if t['node_id'] == 'compute-a')['status'] == 'succeeded',
+            timeout=240,
         )
+        assert next(t for t in detail['targets'] if t['node_id'] == 'compute-b')['status'] == 'pending'
+        retried = self.instance('alpha')
+        assert retried['report']['generation'] == retried['desired']['generation'] > failed_generation
         after = self.lab.remote(
             'compute', 'sudo sha256sum /var/lib/bc-' + self.lab.state['task'][:6] + '/wireguard.conf'
         ).stdout.decode()
@@ -517,85 +514,6 @@ class Acceptance:
         self.call('POST', f'/deployments/{deployment}/waves/2/confirm', {'actor': None}, expected=(200, 202))
         self.complete(deployment, timeout=240)
         self.record('later wave requires explicit confirmation after genuine artifact failure and retry')
-        self.native_guests()
-        self.call('PUT', '/deployment-settings', {'unattended': True})
-
-    def retry_integrity(self):
-        deployment = self.state['last_deployment']
-        detail = self.detail(deployment)
-        revision = detail['revision_id']
-        assert detail['status'] == 'halted'
-        boot = self.state['native']['alpha']['boot']
-        assert (
-            self.guest(
-                'alpha',
-                'cat /proc/sys/kernel/random/boot_id',
-                cached_revision=self.instance('alpha')['desired']['spec']['login_revision'],
-            )
-            == boot
-        )
-        assert self.instance('alpha')['report']['status'] == 'failed'
-        self.record(
-            'real corrupted artifact rejection halts global release and leaves physical Guest boot unchanged',
-            deployment=deployment,
-        )
-        before = self.lab.remote(
-            'compute', 'sudo sha256sum /var/lib/bc-' + self.lab.state['task'][:6] + '/wireguard.conf'
-        ).stdout.decode()
-        self.gate(corrupt_artifact=[])
-        self.call('POST', f'/deployments/{deployment}/targets/compute-a/retry', {}, expected=(200, 202))
-        self.wait(
-            'CVM-only retry',
-            lambda: self.detail(deployment),
-            lambda d: next(t for t in d['targets'] if t['node_id'] == 'compute-a')['status'] == 'succeeded',
-            timeout=240,
-        )
-        after = self.lab.remote(
-            'compute', 'sudo sha256sum /var/lib/bc-' + self.lab.state['task'][:6] + '/wireguard.conf'
-        ).stdout.decode()
-        assert before == after and self.revision() == revision
-        assert self.guest('alpha', 'cat /proc/sys/kernel/random/boot_id') != boot
-        assert next(t for t in self.detail(deployment)['targets'] if t['node_id'] == 'compute-b')['status'] == 'pending'
-        self.record('CVM-only retry consumes intact native bytes, preserves ordinary WG and R, and holds later wave')
-        self.call('POST', f'/deployments/{deployment}/waves/2/confirm', {'actor': None}, expected=(200, 202))
-        self.complete(deployment, timeout=240)
-        self.native_guests()
-        self.call('PUT', '/deployment-settings', {'unattended': True})
-
-    def verify_retry_fix(self):
-        deployment = self.state['last_deployment']
-        detail = self.detail(deployment)
-        revision = detail['revision_id']
-        assert detail['status'] == 'halted'
-        boot = self.guest('alpha', 'cat /proc/sys/kernel/random/boot_id')
-        generation = self.instance('alpha')['desired']['generation']
-        self.record(
-            'real corrupted artifact rejection halts global release and leaves physical Guest boot unchanged',
-            deployment=deployment,
-        )
-        before = self.lab.remote(
-            'compute', 'sudo sha256sum /var/lib/bc-' + self.lab.state['task'][:6] + '/wireguard.conf'
-        ).stdout.decode()
-        self.gate(corrupt_artifact=[])
-        self.call('POST', f'/deployments/{deployment}/targets/compute-a/retry', {}, expected=(200, 202))
-        self.wait(
-            'CVM-only retry',
-            lambda: self.detail(deployment),
-            lambda d: next(t for t in d['targets'] if t['node_id'] == 'compute-a')['status'] == 'succeeded',
-            timeout=240,
-        )
-        after = self.lab.remote(
-            'compute', 'sudo sha256sum /var/lib/bc-' + self.lab.state['task'][:6] + '/wireguard.conf'
-        ).stdout.decode()
-        assert before == after and self.revision() == revision
-        assert self.guest('alpha', 'cat /proc/sys/kernel/random/boot_id') == boot
-        assert self.instance('alpha')['desired']['generation'] > generation
-        assert next(t for t in self.detail(deployment)['targets'] if t['node_id'] == 'compute-b')['status'] == 'pending'
-        self.record(
-            'fixed retry ignores cached receipts, preserves already-applied boot and ordinary WG, and uses a new execution at the same R'
-        )
-        self.call('POST', f'/deployments/{deployment}/waves/2/confirm', {'actor': None}, expected=(200, 202))
-        self.complete(deployment, timeout=240)
         self.native_guests()
         self.call('PUT', '/deployment-settings', {'unattended': True})
 
@@ -706,6 +624,11 @@ print(json.dumps(out[0]))
             time.sleep(0.3)
 
     def networks(self):
+        services = self.output / 'services'
+        probe = services / 'inputs/probe'
+        probe_hash = json.loads((services / 'input-hashes.json').read_text()).get('probe')
+        if probe_hash is None or not probe.is_file() or hashlib.sha256(probe.read_bytes()).hexdigest() != probe_hash:
+            raise RuntimeError('run the deployer with the pinned network probe before starting network acceptance')
         # The third KVM is the independent actual network peer, not a mock server.
         echo = r"""import socket,threading
 def serve(family,kind,port):
@@ -733,7 +656,6 @@ threading.Event().wait()
         source.write_text(echo)
         self.lab.upload('client', source, '/home/cvm-lab/echo.py')
         self.lab.remote('client', 'sudo systemd-run --unit=brocade-lab-echo /usr/bin/python3 /home/cvm-lab/echo.py')
-        probe = self.output / 'services/inputs/probe'
         for role in ('compute', 'provider', 'client'):
             self.lab.upload(role, probe, self.prefix + '/probe')
         for name in ('alpha', 'beta'):

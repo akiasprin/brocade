@@ -26,10 +26,7 @@ HEX64 = re.compile(r'[a-f0-9]{64}')
 MAIN_PHASES = (
     'bootstrap',
     'publish_barriers',
-    'finish_initial',
     'integrity_failure',
-    'retry_integrity',
-    'verify_retry_fix',
     'networks',
     'lifecycle',
     'mixed_mtu_route',
@@ -941,6 +938,71 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
             'KVM memory reservation exceeds physical memory',
         )
 
+    def prepare_network_probe(self, run_root, source):
+        output = run_root / 'network-probe'
+        output.mkdir(mode=0o700, exist_ok=True)
+        probe = output / 'probe'
+        receipt = output / 'input.json'
+        source_hash = digest(source)
+        if receipt.exists():
+            identity = json.loads(receipt.read_text())
+            require(
+                identity['source_sha256'] == source_hash and identity['go'] == self.pins['go'],
+                'network probe source or Go pin changed; use a new disposable run',
+            )
+            require(
+                probe.is_file() and not probe.is_symlink() and digest(probe) == identity['sha256'],
+                'network probe differs from its recorded SHA-256',
+            )
+            return probe, identity['sha256']
+        self.phase(
+            run_root,
+            f'network-probe-{self.pins["go"]}-{source_hash}',
+            [
+                'docker',
+                'run',
+                '--rm',
+                '--network',
+                'none',
+                '--pull',
+                'never',
+                '--user',
+                f'{os.getuid()}:{os.getgid()}',
+                '--volume',
+                f'{source}:/probe.go:ro',
+                '--volume',
+                f'{output}:/out',
+                '--volume',
+                f'{self.tools["go"]}:/tool-go:ro',
+                '--volume',
+                f'{self.cache / "downloads"}:/cache',
+                '--env',
+                'GOCACHE=/cache/go',
+                '--env',
+                'GOTOOLCHAIN=local',
+                '--env',
+                'GOOS=linux',
+                '--env',
+                'GOARCH=amd64',
+                '--env',
+                'CGO_ENABLED=0',
+                self.image('release'),
+                '/bin/sh',
+                '-ec',
+                'test "$(/tool-go/bin/go env GOVERSION)" = "go$1"; '
+                '/tool-go/bin/go build -trimpath -buildvcs=false -o /out/probe /probe.go; '
+                'status=0; /out/probe || status=$?; test "$status" -eq 2',
+                'network-probe',
+                self.pins['go'],
+            ],
+            retryable=True,
+        )
+        require(digest(source) == source_hash, 'network probe source changed while building')
+        require(probe.is_file() and not probe.is_symlink(), 'compiled network probe is missing')
+        probe_hash = digest(probe)
+        atomic_json(receipt, {'source_sha256': source_hash, 'sha256': probe_hash, 'go': self.pins['go']})
+        return probe, probe_hash
+
     def accept(self):
         self.host_preflight(kvm=True)
         self.kvm_inputs()
@@ -960,6 +1022,7 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
         # Run the harness paired with this orchestrator, not an older build worktree.
         cvm = ROOT / 'scripts/tests/cvm'
         require(cvm.is_dir(), 'acceptance source is missing')
+        probe = self.prepare_network_probe(run_root, cvm / 'probe.go') if 'main' in selected else None
         jobs = []
         if 'stack' in selected or 'first-install' in selected:
             catalog = run_root / 'stack/catalog'
@@ -996,10 +1059,10 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(self.prepare_lab, name, root, cvm, frozen) for name, root, _ in jobs]
             wait_all(futures, 'lab preparation')
-        if 'main' in selected:
-            self.main_acceptance(run_root / 'main', cvm, frozen)
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=len(selected)) as pool:
             futures = []
+            if 'main' in selected:
+                futures.append(pool.submit(self.main_acceptance, run_root / 'main', cvm, frozen, probe))
             for name, root, fresh in jobs:
                 if fresh:
                     futures.append(pool.submit(self.first_install, root, cvm))
@@ -1033,7 +1096,7 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
         Runner(directory, root.name + '-' + name).execute(command)
         return True
 
-    def prepare_lab(self, name, root, cvm, frozen):
+    def prepare_lab(self, name, root, cvm, frozen, *, probe=None):
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         lab = root / 'lab-3'
         if lab.exists():
@@ -1078,14 +1141,16 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
                 '--' + key + '-sha256',
                 self.config[key + '_sha256'],
             ]
+        if probe is not None:
+            command += ['--probe', str(probe[0]), '--probe-sha256', probe[1]]
         command += [str(lab), str(frozen), str(services)]
         # Input hashes are written before deployment; only phase success records allow resuming.
         self.phase(root, 'deployment', command)
-        for key in ('geoip', 'geosite'):
-            require(
-                digest(services / 'inputs' / (key + '.dat')) == self.config[key + '_sha256'],
-                f'deployed {key} asset differs from its pin',
-            )
+        staged_hashes = {key + '.dat': self.config[key + '_sha256'] for key in ('geoip', 'geosite')}
+        if probe is not None:
+            staged_hashes['probe'] = probe[1]
+        for filename, expected in staged_hashes.items():
+            require(digest(services / 'inputs' / filename) == expected, f'deployed {filename} differs from its pin')
         self.phase(
             root,
             'verify-owned',
@@ -1100,8 +1165,8 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
             retryable=True,
         )
 
-    def main_acceptance(self, root, cvm, frozen):
-        self.prepare_lab('main', root, cvm, frozen)
+    def main_acceptance(self, root, cvm, frozen, probe):
+        self.prepare_lab('main', root, cvm, frozen, probe=probe)
         for phase in MAIN_PHASES:
             self.phase(root, phase, [sys.executable, str(cvm / 'release_kvm_acceptance.py'), str(root), phase])
         if self.config['stop_labs']:

@@ -169,15 +169,40 @@ class ReleaseOrchestratorTests(unittest.TestCase):
 
     def test_main_lab_stops_only_after_all_phases(self):
         root = self.environment.evidence / 'main'
+        probe = (self.root / 'probe', 'a' * 64)
         phases = []
         with (
-            patch.object(self.environment, 'prepare_lab'),
+            patch.object(self.environment, 'prepare_lab') as prepare,
             patch.object(
                 self.environment, 'phase', side_effect=lambda _root, name, _command, **kwargs: phases.append(name)
             ),
         ):
-            self.environment.main_acceptance(root, self.root / 'cvm', self.root / 'frozen')
+            self.environment.main_acceptance(root, self.root / 'cvm', self.root / 'frozen', probe)
+        prepare.assert_called_once_with('main', root, self.root / 'cvm', self.root / 'frozen', probe=probe)
         self.assertEqual(phases, [*ORCHESTRATOR.MAIN_PHASES, 'stop'])
+        # These scenarios already finish their deployments before the next phase starts.
+        self.assertEqual(phases[:4], ['bootstrap', 'publish_barriers', 'integrity_failure', 'networks'])
+
+    def test_network_probe_build_pins_source_and_rejects_binary_tampering(self):
+        source = self.root / 'probe.go'
+        source.write_text('package main\nfunc main() {}\n')
+        binary = self.root / 'network-probe/probe'
+
+        def compile_probe(_root, _name, command, **_kwargs):
+            self.assertIn(f'{source}:/probe.go:ro', command)
+            self.assertIn('CGO_ENABLED=0', command)
+            self.assertIn('GOARCH=amd64', command)
+            self.assertIn(self.environment.image('release'), command)
+            binary.write_bytes(b'compiled probe')
+
+        with patch.object(self.environment, 'phase', side_effect=compile_probe) as phase:
+            built = self.environment.prepare_network_probe(self.root, source)
+            self.assertEqual(built, (binary, ORCHESTRATOR.digest(binary)))
+            self.assertEqual(self.environment.prepare_network_probe(self.root, source), built)
+            binary.write_bytes(b'tampered probe')
+            with self.assertRaisesRegex(ORCHESTRATOR.OrchestrationError, 'probe differs from its recorded SHA-256'):
+                self.environment.prepare_network_probe(self.root, source)
+        phase.assert_called_once()
 
     def test_stack_scenarios_resume_individually(self):
         root = self.environment.evidence / 'stack'

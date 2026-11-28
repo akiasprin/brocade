@@ -57,13 +57,14 @@ def copy_pinned_input(source, expected, target):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--agent-only-compute', action='store_true', help='prepare compute without a Cube installation')
-    for name in ('geoip', 'geosite'):
+    pinned_options = ('geoip', 'geosite', 'probe')
+    for name in pinned_options:
         parser.add_argument('--' + name, type=Path)
         parser.add_argument('--' + name + '-sha256')
     for name in ('lab_path', 'build_path', 'output_path'):
         parser.add_argument(name, type=Path)
     args = parser.parse_args()
-    for name in ('geoip', 'geosite'):
+    for name in pinned_options:
         if (getattr(args, name) is None) != (getattr(args, name + '_sha256') is None):
             parser.error(f'--{name} and --{name}-sha256 must be provided together')
     lab = Lab(args.lab_path)
@@ -106,6 +107,9 @@ def main():
             target.chmod(0o600)
         assert target.stat().st_size > 0
         hashes[name] = hashlib.file_digest(target.open('rb'), 'sha256').hexdigest()
+    if args.probe is not None:
+        copy_pinned_input(args.probe, args.probe_sha256, inputs / 'probe')
+        hashes['probe'] = args.probe_sha256
     assert hashes['bundle.tar.gz'] == bundle['sha256']
     (output_path / 'input-hashes.json').write_text(json.dumps(hashes, indent=2))
     prefix = '/var/lib/brocade/acceptance-' + lab.state['task']

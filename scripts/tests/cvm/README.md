@@ -47,7 +47,7 @@ PVM 使用 `--host-virtualization pvm`，在本轮外层 VM 中隐藏 VMX／SVM�
 `release_kvm_lab.py`、`release_kvm_services.py`、`release_kvm_deploy.py` 和
 `release_kvm_acceptance.py` 共同使用本轮独占的三个外层 KVM（计算、网络提供者、独立客户端），
 安装固定构建入口生成的真实 Console、Agent 和 Cube 运行包，通过正式 API 发布配置并核对实际回执。
-OS 镜像和运行包须显式提供摘要；具体参数见各脚本。受限输出目录包含节点令牌、会话和测试密钥，不能提交或公开。
+OS 镜像和运行包须显式提供摘要。主流程还需要同源 `probe.go` 构建的静态 Linux amd64 探针，由发行编排器在创建 KVM 前构建并固定摘要。手动部署主流程时，向 `release_kvm_deploy.py` 传入 `--probe` 与 `--probe-sha256`。受限输出目录包含节点令牌、会话和测试密钥，不能提交或公开。
 故障注入期间会断开本轮代理的既有 Agent 通道并拒绝重新升级，使用生产 HTTP 回退路径截获真实回执；
 恢复后继续透传实际 WebSocket 通道。不能把只拦截 HTTP、却仍放行通道 RPC 的脚本当作故障验收通过。
 实验网卡的整 IP 回程与探测网段使用持久静态路由；跨月改时钟后仍核对客户端回程，避免 DHCP 更新清除临时路由。

@@ -62,8 +62,11 @@ reopens all four candidate source trees, checks ELF/glibc boundaries and Stack
 A/B content identity, then freezes the deployment inputs. `accept` hashes those
 frozen inputs again before starting any VM. It runs the release KVM scripts
 from the same checkout as the orchestrator, without editing the candidate source
-trees. The deployment script copies and verifies the pinned GeoIP and GeoSite
-files and creates the Agent-only output directory exclusively.
+trees. Before starting the labs for a main-path run, it builds the static Linux
+network probe in the pinned Docker compiler and records the source and binary
+hashes. The deployment script validates and copies the probe and the pinned GeoIP
+and GeoSite files. It creates the Agent-only output directory exclusively. After
+lab preparation, the selected suites can run concurrently.
 
 To explicitly retire only target caches marked by this orchestrator:
 
