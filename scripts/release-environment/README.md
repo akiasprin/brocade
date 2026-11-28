@@ -7,7 +7,9 @@ configuration; CI selects the Node 22 major version.
 
 The orchestrator is a Linux control-host entry point. It creates four detached
 worktrees (`base`, `cvm`, `cube-a`, `cube-b`), independent compilation caches,
-and three Docker images. It does not deploy to production or modify
+and three Docker images. Jammy performs compilation with a glibc 2.35 ABI;
+Debian 12 provides Python 3.11+, `debugfs`, and `readelf` for independent node
+packaging and verification. It does not deploy to production or modify
 `/opt/brocade`.
 
 ## Local configuration
@@ -55,11 +57,11 @@ re-execution. An interrupted Stack mutation or incomplete Agent-only first
 install must be diagnosed and repeated in a new disposable lab; it is not
 reported as a fresh-install pass by resuming a modified VM.
 
-`verify` reopens all four candidate source trees in a separate packager
-container, checks ELF/glibc boundaries and Stack A/B content identity, then
-freezes the deployment inputs. `accept` hashes those frozen inputs again before
-starting any VM. It still uses the real release KVM scripts and their original
-assertions.
+`verify` assembles both Cube bundles in the independent Python 3.11 packager,
+reopens all four candidate source trees, checks ELF/glibc boundaries and Stack
+A/B content identity, then freezes the deployment inputs. `accept` hashes those
+frozen inputs again before starting any VM. It still uses the real release KVM
+scripts and their original assertions.
 
 To explicitly retire only target caches marked by this orchestrator:
 

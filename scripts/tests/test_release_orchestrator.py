@@ -198,6 +198,20 @@ class ReleaseOrchestratorTests(unittest.TestCase):
         with self.assertRaisesRegex(ORCHESTRATOR.OrchestrationError, 'interrupted Stack scenarios'):
             self.environment.stack_acceptance(root, self.root / 'cvm')
 
+    def test_cube_compile_does_not_require_packaging_python(self):
+        self.environment.config['inputs'].update(
+            {'cube_sysroot_libs': self.root / 'sysroot', 'cube_bpf_include': self.root / 'bpf'}
+        )
+        commands = []
+        with (
+            patch.object(self.environment, 'check_target'),
+            patch.object(self.environment, 'container', return_value=['docker']),
+            patch.object(ORCHESTRATOR.Runner, 'execute', side_effect=lambda command: commands.append(command)),
+        ):
+            self.environment.build_one('cube-a')
+        self.assertIn('--cube-runtime-only', commands[0])
+        self.assertNotIn('--cvm-package-assets', commands[0])
+
     def test_failed_mutating_phase_is_not_repeated(self):
         root = self.environment.evidence / 'main'
         step = root / 'steps/bootstrap'
@@ -220,7 +234,7 @@ class ReleaseOrchestratorTests(unittest.TestCase):
             patch.object(self.environment, 'require_tools', return_value='head'),
             patch.object(self.environment, 'probe', side_effect=ORCHESTRATOR.OrchestrationError('compiler missing')),
         ):
-            with self.assertRaisesRegex(ORCHESTRATOR.OrchestrationError, '4 suites'):
+            with self.assertRaisesRegex(ORCHESTRATOR.OrchestrationError, '5 suites'):
                 self.environment.preflight()
         report = json.loads((self.environment.evidence / 'preflight/report.json').read_text())
         self.assertEqual(report['status'], 'failed')

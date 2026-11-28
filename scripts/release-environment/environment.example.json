@@ -8,6 +8,7 @@
   "source_repository": "/path/to/source-checkout",
   "revision": "0000000000000000000000000000000000000000",
   "base_image": "ubuntu:22.04",
+  "packager_image": "debian:12",
   "image_prefix": "brocade-release",
   "node_version": "22.23.0",
   "tool_sha256": {

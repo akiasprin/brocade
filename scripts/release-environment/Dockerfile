@@ -1,5 +1,6 @@
 # The release ABI follows .github/workflows/ci.yml, not the moving Cube development image.
 ARG BASE_IMAGE=ubuntu:22.04
+ARG PACKAGER_BASE_IMAGE=debian:12
 FROM ${BASE_IMAGE} AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -48,5 +49,16 @@ RUN set -eux; \
     debugfs -V; \
     test -f /usr/include/bpf/bpf_helpers.h
 
-FROM cube AS packager
-RUN python3 --version && debugfs -V && readelf --version
+FROM ${PACKAGER_BASE_IMAGE} AS packager
+ARG DEBIAN_FRONTEND=noninteractive
+RUN set -eux; \
+    apt-get update -o Acquire::Retries=3; \
+    apt-get install -y --no-install-recommends \
+      binutils \
+      ca-certificates \
+      e2fsprogs \
+      python3; \
+    rm -rf /var/lib/apt/lists/*; \
+    python3 -c 'import sys,tomllib; assert sys.version_info >= (3, 11)'; \
+    debugfs -V; \
+    readelf --version

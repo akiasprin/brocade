@@ -118,6 +118,8 @@ def read_config(filename):
         selected = value.get(key, default)
         require(type(selected) is int and selected >= 0, f'{key} must be a nonnegative integer')
         result[key] = selected
+    result['packager_image'] = value.get('packager_image', 'debian:12')
+    require(isinstance(result['packager_image'], str) and result['packager_image'], 'packager_image is required')
     result['tools_directory'] = resolve_path(value.get('tools_directory', result['cache'] / 'tools'), base)
     for key in ('tools', 'inputs'):
         require(isinstance(value.get(key, {}), dict), f'{key} must be an object')
@@ -315,13 +317,12 @@ class ReleaseEnvironment:
             )
         return {'platform': 'linux-x86_64', 'cpu_threads': os.cpu_count(), 'kvm': kvm}
 
-    def pinned_base_image(self):
-        if run(['docker', 'image', 'inspect', self.config['base_image']]).returncode:
-            Runner(self.evidence / 'environment/base-image', 'pull-base-image').execute(
-                ['docker', 'pull', self.config['base_image']]
-            )
+    def pinned_base_image(self, reference=None, label='base-image'):
+        reference = reference or self.config['base_image']
+        if run(['docker', 'image', 'inspect', reference]).returncode:
+            Runner(self.evidence / 'environment' / label, 'pull-' + label).execute(['docker', 'pull', reference])
         return (
-            checked(['docker', 'image', 'inspect', self.config['base_image'], '--format', '{{index .RepoDigests 0}}'])
+            checked(['docker', 'image', 'inspect', reference, '--format', '{{index .RepoDigests 0}}'])
             .stdout.decode()
             .strip()
         )
@@ -343,22 +344,27 @@ class ReleaseEnvironment:
         self.prepare_tools()
         pinned = self.pinned_base_image()
         require('@sha256:' in pinned, 'base_image must resolve to a repository digest')
+        packager_base = self.pinned_base_image(self.config['packager_image'], 'packager-base-image')
+        require('@sha256:' in packager_base, 'packager_image must resolve to a repository digest')
 
         def build_image(target):
+            command = [
+                'docker',
+                'build',
+                '--file',
+                str(DOCKERFILE),
+                '--target',
+                target,
+                '--build-arg',
+                'BASE_IMAGE=' + pinned,
+                '--tag',
+                self.image(target),
+                str(ROOT),
+            ]
+            if target == 'packager':
+                command += ['--build-arg', 'PACKAGER_BASE_IMAGE=' + packager_base]
             Runner(self.evidence / 'environment' / target, 'prepare-image-' + target).execute(
-                [
-                    'docker',
-                    'build',
-                    '--file',
-                    str(DOCKERFILE),
-                    '--target',
-                    target,
-                    '--build-arg',
-                    'BASE_IMAGE=' + pinned,
-                    '--tag',
-                    self.image(target),
-                    str(ROOT),
-                ],
+                command,
                 env=build_environment,
             )
 
@@ -367,6 +373,9 @@ class ReleaseEnvironment:
                 [pool.submit(build_image, target) for target in ('release', 'cube', 'packager')], 'image preparation'
             )
         self.prepare_formatters()
+        packager_script = self.evidence / 'package_cube_candidate.py'
+        shutil.copyfile(ROOT / 'scripts/package_cube_candidate.py', packager_script)
+        packager_script.chmod(0o600)
         images = {}
         for target in ('release', 'cube', 'packager'):
             identity = (
@@ -379,6 +388,7 @@ class ReleaseEnvironment:
             self.evidence / 'environment/images.json',
             {
                 'base_image': pinned,
+                'packager_base_image': packager_base,
                 'buildkit': build_environment['DOCKER_BUILDKIT'] == '1',
                 'images': images,
                 'pins': self.pins,
@@ -714,10 +724,9 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
         atomic_json(report_path, report)
         try:
             with ThreadPoolExecutor(max_workers=4) as pool:
-                wait_all(
-                    [pool.submit(self.probe, name) for name in ('base', 'cvm', 'cube-a', 'cube-b')],
-                    'compiler preflight',
-                )
+                futures = [pool.submit(self.probe, name) for name in ('base', 'cvm', 'cube-a', 'cube-b')]
+                futures.append(pool.submit(self.probe_packager))
+                wait_all(futures, 'compiler preflight')
         except BaseException as error:
             report.update(status='failed', error=str(error), checked_at=utc_now())
             atomic_json(report_path, report)
@@ -725,6 +734,30 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
         report.update(status='passed', checked_at=utc_now())
         atomic_json(report_path, report)
         return report
+
+    def probe_packager(self):
+        script = ROOT / 'scripts/package_cube_candidate.py'
+        require(script.is_file(), f'missing Cube packager entry: {script}')
+        command = self.container(
+            f'brocade-preflight-{os.getpid()}-packager',
+            'packager',
+            self.source('cube-a'),
+            entrypoint=True,
+            evidence=True,
+        )
+        command[command.index('--workdir') : command.index('--workdir') + 2] = []
+        self.phase(
+            self.evidence / 'preflight',
+            'packager',
+            command
+            + [
+                '-c',
+                'python3 -I -c "import sys,tomllib; assert sys.version_info >= (3, 11)" && debugfs -V && readelf --version && python3 -I "$1" --help',
+                'sh',
+                str(script),
+            ],
+            retryable=True,
+        )
 
     def build_one(self, name):
         self.check_target(name)
@@ -743,8 +776,6 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
                 '--cube-bpf-include',
                 str(self.config['inputs']['cube_bpf_include']),
             ]
-            if self.config['inputs'].get('cube_assets'):
-                args += ['--cvm-package-assets', str(self.config['inputs']['cube_assets'])]
         runner = Runner(self.evidence / 'build' / name, 'build-' + name)
         runner.execute(
             self.container(
@@ -768,8 +799,32 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
             if failures:
                 raise OrchestrationError('; '.join(f'{name}: {error}' for name, error in failures))
 
+    def package_one(self, name):
+        script = self.evidence / 'package_cube_candidate.py'
+        require(script.is_file(), 'run prepare before Cube packaging')
+        command = self.container(
+            f'brocade-package-{os.getpid()}-{name}',
+            'packager',
+            self.source(name),
+            entrypoint=True,
+            evidence=True,
+        ) + [
+            '-c',
+            'python3 -I "$1" --root "$2" --assets "$3" --architecture x86_64',
+            'sh',
+            str(script),
+            str(self.source(name)),
+            str(self.config['inputs']['cube_assets']),
+        ]
+        self.phase(self.evidence / 'package', name, command, retryable=True)
+
+    def package_all(self):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            wait_all([pool.submit(self.package_one, name) for name in ('cube-a', 'cube-b')], 'Cube packaging')
+
     def verify(self):
         head = self.require_tools()
+        self.package_all()
         output = self.evidence / 'candidate/verification.json'
         frozen = self.evidence / 'candidate/deployment-build'
         require(not frozen.exists(), f'preserve the existing frozen candidate: {frozen}')
