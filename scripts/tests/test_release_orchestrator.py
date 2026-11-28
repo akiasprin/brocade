@@ -292,6 +292,36 @@ class ReleaseOrchestratorTests(unittest.TestCase):
         self.assertTrue(commands)
         self.assertTrue(all(kwargs['env']['DOCKER_BUILDKIT'] == '0' for _command, kwargs in commands))
 
+    def test_accept_creates_the_stack_catalog_parent_on_a_fresh_run(self):
+        candidate = self.environment.evidence / 'candidate'
+        frozen = candidate / 'deployment-build'
+        frozen.mkdir(parents=True)
+        verification = {
+            'head': 'head',
+            'stacks': {'a': {'sha256': 'a' * 64}, 'b': {'sha256': 'b' * 64}},
+        }
+        (candidate / 'verification.json').write_text(json.dumps(verification))
+        (frozen / 'input-hashes.json').write_text(json.dumps({'head': 'head', 'files': {}}))
+        self.environment.config['acceptance_selector'] = 'stack'
+        self.environment.config['run_directory'] = self.root / 'fresh-acceptance'
+        (self.environment.source('cube-a') / 'scripts/tests/cvm').mkdir(parents=True)
+
+        def catalog_phase(root, name, _command, **_kwargs):
+            self.assertEqual(name, 'stack-catalog')
+            catalog = root / 'stack/catalog'
+            self.assertTrue(catalog.parent.is_dir())
+            catalog.mkdir()
+            (catalog / 'lab-catalog.json').write_text('{}')
+
+        with (
+            patch.object(self.environment, 'host_preflight'),
+            patch.object(self.environment, 'kvm_inputs'),
+            patch.object(self.environment, 'phase', side_effect=catalog_phase),
+            patch.object(self.environment, 'prepare_lab'),
+            patch.object(self.environment, 'stack_acceptance'),
+        ):
+            self.environment.accept()
+
     def test_parallel_failures_are_aggregated(self):
         from concurrent.futures import Future
 

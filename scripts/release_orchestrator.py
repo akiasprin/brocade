@@ -963,6 +963,7 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10)'
         jobs = []
         if 'stack' in selected or 'first-install' in selected:
             catalog = run_root / 'stack/catalog'
+            catalog.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             if not (catalog / 'lab-catalog.json').exists():
                 a, b = verification['stacks']['a'], verification['stacks']['b']
                 self.phase(
